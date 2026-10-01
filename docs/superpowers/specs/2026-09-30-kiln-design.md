@@ -8,6 +8,13 @@
 ### Revision history
 
 - **rev 1 (2026-09-30):** initial design.
+- **rev 2.1 (2026-10-01):** §6.3, §7.3 and §7.4 corrected to match containerd's overlay snapshotter, as found by the oracle while validating the M1a plan:
+  - symlink modes are always 0777;
+  - a hardlink header's metadata applies to its inode;
+  - a whiteout naming an entry already in its layer is an error;
+  - implicit directories described later keep their inherited xattrs.
+
+  §7.4 also records three deliberate divergences, and §12 splits M1 into M1a and M1b.
 - **rev 2 (2026-10-01):** incorporates the adversarial review of rev 1 (five reviewers, ~60 raw findings, 24 after dedup; none refuted). Decisions taken with the user:
   - **A.** A vsock control channel between `kiln-init` and the host is part of v1. It replaces the config disk and the status sector.
   - **B.** Implicit parent directories inherit attributes from lower layers, as containerd does.
@@ -276,6 +283,7 @@ A layer tar may contain `a/b/file` with no `a/` or `a/b/` header. overlayfs show
    - The context hash `ctx` is SHA-256 of the canonical encoding of the resolved `(path, attrs)` list.
    - The erofs output is cached in `cache/layers-ctx/<src>@<fmt>@<ctx>`, and the layer is annotated with `dev.kiln.inherits`.
 4. **Defaults** for invented directories: mode `0755`, uid and gid `0`, mtime equal to the layer's base time (§7.3), no xattrs.
+5. **Described later:** a directory that was created implicitly and then described by its own header later in the same layer keeps that header's mode, uid, gid and mtime. The inherited xattrs lie under its own, as in containerd, so it is reported with the implicit directories too.
 
 ### 6.4 Squash
 
@@ -336,7 +344,7 @@ A compact inode is used only when **all** of these hold. Otherwise the inode is 
 ### 7.3 Determinism rules
 
 - The superblock UUID is all zeros, the volume name is empty, and there is no superblock checksum feature.
-- Base time is the minimum `(sec, nsec)` mtime in the layer, stored as `epoch` and `fixed_nsec`. An empty layer uses base time 0.
+- Base time is the minimum `(sec, nsec)` mtime of the layer's explicit entries (directory, file, symlink, device, FIFO, whiteout, hardlink; opaque markers excluded), stored as `epoch` and `fixed_nsec`. An empty layer uses base time 0.
 - Inode numbering follows a breadth-first traversal in sorted name order.
 - Hardlink groups are numbered by first appearance in tar order, and the canonical path is the first one in tar order.
 - Inline xattrs are sorted by `(name index, name bytes)`.
@@ -351,12 +359,14 @@ These rules match containerd's `archive.Apply`, which is the test oracle (§11.2
 
 - **Directory over directory:** merge. The new header's attributes replace the old ones; children are kept; an opaque marker already set is kept.
 - **Non-directory over anything, or directory over non-directory:** replace, dropping any subtree.
+- **Symlinks:** permission bits are always `0777`, whatever the header says, as Linux reports them.
 - **Hardlinks:** a hardlink binds to the inode that exists at that path **when the link entry is read**. A later replacement of the target path does not affect earlier links. `nlink` is computed at the end.
-  - Links to directories, to a missing path, or to self are typed errors.
+  - The link header's mode (unless the target is a symlink), uid, gid, mtime and xattrs are applied to the shared inode, as containerd does.
+  - Links to directories, to a missing path, to self, or to a path inside the entry the link replaces are typed errors.
 - **Whiteouts (OCI → overlayfs):**
   - `.wh.<name>` becomes a character device 0:0 named `<name>`.
   - `.wh..wh..opq` becomes `trusted.overlay.opaque=y` on the containing directory.
-  - Collisions are decided by the **translated** name. A real entry and a whiteout for the same name in one layer: whichever comes later in tar order wins.
+  - Collisions are decided by the **translated** name. A whiteout for a name that already exists in the same layer is an error: OCI says a whiteout cannot hide its own layer, and containerd rejects it. A real entry after a whiteout replaces it.
   - An opaque marker hides only lower layers, never entries from the same layer, regardless of order.
 - **Entry types:**
   - Supported: regular files, directories, symlinks, hardlinks, char and block devices, FIFOs.
@@ -367,6 +377,10 @@ These rules match containerd's `archive.Apply`, which is the test oracle (§11.2
   - `SCHILY.xattr.*` records map to erofs xattrs for the `user.`, `trusted.`, `security.` and `system.posix_acl_*` namespaces.
   - Other namespaces (e.g. `com.apple.*`) are dropped with a warning.
 - **Paths:** a path that escapes the root after normalisation is a typed error.
+- **Known divergences from containerd:** each is documented in `docs/format.md`, and none occurs in layers image builders produce.
+  1. containerd's final pass that sets directory times fails, or re-times the replacement, when a directory or one of its parents is later replaced by a non-directory in the same layer.
+  2. containerd resolves implicit parents per lower layer, not through the overlay view.
+  3. containerd follows lower-layer symlinks while resolving parents.
 
 ### 7.5 Reader
 
@@ -669,7 +683,7 @@ One parametrised suite runs against both backends, using a test guest (the kerne
 
 | Milestone | Repo | Contents | Needs KVM |
 |---|---|---|---|
-| **M1: convert** | `kiln` | `kiln-store`, `kiln-registry`, `kiln-oci`, `kiln-erofs` (writer, reader, profile, semantics, limits), §6.1–6.4 and §6.6, the oracle tests, the hostile-registry tests, and the CLI `convert`/`pull`/`push`/`import`/`inspect`/`ls`/`gc`/`bench`. Output is the app-layer set plus a provisional manifest without kernel and init layers. | No |
+| **M1: convert** (planned as **M1a**, `kiln-erofs`, and **M1b**, store, registry, OCI inputs, pipeline and CLI) | `kiln` | `kiln-store`, `kiln-registry`, `kiln-oci`, `kiln-erofs` (writer, reader, profile, semantics, limits), §6.1–6.4 and §6.6, the oracle tests, the hostile-registry tests, and the CLI `convert`/`pull`/`push`/`import`/`inspect`/`ls`/`gc`/`bench`. Output is the app-layer set plus a provisional manifest without kernel and init layers. | No |
 | **M2: vmkit** | `vmkit` | `Vmm` trait (snapshot/restore shapes only), Firecracker and Cloud Hypervisor drivers, `sandbox`, `net` (tap, nftables, `pasta`), `Capabilities`, the kernel profiles pipeline, the contract suite, and the hostile-guest network tests (with the busybox guest). | Yes |
 | **M3: run** | `kiln` | `kiln-proto`, `kiln-init`, the ext4 template, §6.5, §8, §9, `kiln run`, `kiln build`, the Lima template, the end-to-end matrix, the remaining security tests, the release pipeline and the docs. | Yes |
 
