@@ -6,7 +6,7 @@ mod model;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{Mount, fsck, groups, is_root, squash_all, try_convert_stack, view, walk_fs};
+use common::{Mount, fsck, groups, is_root, skip, squash_all, try_convert_stack, view, walk_fs};
 use kiln_erofs::testtar::{Opts, TarBuilder};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
@@ -194,11 +194,11 @@ fn compare_stack(bin: &Path, tars: &[Vec<u8>], case: usize) {
 #[test]
 fn kiln_matches_containerd() {
     let Some(bin) = oracle_bin() else {
-        eprintln!("skipping: set KILN_ORACLE to the oracle binary");
+        skip("set KILN_ORACLE to the oracle binary");
         return;
     };
     if !is_root() {
-        eprintln!("skipping: needs root");
+        skip("needs root");
         return;
     }
     let mut stacks = handcrafted();
