@@ -7,6 +7,7 @@
 mod error;
 mod limits;
 pub mod ondisk;
+mod path;
 
 pub use error::{Error, Result};
 pub use limits::Limits;
