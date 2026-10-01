@@ -117,3 +117,52 @@ fn hardlink_xattrs_that_overflow_an_inline_tail_relocate_the_file() {
         );
     }
 }
+
+fn write_limited(tar: &[u8], max_entries: u64) -> kiln_erofs::Result<Vec<u8>> {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = Limits {
+        max_entries,
+        ..Limits::default()
+    };
+    let mut w = LayerWriter::new(Cursor::new(Vec::new()), dir.path(), limits)?;
+    w.append_tar(tar)?;
+    let (out, _) = w.finish(&BTreeMap::new())?;
+    Ok(out.into_inner())
+}
+
+/// `n` files, each under its own chain of `depth - 1` implicit directories.
+fn deep_paths(n: usize, depth: usize) -> Vec<u8> {
+    let mut b = TarBuilder::new();
+    for i in 0..n {
+        let dirs: Vec<String> = (1..depth).map(|d| format!("{i}-{d}")).collect();
+        b.file(&format!("{}/f", dirs.join("/")), b"", &Opts::default());
+    }
+    b.finish()
+}
+
+/// T3: implicit directories count against `max_entries`, so a small tar of deep
+/// paths cannot expand into far more inodes than it has headers.
+#[test]
+fn implicit_directories_count_against_max_entries() {
+    // 20 headers, 20 * 10 = 200 tree entries.
+    let tar = deep_paths(20, 10);
+    assert!(matches!(
+        write_limited(&tar, 199),
+        Err(Error::LimitExceeded {
+            limit: "entries per layer",
+            max: 199,
+            ..
+        })
+    ));
+    let img = write_limited(&tar, 200).expect("a layer exactly at the limit converts");
+    assert_eq!(sb(&img).inos, 201, "200 entries plus the root");
+    let flat: Vec<u8> = {
+        let mut b = TarBuilder::new();
+        for i in 0..50 {
+            b.file(&format!("f{i}"), b"", &Opts::default());
+        }
+        b.finish()
+    };
+    write_limited(&flat, 50).expect("50 flat entries fit a limit of 50");
+    assert!(write_limited(&flat, 49).is_err());
+}

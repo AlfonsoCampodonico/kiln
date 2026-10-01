@@ -50,15 +50,35 @@ pub(crate) struct LayerBuilder {
     base: Option<Timestamp>,
     /// Directories created because a descendant needed them (even if described later).
     created_implicitly: HashSet<NodeId>,
+    /// Tree entries created so far: explicit entries and implicit directories (spec §7.6).
+    entries: u64,
+    max_entries: u64,
 }
 
 impl LayerBuilder {
-    pub fn new() -> Self {
+    /// `max_entries` bounds every tree entry the layer creates, implicit directories
+    /// included, so that deep paths cannot multiply a small tar into many inodes.
+    pub fn new(max_entries: u64) -> Self {
         Self {
             tree: Tree::new(Node::dir(Meta::default_dir(Timestamp::default()), true)),
             base: None,
             created_implicitly: HashSet::new(),
+            entries: 0,
+            max_entries,
         }
+    }
+
+    /// Counts one new tree entry for `path` against `max_entries`.
+    fn count_entry(&mut self, path: &[u8]) -> Result<()> {
+        self.entries += 1;
+        if self.entries > self.max_entries {
+            return Err(Error::LimitExceeded {
+                limit: "entries per layer",
+                max: self.max_entries,
+                path: lossy(path),
+            });
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -118,6 +138,7 @@ impl LayerBuilder {
                     reason: "whiteout for an entry already in this layer",
                 });
             }
+            self.count_entry(&e.path)?;
             self.note_time(e.meta.mtime);
             let id = self.tree.add(Node::whiteout(e.meta.mtime));
             self.tree.children_mut(parent).insert(hidden.to_vec(), id);
@@ -128,6 +149,7 @@ impl LayerBuilder {
         let kind = match e.kind {
             EntryKind::Hardlink { target } => {
                 let id = self.resolve_link(&e.path, &target)?;
+                self.count_entry(&e.path)?;
                 // Like containerd, apply the link header's metadata to the shared inode.
                 self.note_time(e.meta.mtime);
                 let node = &mut self.tree.nodes[id];
@@ -161,6 +183,7 @@ impl LayerBuilder {
             EntryKind::BlockDev { major, minor } => Kind::BlockDev { major, minor },
             EntryKind::Fifo => Kind::Fifo,
         };
+        self.count_entry(&e.path)?;
         self.note_time(e.meta.mtime);
         let mut meta = e.meta;
         if matches!(kind, Kind::Symlink { .. }) {
@@ -193,6 +216,7 @@ impl LayerBuilder {
                 Some(id) if self.tree.nodes[id].is_dir() => id,
                 Some(_) => return Err(Error::ParentNotDirectory { path: lossy(full) }),
                 None => {
+                    self.count_entry(full)?;
                     let id = self.tree.add(Node::dir(Meta::default_dir(Timestamp::default()), true));
                     self.tree.children_mut(cur).insert(c.to_vec(), id);
                     self.created_implicitly.insert(id);
@@ -317,8 +341,31 @@ mod tests {
     }
 
     #[test]
+    fn every_created_entry_counts_against_max_entries() {
+        let mut b = LayerBuilder::new(5);
+        file(&mut b, "a/b/f", 1); // a, a/b, a/b/f
+        dir(&mut b, "a", 1); // merges: no new entry
+        marker(&mut b, "a/.wh..wh..opq", 1).unwrap(); // marks: no new entry
+        marker(&mut b, ".wh.w", 1).unwrap(); // 4
+        let link = Entry {
+            path: b"l".to_vec(),
+            kind: EntryKind::Hardlink {
+                target: b"a/b/f".to_vec(),
+            },
+            meta: meta(0o644, 1),
+            xattrs: Xattrs::new(),
+        };
+        b.apply(link, None).unwrap(); // 5
+        let err = marker(&mut b, "x/y", 1).unwrap_err();
+        assert!(
+            matches!(&err, Error::LimitExceeded { limit: "entries per layer", max: 5, path } if path == "x/y"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn implicit_parents_are_reported_even_once_described() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         file(&mut b, "a/b/c", 10);
         assert_eq!(b.implicit_dirs(), vec![b"a".to_vec(), b"a/b".to_vec()]);
         dir(&mut b, "a", 10);
@@ -329,7 +376,7 @@ mod tests {
 
     #[test]
     fn described_implicit_dir_keeps_inherited_xattrs_under_its_own() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         file(&mut b, "a/f", 10);
         let mut d = entry("a", EntryKind::Dir, 11);
         d.meta.mode = 0o700;
@@ -354,7 +401,7 @@ mod tests {
 
     #[test]
     fn dir_over_dir_merges_attrs_children_and_opaque() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         let mut d = entry("d", EntryKind::Dir, 10);
         d.xattrs.insert(user("x"), b"1".to_vec());
         b.apply(d, None).unwrap();
@@ -374,7 +421,7 @@ mod tests {
 
     #[test]
     fn non_dir_replaces_subtree_and_dir_replaces_non_dir() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         dir(&mut b, "d", 10);
         file(&mut b, "d/f", 10);
         file(&mut b, "d", 10);
@@ -387,7 +434,7 @@ mod tests {
 
     #[test]
     fn hardlink_binds_to_the_node_present_when_read() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         file(&mut b, "a", 1);
         let link = Entry {
             path: b"b".to_vec(),
@@ -405,7 +452,7 @@ mod tests {
 
     #[test]
     fn hardlink_header_metadata_applies_to_the_shared_inode() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         file(&mut b, "a", 1);
         let mut link = Entry {
             path: b"b".to_vec(),
@@ -437,7 +484,7 @@ mod tests {
 
     #[test]
     fn hardlink_errors() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         dir(&mut b, "d", 1);
         file(&mut b, "f", 1);
         marker(&mut b, ".wh.gone", 1).unwrap();
@@ -464,7 +511,7 @@ mod tests {
 
     #[test]
     fn whiteouts_translate_and_collide_by_translated_name() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         marker(&mut b, "etc/.wh.foo", 1).unwrap();
         assert!(b.tree().nodes[b.tree().lookup(b"etc/foo").unwrap()].is_whiteout());
         file(&mut b, "etc/foo", 1);
@@ -490,7 +537,7 @@ mod tests {
 
     #[test]
     fn parent_must_be_a_directory() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         file(&mut b, "f", 1);
         assert!(matches!(
             marker(&mut b, "f/x", 1),
@@ -505,7 +552,7 @@ mod tests {
 
     #[test]
     fn symlink_mode_is_always_0777() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         b.apply(entry("l", EntryKind::Symlink { target: b"x".to_vec() }, 1), None)
             .unwrap();
         assert_eq!(b.tree().nodes[b.tree().lookup(b"l").unwrap()].meta.mode, 0o777);
@@ -513,7 +560,7 @@ mod tests {
 
     #[test]
     fn root_entry() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         let mut root = entry("", EntryKind::Dir, 5);
         root.meta.mode = 0o700;
         b.apply(root, None).unwrap();
@@ -523,7 +570,7 @@ mod tests {
 
     #[test]
     fn base_time_ignores_opaque_markers_only() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         assert_eq!(b.base_time(), Timestamp::default());
         file(&mut b, "f", 50);
         dir(&mut b, "d", 40);
@@ -547,7 +594,7 @@ mod tests {
 
     #[test]
     fn finalize_inherits_or_defaults_and_keeps_opaque() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         file(&mut b, "a/b/f", 100);
         marker(&mut b, "a/.wh..wh..opq", 100).unwrap();
         let mut inherited = BTreeMap::new();
@@ -584,7 +631,7 @@ mod tests {
 
     #[test]
     fn hardlink_to_symlink_keeps_mode_0777() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         b.apply(entry("l", EntryKind::Symlink { target: b"x".to_vec() }, 1), None)
             .unwrap();
         let link = Entry {
@@ -609,7 +656,7 @@ mod tests {
     #[test]
     fn base_time_includes_explicit_root_symlink_and_devices() {
         // Explicit root directory entry
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         let root = entry("", EntryKind::Dir, 5);
         b.apply(root, None).unwrap();
         assert_eq!(
@@ -619,7 +666,7 @@ mod tests {
         );
 
         // Symlink entry
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         b.apply(entry("l", EntryKind::Symlink { target: b"x".to_vec() }, 7), None)
             .unwrap();
         assert_eq!(
@@ -629,7 +676,7 @@ mod tests {
         );
 
         // Character device
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         b.apply(
             Entry {
                 path: b"dev".to_vec(),
@@ -650,7 +697,7 @@ mod tests {
         );
 
         // Block device
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         b.apply(
             Entry {
                 path: b"dev".to_vec(),
@@ -671,7 +718,7 @@ mod tests {
         );
 
         // FIFO
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         b.apply(
             Entry {
                 path: b"fifo".to_vec(),
@@ -690,7 +737,7 @@ mod tests {
 
     #[test]
     fn dir_over_dir_header_xattrs_override() {
-        let mut b = LayerBuilder::new();
+        let mut b = LayerBuilder::new(u64::MAX);
         let mut d = entry("d", EntryKind::Dir, 10);
         d.xattrs.insert(user("k"), b"old".to_vec());
         d.xattrs.insert(user("keep"), b"unrelated".to_vec());

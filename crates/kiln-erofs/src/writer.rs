@@ -480,7 +480,7 @@ impl<W: Read + Write + Seek> LayerWriter<W> {
     pub fn new(out: W, spill_dir: &Path, limits: Limits) -> Result<Self> {
         Ok(Self {
             store: DataStore::new(out, spill_dir)?,
-            builder: LayerBuilder::new(),
+            builder: LayerBuilder::new(limits.max_entries),
             limits,
             warnings: Vec::new(),
             tar_bytes: 0,
