@@ -79,14 +79,24 @@ fn sampled(n: usize) -> Vec<Vec<Vec<u8>>> {
     out
 }
 
+/// Unmounts in reverse order of mounting, on success and on panic alike.
+struct Mounts(Vec<Mount>);
+
+impl Drop for Mounts {
+    fn drop(&mut self) {
+        while let Some(m) = self.0.pop() {
+            drop(m);
+        }
+    }
+}
+
 fn compare_stack(bin: &Path, tars: &[Vec<u8>], case: usize) {
-    let Ok(images) = try_convert_stack(tars) else {
-        return;
-    };
+    let images = try_convert_stack(tars)
+        .unwrap_or_else(|e| panic!("case {case}: kiln rejected a stack the oracle expects to be valid: {e}"));
     let dir = tempfile::tempdir().unwrap();
     let mut c_dirs = Vec::new();
     let mut k_dirs = Vec::new();
-    let mut mounts = Vec::new();
+    let mut mounts = Mounts(Vec::new());
     for (i, (tar, img)) in tars.iter().zip(&images).enumerate() {
         let tar_path = dir.path().join(format!("l{i}.tar"));
         std::fs::write(&tar_path, tar).unwrap();
@@ -106,7 +116,7 @@ fn compare_stack(bin: &Path, tars: &[Vec<u8>], case: usize) {
         let img_path = dir.path().join(format!("l{i}.erofs"));
         std::fs::write(&img_path, img).unwrap();
         let k_dir = dir.path().join(format!("k{i}"));
-        mounts.push(Mount::erofs(&img_path, &k_dir));
+        mounts.0.push(Mount::erofs(&img_path, &k_dir));
         k_dirs.push(k_dir);
     }
     let (a, b) = if tars.len() == 1 {
@@ -116,8 +126,8 @@ fn compare_stack(bin: &Path, tars: &[Vec<u8>], case: usize) {
         let k_lowers: Vec<&Path> = k_dirs.iter().rev().map(PathBuf::as_path).collect();
         let c_merged = dir.path().join("c-merged");
         let k_merged = dir.path().join("k-merged");
-        mounts.push(Mount::overlay(&c_lowers, &c_merged));
-        mounts.push(Mount::overlay(&k_lowers, &k_merged));
+        mounts.0.push(Mount::overlay(&c_lowers, &c_merged));
+        mounts.0.push(Mount::overlay(&k_lowers, &k_merged));
         (walk_fs(&c_merged), walk_fs(&k_merged))
     };
     if tars.len() == 1 {
@@ -161,9 +171,6 @@ fn compare_stack(bin: &Path, tars: &[Vec<u8>], case: usize) {
         groups(&b),
         "case {case}: hardlink groups differ from containerd"
     );
-    while let Some(m) = mounts.pop() {
-        drop(m);
-    }
 }
 
 #[test]
@@ -178,7 +185,11 @@ fn kiln_matches_containerd() {
     }
     let mut stacks = handcrafted();
     stacks.extend(sampled(200));
+    assert_eq!(stacks.len(), 4 + 200, "handcrafted + sampled stacks");
+    let mut compared = 0;
     for (case, tars) in stacks.iter().enumerate() {
         compare_stack(&bin, tars, case);
+        compared += 1;
     }
+    assert_eq!(compared, stacks.len(), "every stack must be compared");
 }
