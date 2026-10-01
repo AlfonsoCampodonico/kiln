@@ -147,3 +147,32 @@ fn squash_base_time_is_min_reachable_mtime() {
     assert!(w[&p("keep")].compact);
     assert!(!w.contains_key(&p("old")), "old should be whited out");
 }
+
+/// overlayfs ignores an opaque marker on a layer's root (verified against the kernel).
+#[test]
+fn root_opaque_marker_hides_nothing() {
+    let l0 = t(TarBuilder::new().file("x", b"x", &Opts::default()));
+    let l1 = t(TarBuilder::new().opaque("").file("y", b"y", &Opts::default()));
+    let layers = convert_stack(&[l0, l1]);
+    assert_eq!(
+        walk(&layers[1])[&p("")].xattrs[&p("trusted.overlay.opaque")],
+        b"y",
+        "the layer still records the marker"
+    );
+    let w = walk(&squash_all(&layers));
+    assert_eq!(w[&p("x")].data, b"x");
+    assert_eq!(w[&p("y")].data, b"y");
+}
+
+/// Only `.wh..wh..opq` makes a directory opaque; a tar cannot inject the xattr itself.
+#[test]
+fn tar_supplied_overlay_xattrs_are_dropped() {
+    let l0 = t(TarBuilder::new().file("d/x", b"x", &Opts::default()));
+    let l1 = t(TarBuilder::new()
+        .dir("d", &Opts::default().xattr("trusted.overlay.opaque", b"y"))
+        .file("d/y", b"y", &Opts::default()));
+    let layers = convert_stack(&[l0, l1]);
+    assert!(walk(&layers[1])[&p("d")].xattrs.is_empty());
+    let w = walk(&squash_all(&layers));
+    assert!(w.contains_key(&p("d/x")) && w.contains_key(&p("d/y")));
+}

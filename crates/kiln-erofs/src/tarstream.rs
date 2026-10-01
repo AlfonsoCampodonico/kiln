@@ -378,6 +378,13 @@ fn convert_xattrs(
             add_warning(warnings, suppressed_count, msg);
             continue;
         };
+        if key.is_overlay() {
+            // Only kiln's own markers (from `.wh.` entries) may steer the overlay.
+            let name_str = truncate_to_128(&lossy(name));
+            let msg = format!("dropping overlay xattr {:?} on {:?}", name_str, path_str);
+            add_warning(warnings, suppressed_count, msg);
+            continue;
+        }
         let bad = |reason| Error::XattrUnencodable {
             path: lossy(path),
             name: lossy(name),
@@ -471,6 +478,24 @@ mod tests {
             ]
         );
         assert_eq!(warnings.len(), 2, "{warnings:?}");
+    }
+
+    #[test]
+    fn drops_tar_supplied_overlay_xattrs() {
+        let o = Opts::default()
+            .xattr("trusted.overlay.opaque", b"y")
+            .xattr("trusted.overlay.redirect", b"/x")
+            .xattr("trusted.other", b"kept");
+        let mut b = TarBuilder::new();
+        b.dir("d", &o);
+        let (es, warnings, _) = collect(&b.finish(), &Limits::default()).unwrap();
+        let keys: Vec<Vec<u8>> = es[0].0.xattrs.keys().map(XattrKey::full_name).collect();
+        assert_eq!(keys, vec![b"trusted.other".to_vec()]);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.starts_with("dropping overlay xattr")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

@@ -410,13 +410,11 @@ pub fn apply_layer_reporting(ops: &[Op], layer: u64, lower: &State) -> Result<(S
     Ok((s, implicit))
 }
 
-/// overlayfs: `layer` on top of the merged state `lower`.
+/// overlayfs: `layer` on top of the merged state `lower`. overlayfs ignores an
+/// opaque marker on a layer's root, so the root's `opaque` flag has no effect.
 pub fn merge(lower: &State, layer: &State) -> State {
     let mut out = lower.clone();
     let root = &layer[""];
-    if root.opaque {
-        out.retain(|k, _| k.is_empty());
-    }
     let r = out.get_mut("").expect("root");
     r.mode = root.mode;
     r.uid = root.uid;
@@ -674,7 +672,8 @@ pub fn hits_deferred_dir_times(layers: &[Vec<Op>]) -> bool {
 /// containerd resolves an implicit parent by searching each lower layer on its own,
 /// skipping non-directories and ignoring whiteouts and opaque directories; kiln uses
 /// the overlay view. They agree unless a lower layer has a non-directory at the path
-/// or one of its parents, or an opaque parent; builders never omit such parents.
+/// or one of its parents, or an opaque non-root parent (an opaque root hides nothing);
+/// builders never omit such parents.
 pub fn ambiguous_inheritance(layers: &[Vec<Op>]) -> bool {
     let mut merged = initial();
     let mut below: Vec<State> = Vec::new();
@@ -686,10 +685,11 @@ pub fn ambiguous_inheritance(layers: &[Vec<Op>]) -> bool {
             let mut prefixes = vec![String::new()];
             prefixes.extend(parent_prefixes(p));
             for lower in &below {
-                if prefixes
-                    .iter()
-                    .any(|q| lower.get(q).is_some_and(|n| n.kind != MKind::Dir || n.opaque))
-                    || lower.get(p).is_some_and(|n| n.kind != MKind::Dir)
+                if prefixes.iter().any(|q| {
+                    lower
+                        .get(q)
+                        .is_some_and(|n| n.kind != MKind::Dir || (n.opaque && !q.is_empty()))
+                }) || lower.get(p).is_some_and(|n| n.kind != MKind::Dir)
                 {
                     return true;
                 }

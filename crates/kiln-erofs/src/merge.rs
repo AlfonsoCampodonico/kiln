@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::ondisk::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG};
 use crate::path::components;
 use crate::reader::{Image, InodeInfo};
-use crate::tree::{Data, DirAttrs, Kind, Meta, Node, NodeId, Timestamp, Tree, XattrKey};
+use crate::tree::{Data, DirAttrs, Kind, Meta, Node, NodeId, Timestamp, Tree, XattrKey, Xattrs};
 use crate::writer::{DataStore, ExternalData, LayerSummary, emit};
 
 fn meta_of(info: &InodeInfo) -> Meta {
@@ -49,6 +49,11 @@ pub fn resolve_inherited<R: Read + Seek>(
     Ok(out)
 }
 
+/// overlayfs treats a directory as opaque only when `trusted.overlay.opaque` is exactly `y`.
+fn is_opaque(xattrs: &Xattrs) -> bool {
+    xattrs.get(&XattrKey::opaque()).is_some_and(|v| v.as_slice() == b"y")
+}
+
 /// The topmost `(layer, nid)` providing `path` in the overlay of `layers`.
 fn merged_lookup<R: Read + Seek>(layers: &mut [Image<R>], path: &[u8]) -> Result<Option<(usize, u64)>> {
     let comps: Vec<&[u8]> = components(path).collect();
@@ -58,7 +63,8 @@ fn merged_lookup<R: Read + Seek>(layers: &mut [Image<R>], path: &[u8]) -> Result
         if comps.is_empty() {
             return Ok(Some((layer, cur)));
         }
-        let mut opaque_above = img.xattrs(cur)?.contains_key(&XattrKey::opaque());
+        // overlayfs ignores an opaque marker on a layer's root directory.
+        let mut opaque_above = false;
         for (i, c) in comps.iter().enumerate() {
             let Some(entry) = img.read_dir(cur)?.into_iter().find(|e| e.name == *c) else {
                 break;
@@ -73,7 +79,7 @@ fn merged_lookup<R: Read + Seek>(layers: &mut [Image<R>], path: &[u8]) -> Result
             if !info.is_dir() {
                 return Ok(None);
             }
-            if img.xattrs(entry.nid)?.contains_key(&XattrKey::opaque()) {
+            if is_opaque(&img.xattrs(entry.nid)?) {
                 opaque_above = true;
             }
             cur = entry.nid;
@@ -170,7 +176,8 @@ fn overlay(merged: &mut Tree, upper: &Tree) {
     let mut mapped: HashMap<NodeId, NodeId> = HashMap::new();
     let mut queue = VecDeque::from([(upper.root, merged_root)]);
     while let Some((upper_dir, merged_dir)) = queue.pop_front() {
-        if upper.nodes[upper_dir].xattrs.contains_key(&XattrKey::opaque()) {
+        // As in overlayfs, an opaque root hides nothing.
+        if upper_dir != upper.root && is_opaque(&upper.nodes[upper_dir].xattrs) {
             merged.children_mut(merged_dir).clear();
         }
         for (name, &uc) in upper.children(upper_dir).expect("queued nodes are directories") {
@@ -230,4 +237,19 @@ pub fn squash<R: Read + Seek, W: Read + Write + Seek>(
             warnings: Vec::new(),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opaque_only_when_value_is_y() {
+        let with = |v: &[u8]| Xattrs::from([(XattrKey::opaque(), v.to_vec())]);
+        assert!(is_opaque(&with(b"y")));
+        for v in [&b""[..], b"n", b"Y", b"yes", b"y\0"] {
+            assert!(!is_opaque(&with(v)), "{v:?}");
+        }
+        assert!(!is_opaque(&Xattrs::new()));
+    }
 }

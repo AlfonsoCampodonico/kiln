@@ -356,6 +356,20 @@ mod linux {
         out
     }
 
+    /// Asserts that `fsck.erofs` accepts the image at `path`.
+    pub fn fsck(path: &Path, what: &str) {
+        let out = Command::new("fsck.erofs")
+            .arg(path)
+            .output()
+            .expect("fsck.erofs is installed (erofs-utils)");
+        assert!(
+            out.status.success(),
+            "fsck.erofs {what}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// Unmounts on drop. Declare outer mounts after inner ones so they drop first.
     pub struct Mount(PathBuf);
 
