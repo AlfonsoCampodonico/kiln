@@ -44,13 +44,15 @@ fn tar_err(e: io::Error) -> Error {
 }
 
 /// Check if a global PAX header contains any recognized keys that would cause unbounded amplification.
+/// Uses raw byte matching (no UTF-8 conversion) to prevent bypass via non-UTF-8 keys.
 fn has_recognized_pax_keys(records: &[(Vec<u8>, Vec<u8>)]) -> bool {
     for (key, _) in records {
-        let key_str = std::str::from_utf8(key).unwrap_or("");
-        if matches!(key_str, "path" | "linkpath" | "uid" | "gid" | "size" | "mtime")
-            || key_str.starts_with("SCHILY.xattr.")
-            || key_str.starts_with("GNU.sparse.")
-            || key_str.starts_with("LIBARCHIVE.xattr.")
+        if matches!(
+            key.as_slice(),
+            b"path" | b"linkpath" | b"uid" | b"gid" | b"size" | b"mtime"
+        ) || key.starts_with(b"SCHILY.xattr.")
+            || key.starts_with(b"GNU.sparse.")
+            || key.starts_with(b"LIBARCHIVE.xattr.")
         {
             return true;
         }
@@ -654,5 +656,84 @@ mod tests {
         // Should have 100 warnings + 1 suppression message = 101 total
         assert_eq!(warnings.len(), 101, "{warnings:?}");
         assert!(warnings[100].contains("50 more warnings suppressed"));
+    }
+
+    #[test]
+    fn rejects_global_pax_with_non_utf8_key() {
+        use crate::testtar::pax_record;
+
+        // Global PAX with non-UTF-8 key that matches SCHILY.xattr. pattern
+        // This tests the byte-based matching, not UTF-8 conversion bypass
+        let mut payload = Vec::new();
+        payload.extend(pax_record(b"SCHILY.xattr.user.\xff", b"v"));
+        let mut b = TarBuilder::new();
+        b.entry(b"././@PaxGlobal", b'g', &payload, b"", (0, 0), &Opts::default());
+        let l = Limits::default();
+        match collect(&b.finish(), &l) {
+            Err(Error::UnsupportedEntry { kind, .. }) => {
+                assert!(kind.contains("global PAX"));
+            }
+            e => panic!("expected UnsupportedEntry, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_gnu_longname() {
+        // Two consecutive L (GNU longname) headers should be rejected
+        let mut b = TarBuilder::new();
+        b.entry(b"././@LongLink", b'L', b"name1\0", b"", (0, 0), &Opts::default())
+            .entry(b"././@LongLink", b'L', b"name2\0", b"", (0, 0), &Opts::default())
+            .file("f", b"", &Opts::default());
+        let l = Limits::default();
+        match collect(&b.finish(), &l) {
+            Err(Error::MalformedTar(msg)) => {
+                assert!(msg.contains("duplicate L header"));
+            }
+            e => panic!("expected MalformedTar, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_gnu_longlink() {
+        // Two consecutive K (GNU longlink) headers should be rejected
+        let mut b = TarBuilder::new();
+        b.entry(b"././@LongLink", b'K', b"link1\0", b"", (0, 0), &Opts::default())
+            .entry(b"././@LongLink", b'K', b"link2\0", b"", (0, 0), &Opts::default())
+            .file("f", b"", &Opts::default());
+        let l = Limits::default();
+        match collect(&b.finish(), &l) {
+            Err(Error::MalformedTar(msg)) => {
+                assert!(msg.contains("duplicate K header"));
+            }
+            e => panic!("expected MalformedTar, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn rejects_v7_directory_with_size() {
+        // V7 typeflag-0 trailing-slash directory with nonzero size
+        let mut b = TarBuilder::new();
+        b.entry(b"dir/", 0, &[0u8; 8], b"", (0, 0), &Opts::default());
+        let l = Limits::default();
+        match collect(&b.finish(), &l) {
+            Err(Error::UnsupportedEntry { kind, .. }) => {
+                assert!(kind.contains("header-only"));
+            }
+            e => panic!("expected UnsupportedEntry, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn rejects_symlink_with_size() {
+        // Symlink (EntryType::Symlink) with nonzero size
+        let mut b = TarBuilder::new();
+        b.entry(b"link", b'2', &[0u8; 8], b"target", (0, 0), &Opts::default());
+        let l = Limits::default();
+        match collect(&b.finish(), &l) {
+            Err(Error::UnsupportedEntry { kind, .. }) => {
+                assert!(kind.contains("header-only"));
+            }
+            e => panic!("expected UnsupportedEntry, got {:?}", e),
+        }
     }
 }
