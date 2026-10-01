@@ -67,9 +67,24 @@ pub(crate) struct DataStore<W> {
 }
 
 impl<W: Read + Write + Seek> DataStore<W> {
+    /// `out` must be empty, readable (relocation reads data back) and not in append
+    /// mode. The first two are checked here.
     pub fn new(mut out: W, spill_dir: &Path) -> Result<Self> {
-        out.seek(SeekFrom::Start(0))?;
+        if out.seek(SeekFrom::End(0))? != 0 {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output must be empty",
+            )));
+        }
         out.write_all(&ZEROS)?;
+        out.seek(SeekFrom::Start(0))?;
+        out.read_exact(&mut [0u8; 1]).map_err(|_| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output must be readable (open read+write)",
+            ))
+        })?;
+        out.seek(SeekFrom::Start(BLOCK_SIZE))?;
         Ok(Self {
             out,
             next_blk: 1,
@@ -477,6 +492,11 @@ pub struct LayerWriter<W: Read + Write + Seek> {
 
 impl<W: Read + Write + Seek> LayerWriter<W> {
     /// `spill_dir` holds a temporary file for inline tails; it should be on local disk.
+    ///
+    /// `out` must be empty, readable as well as writable (a file opened read+write:
+    /// the writer reads data back when it relocates a file), and not in append mode
+    /// (the writer seeks and overwrites). An output that is not empty or not readable
+    /// is rejected with `Error::Io` of kind `InvalidInput`.
     pub fn new(out: W, spill_dir: &Path, limits: Limits) -> Result<Self> {
         Ok(Self {
             store: DataStore::new(out, spill_dir)?,
