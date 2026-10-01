@@ -346,7 +346,7 @@ A compact inode is used only when **all** of these hold. Otherwise the inode is 
 - The superblock UUID is all zeros, the volume name is empty, and there is no superblock checksum feature.
 - Base time is the minimum `(sec, nsec)` mtime of the layer's explicit entries (directory, file, symlink, device, FIFO, whiteout, hardlink; opaque markers excluded), stored as `epoch` and `fixed_nsec`. An empty layer uses base time 0.
 - Inode numbering follows a breadth-first traversal in sorted name order.
-- Hardlink groups are numbered by first appearance in tar order, and the canonical path is the first one in tar order.
+- Inodes, including hardlinked ones, are numbered at their first occurrence in the breadth-first walk (as in `docs/format.md`).
 - Inline xattrs are sorted by `(name index, name bytes)`.
   - An xattr goes into the shared table when it occurs on ≥ 2 inodes.
   - The shared table is ordered by first use in inode-numbering order.
@@ -368,6 +368,8 @@ These rules match containerd's `archive.Apply`, which is the test oracle (§11.2
   - `.wh..wh..opq` becomes `trusted.overlay.opaque=y` on the containing directory.
   - Collisions are decided by the **translated** name. A whiteout for a name that already exists in the same layer is an error: OCI says a whiteout cannot hide its own layer, and containerd rejects it. A real entry after a whiteout replaces it.
   - An opaque marker hides only lower layers, never entries from the same layer, regardless of order.
+  - A root-level opaque marker has no effect on the merged view, as in overlayfs, and a directory is opaque only when `trusted.overlay.opaque` is exactly `y`.
+  - `trusted.overlay.*` xattrs supplied by the tar are dropped with a warning; only whiteout entries produce overlay markers.
 - **Entry types:**
   - Supported: regular files, directories, symlinks, hardlinks, char and block devices, FIFOs.
   - Sockets are skipped with a warning.
