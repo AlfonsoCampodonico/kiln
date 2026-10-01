@@ -2,11 +2,9 @@
 
 mod common;
 
-use std::path::Path;
-use std::process::Command;
-
-use common::{Mount, convert, convert_stack, fixtures, groups, is_root, squash_all, view, walk, walk_fs};
+use common::{Mount, convert, convert_stack, fixtures, fsck, groups, is_root, squash_all, view, walk, walk_fs};
 use kiln_erofs::testtar::{Opts, TarBuilder};
+use std::path::Path;
 
 fn enabled() -> bool {
     std::env::var_os("KILN_KERNEL_TESTS").is_some()
@@ -58,16 +56,7 @@ fn fsck_accepts_every_image() {
     }
     for (name, img) in images {
         let path = write_tmp(dir.path(), &format!("{name}.erofs"), &img);
-        let out = Command::new("fsck.erofs")
-            .arg(&path)
-            .output()
-            .expect("fsck.erofs is installed (erofs-utils)");
-        assert!(
-            out.status.success(),
-            "fsck.erofs {name}: {}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        fsck(&path, &name);
     }
 }
 
