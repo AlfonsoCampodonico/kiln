@@ -11,6 +11,7 @@ mod limits;
 pub mod ondisk;
 mod path;
 mod pax;
+mod reader;
 mod tarstream;
 #[doc(hidden)]
 pub mod testtar;
@@ -19,6 +20,7 @@ mod writer;
 
 pub use error::{Error, Result};
 pub use limits::Limits;
+pub use reader::{DataReader, DirEntry, Image, InodeInfo};
 pub use tree::{DirAttrs, Meta, Timestamp, XattrKey, Xattrs};
 pub use writer::{LayerSummary, LayerWriter};
 
