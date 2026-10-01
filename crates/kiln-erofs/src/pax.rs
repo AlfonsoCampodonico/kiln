@@ -145,9 +145,64 @@ mod tests {
 
     #[test]
     fn rejects_malformed_records() {
-        assert!(parse_records(b"99 path=x\n").is_err());
-        assert!(parse_records(b"x path=x\n").is_err());
-        assert!(parse_records(b"9 pathx\n").is_err());
+        // record missing '=' - valid length, valid newline, but no '='
+        // "6 abc\n" = 6 bytes: '6' (1) + ' ' (1) + 'a' (1) + 'b' (1) + 'c' (1) + '\n' (1) = 6
+        assert!(matches!(
+            parse_records(b"6 abc\n"),
+            Err(Error::MalformedTar(m)) if m.contains("record missing '='")
+        ));
+
+        // record missing newline - valid length, valid '=', but no newline
+        // "5 a=b" = 5 bytes: '5' (1) + ' ' (1) + 'a' (1) + '=' (1) + 'b' (1) = 5
+        assert!(matches!(
+            parse_records(b"5 a=b"),
+            Err(Error::MalformedTar(m)) if m.contains("record missing newline")
+        ));
+
+        // missing length - no space found at all
+        assert!(matches!(
+            parse_records(b"12"),
+            Err(Error::MalformedTar(m)) if m.contains("missing length")
+        ));
+
+        // record length out of range: len <= sp + 1
+        // "2 x" = sp=1, len=2, and 2 <= 1+1 is true (guard fails)
+        assert!(matches!(
+            parse_records(b"2 x"),
+            Err(Error::MalformedTar(m)) if m.contains("record length out of range")
+        ));
+        // "1 x" = sp=1, len=1, and 1 <= 1+1 is true (guard fails)
+        assert!(matches!(
+            parse_records(b"1 x"),
+            Err(Error::MalformedTar(m)) if m.contains("record length out of range")
+        ));
+
+        // record length out of range: len > rest.len()
+        // Claims 99 bytes but only 8 bytes available
+        assert!(matches!(
+            parse_records(b"99 k=v\n"),
+            Err(Error::MalformedTar(m)) if m.contains("record length out of range")
+        ));
+
+        // bad length - can't parse as usize
+        assert!(matches!(
+            parse_records(b"x path=x\n"),
+            Err(Error::MalformedTar(m)) if m.contains("bad length")
+        ));
+
+        // overflow - very large number that overflows usize parsing
+        assert!(matches!(
+            parse_records(b"99999999999999999999999 k=v\n"),
+            Err(Error::MalformedTar(m)) if m.contains("bad length")
+        ));
+
+        // valid first record followed by truncated second record (incomplete)
+        let mut data = pax_record(b"a", b"b");
+        data.extend_from_slice(b"10"); // incomplete second record (claims 10 bytes but not enough data)
+        assert!(matches!(
+            parse_records(&data),
+            Err(Error::MalformedTar(m)) if m.contains("missing length")
+        ));
     }
 
     #[test]
