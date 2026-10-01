@@ -130,3 +130,50 @@ pub fn squash_all(layers: &[Vec<u8>]) -> Vec<u8> {
     let (out, _) = squash(&mut imgs, Cursor::new(Vec::new()), dir.path()).unwrap();
     out.into_inner()
 }
+
+use std::collections::BTreeSet;
+
+/// The comparable projection of a `Seen`. Mtime is `None` for directories when ignored.
+pub type View = (
+    char,
+    u32,
+    u32,
+    u32,
+    Option<(i64, u32)>,
+    BTreeMap<Vec<u8>, Vec<u8>>,
+    Vec<u8>,
+    (u32, u32),
+);
+
+pub fn view(m: &BTreeMap<Vec<u8>, Seen>, ignore_dir_mtime: bool) -> BTreeMap<Vec<u8>, View> {
+    m.iter()
+        .map(|(path, s)| {
+            let mtime = if ignore_dir_mtime && s.kind == 'd' {
+                None
+            } else {
+                Some(s.mtime)
+            };
+            let xattrs = s
+                .xattrs
+                .iter()
+                .filter(|(k, _)| !k.starts_with(b"trusted.overlay."))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            (
+                path.clone(),
+                (s.kind, s.mode, s.uid, s.gid, mtime, xattrs, s.data.clone(), s.rdev),
+            )
+        })
+        .collect()
+}
+
+/// Hardlink groups: sets of non-directory paths that share an inode (size ≥ 2).
+pub fn groups(m: &BTreeMap<Vec<u8>, Seen>) -> BTreeSet<Vec<Vec<u8>>> {
+    let mut by_nid: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
+    for (path, s) in m {
+        if s.kind != 'd' {
+            by_nid.entry(s.nid).or_default().push(path.clone());
+        }
+    }
+    by_nid.into_values().filter(|g| g.len() > 1).collect()
+}
