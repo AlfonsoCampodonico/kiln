@@ -2,6 +2,7 @@ mod common;
 
 use common::{convert_stack, p, squash_all, walk};
 use kiln_erofs::testtar::{Opts, TarBuilder};
+use std::io::Cursor;
 
 fn t(b: &mut TarBuilder) -> Vec<u8> {
     b.finish()
@@ -115,4 +116,34 @@ fn squash_copies_file_data_and_is_deterministic() {
     assert_eq!(w[&p("big")].data, big);
     assert_eq!(w[&p("s")].data, b"big");
     assert_eq!(a, squash_all(&layers));
+}
+
+#[test]
+fn squash_of_empty_stack_is_root_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut imgs: Vec<kiln_erofs::Image<Cursor<&[u8]>>> = Vec::new();
+    let (out, _) = kiln_erofs::squash(&mut imgs, Cursor::new(Vec::new()), dir.path()).unwrap();
+    let img = out.into_inner();
+    let w = walk(&img);
+    assert_eq!(w.len(), 1);
+    assert!(w.contains_key(&p("")));
+    assert_eq!(w[&p("")].kind, 'd');
+}
+
+#[test]
+fn squash_base_time_is_min_reachable_mtime() {
+    let l0 = t(TarBuilder::new().file("old", b"", &Opts::default().mtime(100)).file(
+        "keep",
+        b"",
+        &Opts::default().mtime(500),
+    ));
+    let l1 = t(TarBuilder::new().whiteout("old"));
+    let layers = convert_stack(&[l0, l1]);
+    let img = squash_all(&layers);
+    let w = walk(&img);
+    let sb = kiln_erofs::ondisk::SuperBlock::decode(&img[1024..]).unwrap();
+    assert_eq!(sb.epoch, 500, "base time should be min of reachable mtimes");
+    assert_eq!(sb.fixed_nsec, 0);
+    assert!(w[&p("keep")].compact);
+    assert!(!w.contains_key(&p("old")), "old should be whited out");
 }
