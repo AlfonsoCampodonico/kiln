@@ -6,7 +6,8 @@
 pub struct Limits {
     /// Maximum uncompressed tar bytes consumed for one layer.
     pub max_layer_bytes: u64,
-    /// Maximum filesystem entries in one layer.
+    /// Maximum filesystem entries in one layer: tar headers, and separately every
+    /// tree entry the layer creates, implicit parent directories included.
     pub max_entries: u64,
     /// Maximum size of one PAX header, GNU long name or link, or xattr value.
     pub max_header_record: u64,
