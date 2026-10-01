@@ -25,25 +25,24 @@ A kiln layer image is a Linux erofs filesystem restricted as follows. Readers re
 ### Layout
 
 ```
-block 0          zeros, with the superblock at byte 1024
-data area        file data in tar order (or inode order when squashed), then directory
-                 and symlink bodies that are not fully inline, in inode order;
-                 a regular file whose streamed inline tail no longer fits (because
-                 a later hardlink header added xattrs to its inode) is relocated in
-                 inode order, with blocks copied to new contiguous FLAT_PLAIN blocks,
-                 the tail zero-padded, and original blocks staying as unused bytes
-xattr table      shared xattr entries, each 4-byte aligned (optional)
-metadata area    32-byte slots; slot 0 is zero; inodes from nid 1, in inode order
+block 0               zeros, with the superblock at byte 1024
+streamed file data    in tar order
+external file data    squash only, in inode order
+relocated file data   in inode order (blocks copied to new contiguous FLAT_PLAIN;
+                      tail zero-padded; original blocks stay as unused bytes)
+directory/symlink     bodies not fully inline, in inode order
+xattr table           shared xattr entries, each 4-byte aligned (optional)
+metadata area         32-byte slots; slot 0 is zero; inodes from nid 1, in inode order
 ```
 
 The image ends at a 4096-byte boundary.
 
 ### Inodes
 
-- **Numbering:** inodes are numbered breadth-first from the root, visiting directory entries in byte order of their names. A hardlinked inode takes its number at its first occurrence.
+- **Numbering:** inodes are numbered breadth-first from the root, visiting directory entries in byte order of their names. A hardlinked inode takes its number at its first occurrence in the breadth-first walk.
 - **Data layouts:** only `FLAT_PLAIN` (0) and `FLAT_INLINE` (2). `i_format` bit 4 is never set.
 - **Inline tails:** a tail is inline only when it fits after the inode and its xattrs within one block.
-  - For regular files, that is decided while streaming, assuming the worst case (a 64-byte inode and all xattrs inline): `tail + 64 + 12 + Σ entry sizes ≤ 4096`.
+  - For regular files, that is decided while streaming, assuming the worst case (a 64-byte inode and all xattrs inline): `tail + 64 + X ≤ 4096`, where X = 0 for a file without xattrs, and otherwise X = `12 + Σ entry sizes` with entry size = round_up(4 + name_len + value_len, 4). Thus a file with no xattrs can inline a tail of up to 4032 bytes.
   - For directories and symlinks, it is decided exactly.
 - **Compact vs extended:** a 32-byte compact inode is used only when all of these hold. Otherwise the inode is 64-byte extended.
   - uid ≤ 65535 and gid ≤ 65535
@@ -89,7 +88,15 @@ The image ends at a 4096-byte boundary.
   - `.wh.<name>` hides `<name>` in lower layers.
   - It is an error if `<name>` already exists in the same layer. A later entry with that name replaces the whiteout.
   - `.wh..wh..opq` marks its directory opaque.
-- **Unsupported entries:** sparse entries, PAX size overrides, and devices with major > 4095 or minor > 1048575 are errors. Xattrs outside the five namespaces above are dropped with a warning. Conversion warnings are capped at 100, followed by one "N more warnings suppressed" line. Header-only entries (hardlink, symlink, directory, device, FIFO, V7 trailing-slash directory) whose tar header size is nonzero are errors. A global PAX (`g`) header carrying any key kiln acts on (path, linkpath, uid, gid, size, mtime, `SCHILY.xattr.*`, `GNU.sparse.*`, `LIBARCHIVE.xattr.*`) is an error. More than one pending `x`, `L` or `K` header before a single entry is an error.
+- **Unsupported entries** are errors:
+  - Sparse entries.
+  - A PAX size that differs from the header size.
+  - Devices with major > 4095 or minor > 1048575.
+  - Header-only entries (hardlink, symlink, directory, device, FIFO, V7 trailing-slash directory) whose tar header size is nonzero.
+  - A global PAX (`g`) header carrying any key kiln acts on (path, linkpath, uid, gid, size, mtime, `SCHILY.xattr.*`, `GNU.sparse.*`, `LIBARCHIVE.xattr.*`).
+  - More than one pending header of the same type (x, L or K) before one entry.
+  - Xattrs outside the five namespaces above are dropped with a warning.
+  - Conversion warnings are capped at 100, followed by one "N more warnings suppressed" line.
 
 ### Implicit directories
 
