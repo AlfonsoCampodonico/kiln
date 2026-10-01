@@ -6,6 +6,7 @@
 
 mod error;
 mod limits;
+pub mod ondisk;
 
 pub use error::{Error, Result};
 pub use limits::Limits;
