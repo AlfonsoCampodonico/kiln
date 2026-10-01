@@ -10,6 +10,7 @@ mod limits;
 pub mod ondisk;
 mod path;
 mod pax;
+mod tarstream;
 #[doc(hidden)]
 pub mod testtar;
 mod tree;
