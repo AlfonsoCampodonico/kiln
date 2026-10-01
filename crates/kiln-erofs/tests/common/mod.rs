@@ -11,6 +11,11 @@ use kiln_erofs::{Image, LayerSummary, LayerWriter, Limits};
 /// rejects malformed `security.capability` values with EINVAL).
 pub const CAP_NET_BIND_SERVICE: [u8; 20] = [0, 0, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
+/// Valid minimal POSIX ACL v2: USER_OBJ rw-, GROUP_OBJ r--, OTHER r--.
+pub const ACL_MINIMAL: [u8; 28] = [
+    2, 0, 0, 0, 1, 0, 6, 0, 255, 255, 255, 255, 4, 0, 4, 0, 255, 255, 255, 255, 32, 0, 4, 0, 255, 255, 255, 255,
+];
+
 /// Fixed layers covering every entry kind and layout decision.
 pub fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
     let pattern = |n: usize| -> Vec<u8> { (0..n).map(|i| (i * 7 % 256) as u8).collect() };
@@ -49,10 +54,37 @@ pub fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
     for sub in ["d/x", "d/y", "d/z"] {
         many.dir(sub, &Opts::default().mode(0o750));
     }
+    let relocate = TarBuilder::new()
+        .file("a", &pattern(4096 + 4030), &Opts::default())
+        .entry(
+            b"b",
+            b'1',
+            b"",
+            b"a",
+            (0, 0),
+            &Opts::default().xattr("user.k", &[1u8; 64]),
+        )
+        .finish();
+    let xattrs = TarBuilder::new()
+        .file(
+            "forced",
+            &vec![7u8; 4030],
+            &Opts::default().xattr("user.big", &vec![7u8; 4030]),
+        )
+        .file("plain", &pattern(4090), &Opts::default().xattr("user.k", &[9u8; 100]))
+        .file(
+            "acl",
+            &[],
+            &Opts::default().xattr("system.posix_acl_access", &ACL_MINIMAL),
+        )
+        .entry(b"dev/sda", b'4', b"", b"", (8, 0), &Opts::default().mode(0o660))
+        .finish();
     vec![
         ("empty", TarBuilder::new().finish()),
         ("mixed", mixed),
         ("many", many.finish()),
+        ("relocate", relocate),
+        ("xattrs", xattrs),
     ]
 }
 

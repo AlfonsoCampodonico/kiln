@@ -22,8 +22,12 @@ jobs:
         with:
           fetch-depth: 0
       - name: Existing golden files must not change
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          changed=$(git diff --name-status "origin/${{ github.base_ref }}...HEAD" -- crates/kiln-erofs/tests/golden/ | awk '$1 != "A"')
+          set -euo pipefail
+          changed=$(git diff --name-status "origin/$BASE_REF...HEAD" -- crates/kiln-erofs/tests/golden/ | awk '$1 != "A"')
           if [ -n "$changed" ]; then
             echo "Golden digests are immutable. Bump kiln_erofs::FORMAT_VERSION and add a new digests-vN.txt:"
             echo "$changed"
