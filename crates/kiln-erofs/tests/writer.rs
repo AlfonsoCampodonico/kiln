@@ -166,3 +166,58 @@ fn implicit_directories_count_against_max_entries() {
     write_limited(&flat, 50).expect("50 flat entries fit a limit of 50");
     assert!(write_limited(&flat, 49).is_err());
 }
+
+#[test]
+fn output_must_be_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = LayerWriter::new(Cursor::new(vec![1u8]), dir.path(), Limits::default())
+        .err()
+        .expect("a non-empty output is rejected");
+    assert!(
+        matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput && e.to_string() == "output must be empty"),
+        "{err:?}"
+    );
+    let mut imgs: Vec<kiln_erofs::Image<Cursor<&[u8]>>> = Vec::new();
+    let err = kiln_erofs::squash(&mut imgs, Cursor::new(vec![0u8; 4096]), dir.path())
+        .expect_err("squash rejects a non-empty output too");
+    assert!(
+        matches!(&err, Error::Io(e) if e.to_string() == "output must be empty"),
+        "{err:?}"
+    );
+}
+
+/// Seekable and writable, but every read fails, like a file opened write-only.
+struct WriteOnly(Cursor<Vec<u8>>);
+
+impl std::io::Read for WriteOnly {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from_raw_os_error(9)) // EBADF
+    }
+}
+
+impl std::io::Write for WriteOnly {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for WriteOnly {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+#[test]
+fn output_must_be_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = LayerWriter::new(WriteOnly(Cursor::new(Vec::new())), dir.path(), Limits::default())
+        .err()
+        .expect("a write-only output is rejected up front");
+    assert!(
+        matches!(&err, Error::Io(e) if e.to_string() == "output must be readable (open read+write)"),
+        "{err:?}"
+    );
+}

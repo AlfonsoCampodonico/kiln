@@ -214,6 +214,9 @@ impl<R: Read + Seek> ExternalData for Sources<'_, R> {
 }
 
 /// Merges `layers` (bottom first) into one bottom layer with no overlay markers.
+///
+/// `out` has the same contract as for `LayerWriter::new`: it must be empty, readable
+/// as well as writable, and not in append mode.
 pub fn squash<R: Read + Seek, W: Read + Write + Seek>(
     layers: &mut [Image<R>],
     out: W,
