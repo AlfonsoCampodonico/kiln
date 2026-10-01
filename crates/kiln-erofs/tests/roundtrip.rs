@@ -211,3 +211,123 @@ fn open_rejects_truncated_and_foreign_images() {
         Err(Error::ProfileViolation(_))
     ));
 }
+
+#[test]
+fn bad_nameoff0_returns_corrupt() {
+    let tar = TarBuilder::new()
+        .file("a", b"x", &Opts::default())
+        .file("b", b"y", &Opts::default())
+        .finish();
+    let (mut img, _) = convert(&tar);
+    let sb = kiln_erofs::ondisk::SuperBlock::decode(&img[1024..1024 + 128]).unwrap();
+    let root_dir_body_off = sb.meta_blkaddr as usize * 4096 + 32 + 32;
+    // Set bytes [8..10] of root dir body (nameoff0) to 5, which is invalid (not a multiple of 12)
+    img[root_dir_body_off + 8] = 5;
+    img[root_dir_body_off + 9] = 0;
+    let mut image = Image::open(Cursor::new(img.as_slice())).unwrap();
+    assert!(matches!(image.read_dir(1), Err(Error::Corrupt(_))));
+}
+
+#[test]
+fn unsorted_entries_returns_corrupt() {
+    let tar = TarBuilder::new()
+        .file("a", b"x", &Opts::default())
+        .file("b", b"y", &Opts::default())
+        .finish();
+    let (mut img, _) = convert(&tar);
+    let sb = kiln_erofs::ondisk::SuperBlock::decode(&img[1024..1024 + 128]).unwrap();
+    let root_dir_body_off = sb.meta_blkaddr as usize * 4096 + 32 + 32;
+    // Root dir has 4 dirents (., .., a, b) of 12 bytes each (48 bytes total)
+    // Then names at byte 48 of the body: ".", "..", "a", "b"
+    // Swap the last two name bytes to make them "b", "a"
+    // Names are at offsets: root_dir_body_off + 48 + nameoff
+    // "a" is at root_dir_body_off + 51, "b" is at root_dir_body_off + 52
+    img[root_dir_body_off + 51] = b'b';
+    img[root_dir_body_off + 52] = b'a';
+    let mut image = Image::open(Cursor::new(img.as_slice())).unwrap();
+    assert!(matches!(image.read_dir(1), Err(Error::Corrupt(_))));
+}
+
+#[test]
+fn nid_out_of_range_returns_corrupt() {
+    let tar = TarBuilder::new()
+        .file("a", b"x", &Opts::default())
+        .file("b", b"y", &Opts::default())
+        .finish();
+    let (mut img, _) = convert(&tar);
+    let sb = kiln_erofs::ondisk::SuperBlock::decode(&img[1024..1024 + 128]).unwrap();
+    let root_dir_body_off = sb.meta_blkaddr as usize * 4096 + 32 + 32;
+    // Set dirent #2's nid (directory entry for "a", at bytes [24..32] of body) to u64::MAX >> 1
+    let bad_nid = (u64::MAX >> 1).to_le_bytes();
+    img[root_dir_body_off + 24..root_dir_body_off + 32].copy_from_slice(&bad_nid);
+    let mut image = Image::open(Cursor::new(img.as_slice())).unwrap();
+    // Both inode and lookup should fail
+    let nid_from_dir = image
+        .read_dir(1)
+        .unwrap()
+        .iter()
+        .find(|e| e.name == p("a"))
+        .map(|e| e.nid);
+    if let Some(nid) = nid_from_dir {
+        assert!(matches!(image.inode(nid), Err(Error::Corrupt(_))));
+    }
+}
+
+#[test]
+fn inline_data_crossing_block_returns_corrupt() {
+    let tar = TarBuilder::new()
+        .file("a", b"x", &Opts::default())
+        .file("b", b"y", &Opts::default())
+        .finish();
+    let (mut img, _) = convert(&tar);
+    let sb = kiln_erofs::ondisk::SuperBlock::decode(&img[1024..1024 + 128]).unwrap();
+    // Find inode of "a" by looking at root dir
+    let mut image = Image::open(Cursor::new(img.as_slice())).unwrap();
+    let a_nid = image
+        .read_dir(1)
+        .unwrap()
+        .iter()
+        .find(|e| e.name == p("a"))
+        .unwrap()
+        .nid;
+
+    let iloc_a = sb.meta_blkaddr as usize * 4096 + a_nid as usize * 32;
+    // Set i_size (u32 at offset 8 in the compact inode) to 4000
+    // This should cause the tail to cross a block boundary
+    let size_4000 = (4000u32).to_le_bytes();
+    img[iloc_a + 8..iloc_a + 12].copy_from_slice(&size_4000);
+
+    let mut image = Image::open(Cursor::new(img.as_slice())).unwrap();
+    assert!(matches!(image.read_data(a_nid), Err(Error::Corrupt(_))));
+}
+
+#[test]
+fn xattr_value_overrun_returns_corrupt() {
+    let tar = TarBuilder::new()
+        .file("a", b"x", &Opts::default().xattr("user.k", b"v"))
+        .file("b", b"y", &Opts::default())
+        .finish();
+    let (mut img, _) = convert(&tar);
+    let sb = kiln_erofs::ondisk::SuperBlock::decode(&img[1024..1024 + 128]).unwrap();
+
+    let mut image = Image::open(Cursor::new(img.as_slice())).unwrap();
+    let a_nid = image
+        .read_dir(1)
+        .unwrap()
+        .iter()
+        .find(|e| e.name == p("a"))
+        .unwrap()
+        .nid;
+
+    let iloc_a = sb.meta_blkaddr as usize * 4096 + a_nid as usize * 32;
+    // Compact inode is 32 bytes, xattr ibody header is 12 bytes
+    // Xattr ibody starts at iloc_a + 32
+    // First inline xattr entry starts at iloc_a + 32 + 12 = iloc_a + 44
+    // Entry format: name_len (1), index (1), value_len (u16 at offset +2)
+    // The value_len field is at offset +2 of the entry: iloc_a + 44 + 2 = iloc_a + 46
+    let bad_value_len = (60000u16).to_le_bytes();
+    img[iloc_a + 46..iloc_a + 48].copy_from_slice(&bad_value_len);
+
+    let mut image = Image::open(Cursor::new(img.as_slice())).unwrap();
+    assert!(matches!(image.xattrs(a_nid), Err(Error::Corrupt(_))));
+}
