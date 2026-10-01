@@ -4,7 +4,57 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use kiln_erofs::ondisk::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG};
+use kiln_erofs::testtar::{Opts, TarBuilder};
 use kiln_erofs::{Image, LayerSummary, LayerWriter, Limits};
+
+/// A valid `vfs_cap_data` v2 value granting cap_net_bind_service (the kernel
+/// rejects malformed `security.capability` values with EINVAL).
+pub const CAP_NET_BIND_SERVICE: [u8; 20] = [0, 0, 0, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// Fixed layers covering every entry kind and layout decision.
+pub fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
+    let pattern = |n: usize| -> Vec<u8> { (0..n).map(|i| (i * 7 % 256) as u8).collect() };
+    let mixed = TarBuilder::new()
+        .dir("etc", &Opts::default().mode(0o755))
+        .file(
+            "etc/os-release",
+            b"ID=kiln\n",
+            &Opts::default().xattr("user.common", b"1"),
+        )
+        .file(
+            "usr/bin/tool",
+            &pattern(10_000),
+            &Opts::default()
+                .mode(0o755)
+                .xattr("security.capability", &CAP_NET_BIND_SERVICE)
+                .xattr("user.common", b"1"),
+        )
+        .symlink("usr/bin/alias", "tool", &Opts::default())
+        .hardlink("usr/bin/tool2", "usr/bin/tool")
+        .chardev("dev/console", 5, 1, &Opts::default().mode(0o600))
+        .fifo("run/fifo", &Opts::default())
+        .whiteout("etc/old")
+        .dir("var/cache", &Opts::default().mode(0o755))
+        .opaque("var/cache")
+        .file(
+            "home/u/f",
+            &pattern(4096),
+            &Opts::default().uid(70_000).pax("mtime", b"1700000000.123456789"),
+        )
+        .finish();
+    let mut many = TarBuilder::new();
+    for i in 0..700 {
+        many.file(&format!("d/f{i:04}"), &pattern(i % 50), &Opts::default());
+    }
+    for sub in ["d/x", "d/y", "d/z"] {
+        many.dir(sub, &Opts::default().mode(0o750));
+    }
+    vec![
+        ("empty", TarBuilder::new().finish()),
+        ("mixed", mixed),
+        ("many", many.finish()),
+    ]
+}
 
 /// Everything a test may assert about one path in an image.
 #[derive(Debug, Clone, PartialEq, Eq)]
