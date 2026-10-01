@@ -1,13 +1,12 @@
 //! Deterministic erofs writer and reader implementing kiln's erofs profile
 //! (spec §7). One OCI layer tar becomes one erofs image.
 #![forbid(unsafe_code)]
-// Modules are wired together incrementally; Task 10 removes this allowance.
-#![allow(dead_code)]
 
 mod apply;
 mod error;
 mod layout;
 mod limits;
+mod merge;
 pub mod ondisk;
 mod path;
 mod pax;
@@ -20,6 +19,7 @@ mod writer;
 
 pub use error::{Error, Result};
 pub use limits::Limits;
+pub use merge::{resolve_inherited, squash};
 pub use reader::{DataReader, DirEntry, Image, InodeInfo};
 pub use tree::{DirAttrs, Meta, Timestamp, XattrKey, Xattrs};
 pub use writer::{LayerSummary, LayerWriter};
