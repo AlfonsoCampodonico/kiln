@@ -41,9 +41,13 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y erofs-utils jq
       - run: KILN_KERNEL_TESTS=1 cargo test -p kiln-erofs --test kernel
       - run: KILN_KERNEL_TESTS=1 scripts/run-root-test.sh kernel
+        env:
+          KILN_REQUIRE_LINUX_TESTS: "1"
       - uses: actions/setup-go@v5
         with:
           go-version: stable
           cache-dependency-path: tools/oracle/go.sum
       - run: (cd tools/oracle && go build -o "$GITHUB_WORKSPACE/target/oracle" .)
       - run: KILN_ORACLE="$GITHUB_WORKSPACE/target/oracle" scripts/run-root-test.sh oracle
+        env:
+          KILN_REQUIRE_LINUX_TESTS: "1"

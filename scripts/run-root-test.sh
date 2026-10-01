@@ -6,4 +6,4 @@ test_name="$1"
 bin=$(cargo test -p kiln-erofs --test "$test_name" --no-run --message-format=json \
   | jq -r --arg t "$test_name" 'select(.reason == "compiler-artifact" and .target.name == $t and .executable != null) | .executable' \
   | tail -1)
-sudo --preserve-env=KILN_KERNEL_TESTS,KILN_ORACLE "$bin" --test-threads=1
+sudo --preserve-env=KILN_KERNEL_TESTS,KILN_ORACLE,KILN_REQUIRE_LINUX_TESTS "$bin" --test-threads=1

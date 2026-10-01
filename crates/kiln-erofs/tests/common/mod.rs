@@ -276,6 +276,15 @@ mod linux {
 
     use super::Seen;
 
+    /// Reports a skipped Linux-only test. With `KILN_REQUIRE_LINUX_TESTS` set (CI root
+    /// steps), a skip is a failure instead of a silent pass.
+    pub fn skip(reason: &str) {
+        if std::env::var_os("KILN_REQUIRE_LINUX_TESTS").is_some() {
+            panic!("KILN_REQUIRE_LINUX_TESTS is set but the test would skip: {reason}");
+        }
+        eprintln!("skipping: {reason}");
+    }
+
     pub fn is_root() -> bool {
         Command::new("id")
             .arg("-u")

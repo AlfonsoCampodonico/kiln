@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{Mount, convert, convert_stack, fixtures, fsck, groups, is_root, squash_all, view, walk, walk_fs};
+use common::{Mount, convert, convert_stack, fixtures, fsck, groups, is_root, skip, squash_all, view, walk, walk_fs};
 use kiln_erofs::testtar::{Opts, TarBuilder};
 use std::path::Path;
 
@@ -41,7 +41,7 @@ fn write_tmp(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
 #[test]
 fn fsck_accepts_every_image() {
     if !enabled() {
-        eprintln!("skipping: set KILN_KERNEL_TESTS=1");
+        skip("set KILN_KERNEL_TESTS=1");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -63,7 +63,7 @@ fn fsck_accepts_every_image() {
 #[test]
 fn kernel_mount_matches_reader() {
     if !enabled() || !is_root() {
-        eprintln!("skipping: needs KILN_KERNEL_TESTS=1 and root");
+        skip("needs KILN_KERNEL_TESTS=1 and root");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -94,7 +94,7 @@ fn kernel_mount_matches_reader() {
 #[test]
 fn overlay_over_layers_equals_squash() {
     if !enabled() || !is_root() {
-        eprintln!("skipping: needs KILN_KERNEL_TESTS=1 and root");
+        skip("needs KILN_KERNEL_TESTS=1 and root");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
