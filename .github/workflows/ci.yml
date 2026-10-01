@@ -14,3 +14,18 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+  golden-immutable:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Existing golden files must not change
+        run: |
+          changed=$(git diff --name-status "origin/${{ github.base_ref }}...HEAD" -- crates/kiln-erofs/tests/golden/ | awk '$1 != "A"')
+          if [ -n "$changed" ]; then
+            echo "Golden digests are immutable. Bump kiln_erofs::FORMAT_VERSION and add a new digests-vN.txt:"
+            echo "$changed"
+            exit 1
+          fi
