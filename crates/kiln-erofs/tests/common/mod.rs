@@ -93,3 +93,40 @@ pub fn convert(tar: &[u8]) -> (Vec<u8>, LayerSummary) {
     let (out, summary) = w.finish(&BTreeMap::new()).unwrap();
     (out.into_inner(), summary)
 }
+
+use kiln_erofs::{resolve_inherited, squash};
+
+/// Converts layers bottom-up, resolving implicit parents against the layers below.
+pub fn try_convert_stack(tars: &[Vec<u8>]) -> kiln_erofs::Result<Vec<Vec<u8>>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for tar in tars {
+        let dir = tempfile::tempdir()?;
+        let mut w = LayerWriter::new(Cursor::new(Vec::new()), dir.path(), Limits::default())?;
+        w.append_tar(tar.as_slice())?;
+        let implicit = w.implicit_dirs();
+        let inherited = {
+            let mut lowers = out
+                .iter()
+                .map(|b| Image::open(Cursor::new(b.as_slice())))
+                .collect::<kiln_erofs::Result<Vec<_>>>()?;
+            resolve_inherited(&mut lowers, &implicit)?
+        };
+        let (cur, _) = w.finish(&inherited)?;
+        out.push(cur.into_inner());
+    }
+    Ok(out)
+}
+
+pub fn convert_stack(tars: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    try_convert_stack(tars).unwrap()
+}
+
+pub fn squash_all(layers: &[Vec<u8>]) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    let mut imgs: Vec<_> = layers
+        .iter()
+        .map(|b| Image::open(Cursor::new(b.as_slice())).unwrap())
+        .collect();
+    let (out, _) = squash(&mut imgs, Cursor::new(Vec::new()), dir.path()).unwrap();
+    out.into_inner()
+}
