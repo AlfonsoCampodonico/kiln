@@ -152,6 +152,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "xattr",
 ]
 
 [[package]]

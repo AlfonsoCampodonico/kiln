@@ -259,3 +259,131 @@ pub fn groups(m: &BTreeMap<Vec<u8>, Seen>) -> BTreeSet<Vec<Vec<u8>>> {
     }
     by_nid.into_values().filter(|g| g.len() > 1).collect()
 }
+
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub use linux::*;
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::collections::BTreeMap;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use kiln_erofs::ondisk::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG};
+
+    use super::Seen;
+
+    pub fn is_root() -> bool {
+        Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| o.stdout == b"0\n")
+            .unwrap_or(false)
+    }
+
+    /// Walks a mounted tree without following symlinks.
+    pub fn walk_fs(root: &Path) -> BTreeMap<Vec<u8>, Seen> {
+        let mut out = BTreeMap::new();
+        let mut stack = vec![(Vec::new(), root.to_path_buf())];
+        while let Some((rel, path)) = stack.pop() {
+            // overlayfs lists a whiteout that hides nothing in a directory that exists in
+            // only one layer, but lstat says ENOENT; such names are not visible files.
+            let md = match std::fs::symlink_metadata(&path) {
+                Ok(md) => md,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => panic!("lstat {}: {e}", path.display()),
+            };
+            let kind = match md.mode() & S_IFMT {
+                S_IFDIR => 'd',
+                S_IFREG => 'f',
+                S_IFLNK => 'l',
+                S_IFCHR => 'c',
+                S_IFBLK => 'b',
+                S_IFIFO => 'p',
+                _ => '?',
+            };
+            let data = match kind {
+                'f' => std::fs::read(&path).unwrap(),
+                'l' => std::fs::read_link(&path).unwrap().as_os_str().as_bytes().to_vec(),
+                _ => Vec::new(),
+            };
+            let mut xattrs = BTreeMap::new();
+            for name in xattr::list(&path).unwrap() {
+                if let Some(v) = xattr::get(&path, &name).unwrap() {
+                    xattrs.insert(name.as_bytes().to_vec(), v);
+                }
+            }
+            if kind == 'd' {
+                for e in std::fs::read_dir(&path).unwrap() {
+                    let e = e.unwrap();
+                    let mut child = rel.clone();
+                    if !child.is_empty() {
+                        child.push(b'/');
+                    }
+                    child.extend_from_slice(e.file_name().as_bytes());
+                    stack.push((child, e.path()));
+                }
+            }
+            let dev = md.rdev();
+            let major = (((dev >> 8) & 0xfff) | ((dev >> 32) & 0xffff_f000)) as u32;
+            let minor = ((dev & 0xff) | ((dev >> 12) & 0xffff_ff00)) as u32;
+            let rdev = if kind == 'c' || kind == 'b' {
+                (major, minor)
+            } else {
+                (0, 0)
+            };
+            out.insert(
+                rel,
+                Seen {
+                    kind,
+                    mode: md.mode() & 0o7777,
+                    uid: md.uid(),
+                    gid: md.gid(),
+                    mtime: (md.mtime(), md.mtime_nsec() as u32),
+                    nlink: md.nlink() as u32,
+                    xattrs,
+                    data,
+                    rdev,
+                    nid: md.ino(),
+                    compact: false,
+                    layout: 0,
+                },
+            );
+        }
+        out
+    }
+
+    /// Unmounts on drop. Declare outer mounts after inner ones so they drop first.
+    pub struct Mount(PathBuf);
+
+    impl Mount {
+        fn run(args: &[&str], target: &Path) -> Mount {
+            std::fs::create_dir_all(target).unwrap();
+            let status = Command::new("mount").args(args).arg(target).status().unwrap();
+            assert!(status.success(), "mount {args:?} {} failed", target.display());
+            Mount(target.to_path_buf())
+        }
+
+        pub fn erofs(img: &Path, target: &Path) -> Mount {
+            Self::run(&["-t", "erofs", "-o", "loop,ro", img.to_str().unwrap()], target)
+        }
+
+        pub fn overlay(lowers_top_first: &[&Path], target: &Path) -> Mount {
+            let lower: Vec<&str> = lowers_top_first.iter().map(|p| p.to_str().unwrap()).collect();
+            let opts = format!(
+                "lowerdir={},xino=on,redirect_dir=off,index=off,metacopy=off",
+                lower.join(":")
+            );
+            Self::run(&["-t", "overlay", "overlay", "-o", &opts], target)
+        }
+    }
+
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            let _ = Command::new("umount").arg(&self.0).status();
+        }
+    }
+}

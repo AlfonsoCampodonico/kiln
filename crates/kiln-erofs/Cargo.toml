@@ -13,3 +13,6 @@ thiserror = "2.0.21"
 [dev-dependencies]
 proptest = "1.11.0"
 sha2 = "0.11.0"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+xattr = "1.6.1"
