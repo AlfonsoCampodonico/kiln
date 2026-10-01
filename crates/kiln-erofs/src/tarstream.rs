@@ -175,6 +175,13 @@ fn walk<R: Read>(
         seen_gnu_longlink = false;
 
         let pax = PaxState::overlay(&global, std::mem::take(&mut local));
+        // Go's archive/tar and kiln would pick different names for these.
+        if (pax.path.is_some() && long_name.is_some()) || (pax.linkpath.is_some() && long_link.is_some()) {
+            return Err(Error::UnsupportedEntry {
+                path: lossy(pax.path.as_deref().unwrap_or(&header.path_bytes())),
+                kind: "conflicting long-name and PAX path".into(),
+            });
+        }
         let raw_path = pax
             .path
             .clone()
@@ -496,6 +503,63 @@ mod tests {
             warnings.iter().all(|w| w.starts_with("dropping overlay xattr")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn empty_pax_path_keeps_the_ustar_name() {
+        let mut b = TarBuilder::new();
+        b.file("short", b"x", &Opts::default().pax("path", b"").pax("uid", b""));
+        let (es, _, _) = collect(&b.finish(), &Limits::default()).unwrap();
+        assert_eq!(es[0].0.path, b"short");
+        assert_eq!(es[0].0.meta.uid, 0);
+    }
+
+    #[test]
+    fn rejects_gnu_long_name_together_with_pax_path() {
+        use crate::testtar::pax_record;
+        let conflict = |e: Result<Collected>| match e {
+            Err(Error::UnsupportedEntry { kind, .. }) => kind == "conflicting long-name and PAX path",
+            _ => false,
+        };
+        let mut b = TarBuilder::new();
+        b.entry(b"././@LongLink", b'L', b"gnu-name\0", b"", (0, 0), &Opts::default())
+            .entry(
+                b"././@PaxHeader",
+                b'x',
+                &pax_record(b"path", b"pax-name"),
+                b"",
+                (0, 0),
+                &Opts::default(),
+            )
+            .file("f", b"", &Opts::default());
+        assert!(conflict(collect(&b.finish(), &Limits::default())), "L + PAX path");
+        let mut b = TarBuilder::new();
+        b.entry(b"././@LongLink", b'K', b"gnu-target\0", b"", (0, 0), &Opts::default())
+            .entry(
+                b"././@PaxHeader",
+                b'x',
+                &pax_record(b"linkpath", b"pax-target"),
+                b"",
+                (0, 0),
+                &Opts::default(),
+            )
+            .symlink("s", "t", &Opts::default());
+        assert!(conflict(collect(&b.finish(), &Limits::default())), "K + PAX linkpath");
+        // Either form alone, or a long name with a PAX linkpath, is fine.
+        let mut b = TarBuilder::new();
+        b.entry(b"././@LongLink", b'L', b"gnu-name\0", b"", (0, 0), &Opts::default())
+            .entry(
+                b"././@PaxHeader",
+                b'x',
+                &pax_record(b"linkpath", b"pax-target"),
+                b"",
+                (0, 0),
+                &Opts::default(),
+            )
+            .symlink("s", "t", &Opts::default());
+        let (es, _, _) = collect(&b.finish(), &Limits::default()).unwrap();
+        assert_eq!(es[0].0.path, b"gnu-name");
+        assert!(matches!(&es[0].0.kind, EntryKind::Symlink { target } if target == b"pax-target"));
     }
 
     #[test]
