@@ -92,13 +92,28 @@ impl<R: Read + Seek> Image<R> {
             .map_err(|_| corrupt(format!("read past the end of the image at offset {off}")))
     }
 
-    fn iloc(&self, nid: u64) -> u64 {
-        u64::from(self.sb.meta_blkaddr) * BLOCK_SIZE + nid * SLOT_SIZE
+    fn iloc(&self, nid: u64) -> Result<u64> {
+        let base = u64::from(self.sb.meta_blkaddr)
+            .checked_mul(BLOCK_SIZE)
+            .ok_or_else(|| corrupt(format!("nid {nid} out of range")))?;
+        let offset = nid
+            .checked_mul(SLOT_SIZE)
+            .ok_or_else(|| corrupt(format!("nid {nid} out of range")))?;
+        let result = base
+            .checked_add(offset)
+            .ok_or_else(|| corrupt(format!("nid {nid} out of range")))?;
+        let max = u64::from(self.sb.blocks)
+            .checked_mul(BLOCK_SIZE)
+            .ok_or_else(|| corrupt(format!("nid {nid} out of range")))?;
+        if result >= max {
+            return Err(corrupt(format!("nid {nid} out of range")));
+        }
+        Ok(result)
     }
 
     pub fn inode(&mut self, nid: u64) -> Result<InodeInfo> {
         let mut b = [0u8; EXTENDED_INODE_LEN];
-        let at = self.iloc(nid);
+        let at = self.iloc(nid)?;
         self.read_at(at, &mut b[..COMPACT_INODE_LEN])?;
         if b[0] & 1 == 1 {
             self.read_at(at + COMPACT_INODE_LEN as u64, &mut b[COMPACT_INODE_LEN..])?;
@@ -145,7 +160,8 @@ impl<R: Read + Seek> Image<R> {
             return Ok(out);
         }
         let mut body = vec![0u8; info.ibody_len];
-        self.read_at(self.iloc(nid) + info.isize as u64, &mut body)?;
+        let iloc_val = self.iloc(nid)?;
+        self.read_at(iloc_val + info.isize as u64, &mut body)?;
         let shared = usize::from(body[4]);
         let mut pos = XATTR_IBODY_HEADER_LEN;
         if pos + 4 * shared > body.len() {
@@ -184,7 +200,7 @@ impl<R: Read + Seek> Image<R> {
         ))
     }
 
-    fn segments(&self, info: &InodeInfo) -> Result<Vec<(u64, u64)>> {
+    fn segments(&mut self, info: &InodeInfo) -> Result<Vec<(u64, u64)>> {
         if info.size == 0 {
             return Ok(Vec::new());
         }
@@ -193,7 +209,8 @@ impl<R: Read + Seek> Image<R> {
             return Ok(vec![(start, info.size)]);
         }
         let full = (info.size.div_ceil(BLOCK_SIZE) - 1) * BLOCK_SIZE;
-        let tail_off = self.iloc(info.nid) + (info.isize + info.ibody_len) as u64;
+        let iloc_val = self.iloc(info.nid)?;
+        let tail_off = iloc_val + (info.isize + info.ibody_len) as u64;
         let tail_len = info.size - full;
         if tail_off % BLOCK_SIZE + tail_len > BLOCK_SIZE {
             return Err(corrupt(format!(
@@ -238,7 +255,7 @@ impl<R: Read + Seek> Image<R> {
         }
         let data = self.read_data(nid)?;
         let bad = || corrupt(format!("bad directory block in nid {nid}"));
-        let mut out = Vec::new();
+        let mut all_entries = Vec::new();
         for block in data.chunks(BLOCK_SIZE as usize) {
             if block.len() < DIRENT_LEN {
                 return Err(bad());
@@ -261,18 +278,19 @@ impl<R: Read + Seek> Image<R> {
                     return Err(bad());
                 }
                 let name = block[start..end].to_vec();
-                if name != b"." && name != b".." {
-                    out.push(DirEntry {
-                        name,
-                        nid: child,
-                        file_type: ft,
-                    });
-                }
+                all_entries.push((name.clone(), child, ft));
             }
         }
-        if !out.windows(2).all(|w| w[0].name < w[1].name) {
+        // Check sort order on ALL entries including "." and ".."
+        if !all_entries.windows(2).all(|w| w[0].0 < w[1].0) {
             return Err(corrupt(format!("directory nid {nid} is not strictly sorted")));
         }
+        // Filter out "." and ".." before returning
+        let out: Vec<DirEntry> = all_entries
+            .into_iter()
+            .filter(|(name, _, _)| name != b"." && name != b"..")
+            .map(|(name, nid, file_type)| DirEntry { name, nid, file_type })
+            .collect();
         Ok(out)
     }
 
