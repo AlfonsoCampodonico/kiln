@@ -4,6 +4,7 @@
 // Modules are wired together incrementally; Task 10 removes this allowance.
 #![allow(dead_code)]
 
+mod apply;
 mod error;
 mod limits;
 pub mod ondisk;
@@ -15,4 +16,4 @@ mod tree;
 
 pub use error::{Error, Result};
 pub use limits::Limits;
-pub use tree::Timestamp;
+pub use tree::{DirAttrs, Meta, Timestamp, XattrKey, Xattrs};
