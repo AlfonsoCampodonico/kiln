@@ -6,6 +6,7 @@
 
 mod apply;
 mod error;
+mod layout;
 mod limits;
 pub mod ondisk;
 mod path;
