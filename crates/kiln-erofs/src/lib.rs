@@ -15,7 +15,12 @@ mod tarstream;
 #[doc(hidden)]
 pub mod testtar;
 mod tree;
+mod writer;
 
 pub use error::{Error, Result};
 pub use limits::Limits;
 pub use tree::{DirAttrs, Meta, Timestamp, XattrKey, Xattrs};
+pub use writer::{LayerSummary, LayerWriter};
+
+/// Version of kiln's erofs profile. Bump whenever output bytes change.
+pub const FORMAT_VERSION: u32 = 1;
