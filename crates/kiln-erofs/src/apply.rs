@@ -581,4 +581,130 @@ mod tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn hardlink_to_symlink_keeps_mode_0777() {
+        let mut b = LayerBuilder::new();
+        b.apply(entry("l", EntryKind::Symlink { target: b"x".to_vec() }, 1), None)
+            .unwrap();
+        let link = Entry {
+            path: b"h".to_vec(),
+            kind: EntryKind::Hardlink { target: b"l".to_vec() },
+            meta: Meta {
+                mode: 0o600,
+                uid: 7,
+                gid: 0,
+                mtime: Timestamp { sec: 9, nsec: 0 },
+            },
+            xattrs: Xattrs::new(),
+        };
+        b.apply(link, None).unwrap();
+        let t = b.tree();
+        let symlink = &t.nodes[t.lookup(b"l").unwrap()];
+        assert_eq!(symlink.meta.mode, 0o777, "symlink mode stays 0777");
+        assert_eq!(symlink.meta.uid, 7, "hardlink header uid applies");
+        assert_eq!(symlink.meta.mtime.sec, 9, "hardlink header mtime applies");
+    }
+
+    #[test]
+    fn base_time_includes_explicit_root_symlink_and_devices() {
+        // Explicit root directory entry
+        let mut b = LayerBuilder::new();
+        let root = entry("", EntryKind::Dir, 5);
+        b.apply(root, None).unwrap();
+        assert_eq!(
+            b.base_time(),
+            Timestamp { sec: 5, nsec: 0 },
+            "explicit root counts as base_time"
+        );
+
+        // Symlink entry
+        let mut b = LayerBuilder::new();
+        b.apply(entry("l", EntryKind::Symlink { target: b"x".to_vec() }, 7), None)
+            .unwrap();
+        assert_eq!(
+            b.base_time(),
+            Timestamp { sec: 7, nsec: 0 },
+            "symlink counts as base_time"
+        );
+
+        // Character device
+        let mut b = LayerBuilder::new();
+        b.apply(
+            Entry {
+                path: b"dev".to_vec(),
+                kind: EntryKind::CharDev { major: 1, minor: 3 },
+                meta: meta(0o666, 7),
+                xattrs: Xattrs::new(),
+            },
+            None,
+        )
+        .unwrap();
+        let t = b.tree();
+        let dev = &t.nodes[t.lookup(b"dev").unwrap()];
+        assert!(matches!(dev.kind, Kind::CharDev { major: 1, minor: 3 }));
+        assert_eq!(
+            b.base_time(),
+            Timestamp { sec: 7, nsec: 0 },
+            "char device counts as base_time"
+        );
+
+        // Block device
+        let mut b = LayerBuilder::new();
+        b.apply(
+            Entry {
+                path: b"dev".to_vec(),
+                kind: EntryKind::BlockDev { major: 8, minor: 0 },
+                meta: meta(0o666, 7),
+                xattrs: Xattrs::new(),
+            },
+            None,
+        )
+        .unwrap();
+        let t = b.tree();
+        let dev = &t.nodes[t.lookup(b"dev").unwrap()];
+        assert!(matches!(dev.kind, Kind::BlockDev { major: 8, minor: 0 }));
+        assert_eq!(
+            b.base_time(),
+            Timestamp { sec: 7, nsec: 0 },
+            "block device counts as base_time"
+        );
+
+        // FIFO
+        let mut b = LayerBuilder::new();
+        b.apply(
+            Entry {
+                path: b"fifo".to_vec(),
+                kind: EntryKind::Fifo,
+                meta: meta(0o666, 7),
+                xattrs: Xattrs::new(),
+            },
+            None,
+        )
+        .unwrap();
+        let t = b.tree();
+        let fifo = &t.nodes[t.lookup(b"fifo").unwrap()];
+        assert!(matches!(fifo.kind, Kind::Fifo));
+        assert_eq!(b.base_time(), Timestamp { sec: 7, nsec: 0 }, "FIFO counts as base_time");
+    }
+
+    #[test]
+    fn dir_over_dir_header_xattrs_override() {
+        let mut b = LayerBuilder::new();
+        let mut d = entry("d", EntryKind::Dir, 10);
+        d.xattrs.insert(user("k"), b"old".to_vec());
+        d.xattrs.insert(user("keep"), b"unrelated".to_vec());
+        b.apply(d, None).unwrap();
+        let mut d2 = entry("d", EntryKind::Dir, 11);
+        d2.xattrs.insert(user("k"), b"new".to_vec());
+        b.apply(d2, None).unwrap();
+        let t = b.tree();
+        let d_node = &t.nodes[t.lookup(b"d").unwrap()];
+        assert_eq!(
+            d_node.xattrs[&user("k")],
+            b"new",
+            "header xattr overrides same-named one"
+        );
+        assert_eq!(d_node.xattrs[&user("keep")], b"unrelated", "unrelated xattr survives");
+    }
 }
