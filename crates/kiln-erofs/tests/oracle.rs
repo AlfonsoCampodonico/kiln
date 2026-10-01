@@ -6,7 +6,7 @@ mod model;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{Mount, groups, is_root, try_convert_stack, view, walk_fs};
+use common::{Mount, fsck, groups, is_root, squash_all, try_convert_stack, view, walk_fs};
 use kiln_erofs::testtar::{Opts, TarBuilder};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
@@ -115,6 +115,7 @@ fn compare_stack(bin: &Path, tars: &[Vec<u8>], case: usize) {
         c_dirs.push(c_dir);
         let img_path = dir.path().join(format!("l{i}.erofs"));
         std::fs::write(&img_path, img).unwrap();
+        fsck(&img_path, &format!("case {case} layer {i}"));
         let k_dir = dir.path().join(format!("k{i}"));
         mounts.0.push(Mount::erofs(&img_path, &k_dir));
         k_dirs.push(k_dir);
@@ -164,6 +165,23 @@ fn compare_stack(bin: &Path, tars: &[Vec<u8>], case: usize) {
             view(&a, true),
             view(&b, true),
             "case {case}: merged view differs from containerd"
+        );
+        // kiln's squash must equal the kernel's overlay of kiln's own layers.
+        let squash_path = dir.path().join("squash.erofs");
+        std::fs::write(&squash_path, squash_all(&images)).unwrap();
+        fsck(&squash_path, &format!("case {case} squash"));
+        let squash_dir = dir.path().join("squash");
+        mounts.0.push(Mount::erofs(&squash_path, &squash_dir));
+        let squashed = walk_fs(&squash_dir);
+        assert_eq!(
+            view(&squashed, true),
+            view(&b, true),
+            "case {case}: squash differs from the kernel overlay of kiln's layers"
+        );
+        assert_eq!(
+            groups(&squashed),
+            groups(&b),
+            "case {case}: squash hardlink groups differ from the kernel overlay"
         );
     }
     assert_eq!(
