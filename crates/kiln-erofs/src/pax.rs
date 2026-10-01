@@ -90,8 +90,17 @@ pub(crate) struct PaxState {
 }
 
 impl PaxState {
+    /// An empty `path`, `linkpath`, `uid`, `gid`, `size` or `mtime` value means the
+    /// record is absent: like Go's `archive/tar`, the ustar header value is kept.
     pub fn apply(&mut self, records: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
         for (k, v) in records {
+            let ustar_field = matches!(
+                k.as_slice(),
+                b"path" | b"linkpath" | b"uid" | b"gid" | b"size" | b"mtime"
+            );
+            if ustar_field && v.is_empty() {
+                continue;
+            }
             match k.as_slice() {
                 b"path" => self.path = Some(v),
                 b"linkpath" => self.linkpath = Some(v),
@@ -237,6 +246,23 @@ mod tests {
         );
         assert_eq!(parse_timestamp(b"-3").unwrap(), Timestamp { sec: -3, nsec: 0 });
         assert!(parse_timestamp(b"abc").is_err());
+    }
+
+    #[test]
+    fn empty_values_mean_absent() {
+        let mut s = PaxState::default();
+        s.apply(
+            [&b"path"[..], b"linkpath", b"uid", b"gid", b"size", b"mtime"]
+                .into_iter()
+                .map(|k| (k.to_vec(), Vec::new()))
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            (s.path, s.linkpath, s.uid, s.gid, s.size, s.mtime),
+            (None, None, None, None, None, None),
+            "Go's archive/tar keeps the ustar value for an empty record"
+        );
     }
 
     #[test]
