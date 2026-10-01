@@ -1,0 +1,211 @@
+//! PAX extended header parsing (POSIX.1-2001 `x`/`g` records).
+
+use crate::error::{Error, Result};
+use crate::tree::Timestamp;
+
+fn malformed(what: &str) -> Error {
+    Error::MalformedTar(format!("PAX header: {what}"))
+}
+
+/// Parses `"<len> <key>=<value>\n"` records. Values may be binary.
+pub(crate) fn parse_records(data: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let mut rest = data;
+    while !rest.is_empty() {
+        if rest.iter().all(|&b| b == 0) {
+            break;
+        }
+        let sp = rest
+            .iter()
+            .position(|&b| b == b' ')
+            .ok_or_else(|| malformed("missing length"))?;
+        let len: usize = std::str::from_utf8(&rest[..sp])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| malformed("bad length"))?;
+        if len <= sp + 1 || len > rest.len() {
+            return Err(malformed("record length out of range"));
+        }
+        let rec = rest[sp + 1..len]
+            .strip_suffix(b"\n")
+            .ok_or_else(|| malformed("record missing newline"))?;
+        let eq = rec
+            .iter()
+            .position(|&b| b == b'=')
+            .ok_or_else(|| malformed("record missing '='"))?;
+        out.push((rec[..eq].to_vec(), rec[eq + 1..].to_vec()));
+        rest = &rest[len..];
+    }
+    Ok(out)
+}
+
+fn parse_u64(v: &[u8], what: &str) -> Result<u64> {
+    std::str::from_utf8(v)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| malformed(what))
+}
+
+/// Parses a PAX time such as `1700000000.123456789` or `-1.5`.
+pub(crate) fn parse_timestamp(v: &[u8]) -> Result<Timestamp> {
+    let s = std::str::from_utf8(v).map_err(|_| malformed("mtime"))?;
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    if int.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(malformed("mtime"));
+    }
+    let sec: i64 = int.parse().map_err(|_| malformed("mtime"))?;
+    let mut digits: String = frac.chars().take(9).collect();
+    while digits.len() < 9 {
+        digits.push('0');
+    }
+    let nsec: u32 = digits.parse().map_err(|_| malformed("mtime"))?;
+    Ok(match (neg, nsec) {
+        (false, _) => Timestamp { sec, nsec },
+        (true, 0) => Timestamp { sec: -sec, nsec: 0 },
+        (true, n) => Timestamp {
+            sec: -sec - 1,
+            nsec: 1_000_000_000 - n,
+        },
+    })
+}
+
+/// Accumulated PAX overrides for the next entry.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PaxState {
+    pub path: Option<Vec<u8>>,
+    pub linkpath: Option<Vec<u8>>,
+    pub uid: Option<u64>,
+    pub gid: Option<u64>,
+    pub size: Option<u64>,
+    pub mtime: Option<Timestamp>,
+    /// Full xattr names (`user.foo`) with raw values, in record order.
+    pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub sparse: bool,
+    /// Xattr names kiln cannot represent (`LIBARCHIVE.xattr.*`).
+    pub dropped: Vec<Vec<u8>>,
+}
+
+impl PaxState {
+    pub fn apply(&mut self, records: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        for (k, v) in records {
+            match k.as_slice() {
+                b"path" => self.path = Some(v),
+                b"linkpath" => self.linkpath = Some(v),
+                b"uid" => self.uid = Some(parse_u64(&v, "uid")?),
+                b"gid" => self.gid = Some(parse_u64(&v, "gid")?),
+                b"size" => self.size = Some(parse_u64(&v, "size")?),
+                b"mtime" => self.mtime = Some(parse_timestamp(&v)?),
+                _ if k.starts_with(b"SCHILY.xattr.") => self.xattrs.push((k[13..].to_vec(), v)),
+                _ if k.starts_with(b"GNU.sparse.") => self.sparse = true,
+                _ if k.starts_with(b"LIBARCHIVE.xattr.") => self.dropped.push(k[17..].to_vec()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Combines global (`g`) and local (`x`) state; local values win.
+    pub fn overlay(global: &PaxState, local: PaxState) -> PaxState {
+        let mut xattrs = global.xattrs.clone();
+        xattrs.extend(local.xattrs);
+        let mut dropped = global.dropped.clone();
+        dropped.extend(local.dropped);
+        PaxState {
+            path: local.path.or_else(|| global.path.clone()),
+            linkpath: local.linkpath.or_else(|| global.linkpath.clone()),
+            uid: local.uid.or(global.uid),
+            gid: local.gid.or(global.gid),
+            size: local.size.or(global.size),
+            mtime: local.mtime.or(global.mtime),
+            xattrs,
+            sparse: global.sparse || local.sparse,
+            dropped,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testtar::pax_record;
+
+    #[test]
+    fn parses_records_including_binary_values() {
+        let mut data = pax_record(b"path", b"usr/bin/php");
+        data.extend(pax_record(b"SCHILY.xattr.security.capability", &[1, 0, 0, 2, b'\n', 0]));
+        data.extend([0u8; 7]); // trailing NUL padding is tolerated
+        let recs = parse_records(&data).unwrap();
+        assert_eq!(recs[0], (b"path".to_vec(), b"usr/bin/php".to_vec()));
+        assert_eq!(recs[1].1, vec![1, 0, 0, 2, b'\n', 0]);
+    }
+
+    #[test]
+    fn rejects_malformed_records() {
+        assert!(parse_records(b"99 path=x\n").is_err());
+        assert!(parse_records(b"x path=x\n").is_err());
+        assert!(parse_records(b"9 pathx\n").is_err());
+    }
+
+    #[test]
+    fn timestamps() {
+        assert_eq!(
+            parse_timestamp(b"1700000000").unwrap(),
+            Timestamp {
+                sec: 1_700_000_000,
+                nsec: 0
+            }
+        );
+        assert_eq!(
+            parse_timestamp(b"1700000000.5").unwrap(),
+            Timestamp {
+                sec: 1_700_000_000,
+                nsec: 500_000_000
+            }
+        );
+        assert_eq!(
+            parse_timestamp(b"1.1234567891").unwrap(),
+            Timestamp {
+                sec: 1,
+                nsec: 123_456_789
+            }
+        );
+        assert_eq!(
+            parse_timestamp(b"-1.5").unwrap(),
+            Timestamp {
+                sec: -2,
+                nsec: 500_000_000
+            }
+        );
+        assert_eq!(parse_timestamp(b"-3").unwrap(), Timestamp { sec: -3, nsec: 0 });
+        assert!(parse_timestamp(b"abc").is_err());
+    }
+
+    #[test]
+    fn state_applies_known_keys_and_local_overrides_global() {
+        let mut global = PaxState::default();
+        global
+            .apply(vec![
+                (b"uid".to_vec(), b"5".to_vec()),
+                (b"SCHILY.xattr.user.a".to_vec(), b"g".to_vec()),
+            ])
+            .unwrap();
+        let mut local = PaxState::default();
+        local
+            .apply(vec![
+                (b"uid".to_vec(), b"7".to_vec()),
+                (b"GNU.sparse.major".to_vec(), b"1".to_vec()),
+                (b"LIBARCHIVE.xattr.user.b".to_vec(), b"x".to_vec()),
+                (b"SCHILY.xattr.user.a".to_vec(), b"l".to_vec()),
+            ])
+            .unwrap();
+        let s = PaxState::overlay(&global, local);
+        assert_eq!(s.uid, Some(7));
+        assert!(s.sparse);
+        assert_eq!(s.dropped, vec![b"user.b".to_vec()]);
+        assert_eq!(s.xattrs.last().unwrap(), &(b"user.a".to_vec(), b"l".to_vec()));
+    }
+}

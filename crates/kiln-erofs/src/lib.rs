@@ -8,6 +8,11 @@ mod error;
 mod limits;
 pub mod ondisk;
 mod path;
+mod pax;
+#[doc(hidden)]
+pub mod testtar;
+mod tree;
 
 pub use error::{Error, Result};
 pub use limits::Limits;
+pub use tree::Timestamp;
