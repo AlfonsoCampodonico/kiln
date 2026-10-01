@@ -43,6 +43,44 @@ fn tar_err(e: io::Error) -> Error {
     }
 }
 
+/// Check if a global PAX header contains any recognized keys that would cause unbounded amplification.
+fn has_recognized_pax_keys(records: &[(Vec<u8>, Vec<u8>)]) -> bool {
+    for (key, _) in records {
+        let key_str = std::str::from_utf8(key).unwrap_or("");
+        if matches!(key_str, "path" | "linkpath" | "uid" | "gid" | "size" | "mtime")
+            || key_str.starts_with("SCHILY.xattr.")
+            || key_str.starts_with("GNU.sparse.")
+            || key_str.starts_with("LIBARCHIVE.xattr.")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Truncate a string to 128 bytes on a char boundary.
+fn truncate_to_128(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() <= 128 {
+        return s.to_string();
+    }
+    // Find the last valid UTF-8 boundary before 128
+    let mut end = 128;
+    while end > 0 && !std::str::from_utf8(&bytes[..end]).is_ok() {
+        end -= 1;
+    }
+    std::str::from_utf8(&bytes[..end]).unwrap_or("").to_string()
+}
+
+/// Add a warning with a maximum of 100 messages; further warnings are counted.
+fn add_warning(warnings: &mut Vec<String>, suppressed: &mut usize, msg: String) {
+    if warnings.len() < 100 {
+        warnings.push(msg);
+    } else {
+        *suppressed += 1;
+    }
+}
+
 /// Reads entries up to the end-of-archive marker; returns tar bytes consumed.
 pub(crate) fn read_tar<R: Read>(
     reader: R,
@@ -58,14 +96,20 @@ pub(crate) fn read_tar<R: Read>(
         limit: limits.max_layer_bytes,
         exceeded: Rc::clone(&exceeded),
     });
-    match walk(&mut archive, limits, warnings, f) {
+    let mut suppressed_count = 0usize;
+    match walk(&mut archive, limits, warnings, &mut suppressed_count, f) {
         Err(_) if exceeded.get() => Err(Error::LimitExceeded {
             limit: "uncompressed bytes per layer",
             max: limits.max_layer_bytes,
             path: String::new(),
         }),
         Err(e) => Err(e),
-        Ok(()) => Ok(count.get()),
+        Ok(()) => {
+            if suppressed_count > 0 {
+                warnings.push(format!("{} more warnings suppressed", suppressed_count));
+            }
+            Ok(count.get())
+        }
     }
 }
 
@@ -73,6 +117,7 @@ fn walk<R: Read>(
     archive: &mut Archive<R>,
     limits: &Limits,
     warnings: &mut Vec<String>,
+    suppressed_count: &mut usize,
     f: &mut dyn FnMut(Entry, &mut dyn Read) -> Result<()>,
 ) -> Result<()> {
     let mut global = PaxState::default();
@@ -80,6 +125,9 @@ fn walk<R: Read>(
     let mut long_name: Option<Vec<u8>> = None;
     let mut long_link: Option<Vec<u8>> = None;
     let mut seen: u64 = 0;
+    let mut seen_local_pax = false;
+    let mut seen_gnu_longname = false;
+    let mut seen_gnu_longlink = false;
     for item in archive.entries().map_err(tar_err)?.raw(true) {
         let mut ent = item.map_err(tar_err)?;
         let header = ent.header().clone();
@@ -88,19 +136,42 @@ fn walk<R: Read>(
         {
             let data = read_record(&mut ent, &header, limits)?;
             if et.is_pax_local_extensions() {
+                if seen_local_pax {
+                    return Err(Error::MalformedTar("duplicate x header before one entry".into()));
+                }
+                seen_local_pax = true;
                 local.apply(parse_records(&data)?)?;
             } else if et.is_pax_global_extensions() {
-                global.apply(parse_records(&data)?)?;
-            } else {
-                let trimmed = trim_nul(data);
-                if et.is_gnu_longname() {
-                    long_name = Some(trimmed);
-                } else {
-                    long_link = Some(trimmed);
+                let records = parse_records(&data)?;
+                if has_recognized_pax_keys(&records) {
+                    return Err(Error::UnsupportedEntry {
+                        path: lossy(&header.path_bytes()),
+                        kind: "global PAX header override".into(),
+                    });
                 }
+                global.apply(records)?;
+            } else if et.is_gnu_longname() {
+                if seen_gnu_longname {
+                    return Err(Error::MalformedTar("duplicate L header before one entry".into()));
+                }
+                seen_gnu_longname = true;
+                let trimmed = trim_nul(data);
+                long_name = Some(trimmed);
+            } else {
+                if seen_gnu_longlink {
+                    return Err(Error::MalformedTar("duplicate K header before one entry".into()));
+                }
+                seen_gnu_longlink = true;
+                let trimmed = trim_nul(data);
+                long_link = Some(trimmed);
             }
             continue;
         }
+        // Reset per-entry flags for the next filesystem entry
+        seen_local_pax = false;
+        seen_gnu_longname = false;
+        seen_gnu_longlink = false;
+
         let pax = PaxState::overlay(&global, std::mem::take(&mut local));
         let raw_path = pax
             .path
@@ -120,7 +191,16 @@ fn walk<R: Read>(
                 path: lossy(&raw_path),
             });
         }
-        let entry = build_entry(&header, et, &raw_path, raw_link, &pax, limits, warnings)?;
+        let entry = build_entry(
+            &header,
+            et,
+            &raw_path,
+            raw_link,
+            &pax,
+            limits,
+            warnings,
+            suppressed_count,
+        )?;
         f(entry, &mut ent)?;
     }
     Ok(())
@@ -157,6 +237,7 @@ fn to_u32(v: u64, what: &'static str, path: &[u8]) -> Result<u32> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_entry(
     header: &Header,
     et: EntryType,
@@ -165,6 +246,7 @@ fn build_entry(
     pax: &PaxState,
     limits: &Limits,
     warnings: &mut Vec<String>,
+    suppressed_count: &mut usize,
 ) -> Result<Entry> {
     let unsupported = |kind: &str| Error::UnsupportedEntry {
         path: lossy(raw_path),
@@ -178,6 +260,20 @@ fn build_entry(
     let size = header.entry_size().map_err(tar_err)?;
     if pax.size.is_some_and(|s| s != size) {
         return Err(unsupported("PAX size override (entries larger than 8 GiB)"));
+    }
+    // Check for parser differential: header-only types with nonzero size
+    if (matches!(
+        et,
+        EntryType::Link
+            | EntryType::Symlink
+            | EntryType::Char
+            | EntryType::Block
+            | EntryType::Directory
+            | EntryType::Fifo
+    ) || (typeflag == 0 && raw_path.ends_with(b"/")))
+        && size != 0
+    {
+        return Err(unsupported("header-only entry with nonzero size"));
     }
     let uid = to_u32(pax.uid.map_or_else(|| header.uid(), Ok).map_err(tar_err)?, "uid", &path)?;
     let gid = to_u32(pax.gid.map_or_else(|| header.gid(), Ok).map_err(tar_err)?, "gid", &path)?;
@@ -194,7 +290,7 @@ fn build_entry(
         gid,
         mtime,
     };
-    let xattrs = convert_xattrs(pax, &path, limits, warnings)?;
+    let xattrs = convert_xattrs(pax, &path, limits, warnings, suppressed_count)?;
     let device = || -> Result<(u32, u32)> {
         let major = header.device_major().map_err(tar_err)?.unwrap_or(0);
         let minor = header.device_minor().map_err(tar_err)?.unwrap_or(0);
@@ -249,14 +345,19 @@ fn build_entry(
     })
 }
 
-fn convert_xattrs(pax: &PaxState, path: &[u8], limits: &Limits, warnings: &mut Vec<String>) -> Result<Xattrs> {
+fn convert_xattrs(
+    pax: &PaxState,
+    path: &[u8],
+    limits: &Limits,
+    warnings: &mut Vec<String>,
+    suppressed_count: &mut usize,
+) -> Result<Xattrs> {
     let mut out = Xattrs::new();
+    let path_str = truncate_to_128(&lossy(path));
     for name in &pax.dropped {
-        warnings.push(format!(
-            "dropping LIBARCHIVE xattr {:?} on {:?}",
-            lossy(name),
-            lossy(path)
-        ));
+        let name_str = truncate_to_128(&lossy(name));
+        let msg = format!("dropping LIBARCHIVE xattr {:?} on {:?}", name_str, path_str);
+        add_warning(warnings, suppressed_count, msg);
     }
     for (name, value) in &pax.xattrs {
         if value.len() as u64 > limits.max_header_record {
@@ -267,11 +368,12 @@ fn convert_xattrs(pax: &PaxState, path: &[u8], limits: &Limits, warnings: &mut V
             });
         }
         let Some(key) = XattrKey::from_full_name(name) else {
-            warnings.push(format!(
+            let name_str = truncate_to_128(&lossy(name));
+            let msg = format!(
                 "dropping xattr {:?} on {:?}: namespace not representable in erofs",
-                lossy(name),
-                lossy(path)
-            ));
+                name_str, path_str
+            );
+            add_warning(warnings, suppressed_count, msg);
             continue;
         };
         let bad = |reason| Error::XattrUnencodable {
@@ -471,5 +573,86 @@ mod tests {
         let (_, _, n) = collect(&b.finish(), &Limits::default()).unwrap();
         let body = b.bytes().len() as u64;
         assert!(n >= body + 512 && n <= body + 1024, "consumed {n}, body {body}");
+    }
+
+    #[test]
+    fn rejects_header_only_with_nonzero_size() {
+        let l = Limits::default();
+        // Hardlink with nonzero size
+        let mut b = TarBuilder::new();
+        b.entry(b"hard", b'1', &[0u8; 8], b"target", (0, 0), &Opts::default());
+        match collect(&b.finish(), &l) {
+            Err(Error::UnsupportedEntry { kind, .. }) => {
+                assert!(kind.contains("header-only"));
+            }
+            e => panic!("expected UnsupportedEntry, got {:?}", e),
+        }
+
+        // Directory with nonzero size
+        let mut b = TarBuilder::new();
+        b.entry(b"dir", b'5', &[0u8; 8], b"", (0, 0), &Opts::default());
+        match collect(&b.finish(), &l) {
+            Err(Error::UnsupportedEntry { kind, .. }) => {
+                assert!(kind.contains("header-only"));
+            }
+            e => panic!("expected UnsupportedEntry, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn rejects_global_pax_with_recognized_keys() {
+        use crate::testtar::pax_record;
+
+        // Global PAX with recognized key (SCHILY.xattr.*) should be rejected
+        let mut payload = Vec::new();
+        payload.extend(pax_record(b"SCHILY.xattr.user.a", b"value"));
+        let mut b = TarBuilder::new();
+        b.entry(b"././@PaxGlobal", b'g', &payload, b"", (0, 0), &Opts::default());
+        let l = Limits::default();
+        match collect(&b.finish(), &l) {
+            Err(Error::UnsupportedEntry { kind, .. }) => {
+                assert!(kind.contains("global PAX"));
+            }
+            e => panic!("expected UnsupportedEntry, got {:?}", e),
+        }
+
+        // Global PAX with ignorable key should be accepted
+        let mut payload = Vec::new();
+        payload.extend(pax_record(b"comment", b"x"));
+        let mut b = TarBuilder::new();
+        b.entry(b"././@PaxGlobal", b'g', &payload, b"", (0, 0), &Opts::default())
+            .file("f", b"", &Opts::default());
+        let (entries, _, _) = collect(&b.finish(), &l).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn rejects_duplicate_pax_headers() {
+        // Two consecutive x (PAX local) headers should be rejected
+        let mut b = TarBuilder::new();
+        let pax1 = vec![(b"path".to_vec(), b"p1".to_vec())];
+        let pax2 = vec![(b"path".to_vec(), b"p2".to_vec())];
+        b.pax_header(&pax1).pax_header(&pax2).file("f", b"", &Opts::default());
+        let l = Limits::default();
+        match collect(&b.finish(), &l) {
+            Err(Error::MalformedTar(msg)) => {
+                assert!(msg.contains("duplicate x header"));
+            }
+            e => panic!("expected MalformedTar, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn bounds_warnings_to_100() {
+        // Create 150 files each with one unmappable xattr
+        let mut b = TarBuilder::new();
+        for i in 0..150 {
+            let name = format!("f{}", i);
+            b.file(&name, b"", &Opts::default().xattr("com.apple.x", b"v"));
+        }
+        let (_, warnings, _) = collect(&b.finish(), &Limits::default()).unwrap();
+        // Should have 100 warnings + 1 suppression message = 101 total
+        assert_eq!(warnings.len(), 101, "{warnings:?}");
+        assert!(warnings[100].contains("50 more warnings suppressed"));
     }
 }
