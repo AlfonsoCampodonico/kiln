@@ -4,7 +4,7 @@ This document is normative. It currently defines the **erofs profile** (format v
 
 ## erofs profile, version 1
 
-A kiln layer image is a Linux erofs filesystem restricted as follows. Readers reject anything outside the profile.
+A kiln layer image is a Linux erofs filesystem restricted as follows. Readers reject images that violate the layout rules below (feature flags, data layouts, block size, bounds, ordering).
 
 ### Superblock (byte 1024)
 
@@ -63,7 +63,7 @@ The image ends at a 4096-byte boundary.
 
 ### Xattrs
 
-- **Name indexes:** `user.` 1, `system.posix_acl_access` 2, `system.posix_acl_default` 3, `trusted.` 4, `security.` 6. Other namespaces are dropped with a warning.
+- **Name indexes:** `user.` 1, `system.posix_acl_access` 2, `system.posix_acl_default` 3, `trusted.` 4, `security.` 6. Other namespaces are dropped with a warning, and so are `trusted.overlay.*` xattrs supplied by the tar.
 - **Shared table:** an `(index, name, value)` triple goes into the shared table when two or more inodes carry it, or when an inode's all-inline body would exceed 4032 bytes (in which case all of that inode's xattrs are shared).
   - Shared entries are ordered by first use in inode order.
   - Within an inode, shared ids come first, then inline entries, each sorted by `(index, name)`.
@@ -72,7 +72,8 @@ The image ends at a 4096-byte boundary.
 ### Overlay markers
 
 - A whiteout is a character device 0:0, mode 0, uid and gid 0.
-- An opaque directory carries `trusted.overlay.opaque = "y"`.
+- An opaque directory carries `trusted.overlay.opaque = "y"`. Only `.wh.` entries produce markers: `trusted.overlay.*` xattrs supplied by the tar are dropped.
+- When merging (parent inheritance and squash), a directory is opaque only when `trusted.overlay.opaque` is exactly `"y"`, and a root-level opaque marker has no effect on the merged view, as in overlayfs.
 - Squashed images contain no markers.
 
 ### Layer semantics (applying one tar)
@@ -87,20 +88,31 @@ The image ends at a 4096-byte boundary.
 - **Whiteouts:**
   - `.wh.<name>` hides `<name>` in lower layers.
   - It is an error if `<name>` already exists in the same layer. A later entry with that name replaces the whiteout.
-  - `.wh..wh..opq` marks its directory opaque.
+  - `.wh..wh..opq` marks its directory opaque. On the layer root, the marker is recorded but has no effect on the merged view (overlayfs ignores it).
+- **PAX records:** an empty `path`, `linkpath`, `uid`, `gid`, `size` or `mtime` value means the record is absent; the ustar header value is kept.
 - **Unsupported entries** are errors:
   - Sparse entries.
+  - Tar entry types other than regular file, directory, symlink, hardlink, character and block device and FIFO.
   - A PAX size that differs from the header size.
   - Devices with major > 4095 or minor > 1048575.
+  - A uid or gid above 32 bits.
+  - An empty symlink target.
   - Header-only entries (hardlink, symlink, directory, device, FIFO, V7 trailing-slash directory) whose tar header size is nonzero.
   - A global PAX (`g`) header carrying any key kiln acts on (path, linkpath, uid, gid, size, mtime, `SCHILY.xattr.*`, `GNU.sparse.*`, `LIBARCHIVE.xattr.*`).
   - More than one pending header of the same type (x, L or K) before one entry.
+  - An entry with both a GNU long name (L) and a PAX `path`, or both a GNU long link (K) and a PAX `linkpath`.
+  - An xattr name longer than 255 bytes (after its namespace prefix) or a value larger than 65535 bytes.
+  - An inode that needs more than 255 shared xattrs.
+  - More entries than the entries-per-layer limit, counting both tar headers and every entry the layer creates, implicit directories included.
+- **Warnings** (conversion continues):
   - Xattrs outside the five namespaces above are dropped with a warning.
+  - `trusted.overlay.*` xattrs supplied by the tar are dropped with a warning.
+  - `LIBARCHIVE.xattr.*` records are dropped with a warning.
   - Conversion warnings are capped at 100, followed by one "N more warnings suppressed" line.
 
 ### Implicit directories
 
-A directory created because a descendant, whiteout or opaque marker needed it inherits from the same path in the overlay of the lower layers, with `trusted.overlay.*` keys stripped. That means the topmost lower layer providing the path, where whiteouts, opaque directories and non-directories in nearer layers hide farther ones.
+A directory created because a descendant, whiteout or opaque marker needed it inherits from the same path in the overlay of the lower layers, with `trusted.overlay.*` keys stripped. That means the topmost lower layer providing the path, where whiteouts, opaque directories and non-directories in nearer layers hide farther ones. A directory is opaque only when `trusted.overlay.opaque` is exactly `"y"`, and a root-level opaque marker hides nothing (as in overlayfs).
 - **Not described in this layer:** it takes mode, uid, gid, mtime and xattrs from that lower directory. If the path is absent there, or is not a directory, it takes mode 0755, uid 0, gid 0 and mtime = base time.
 - **Described later by its own header:** it keeps the header's mode, uid, gid and mtime, and the inherited xattrs lie under its own.
 - **Root:** an implicit root always takes the defaults.
