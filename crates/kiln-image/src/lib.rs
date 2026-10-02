@@ -5,11 +5,13 @@ mod convert;
 mod ctx;
 mod decompress;
 mod error;
+mod import;
 mod load;
 mod pipeline;
 pub mod types;
 
 pub use convert::{ConvertOptions, Converted, LayerReport, convert_image};
 pub use error::{ImageError, Result};
+pub use import::{ImportReport, import_image};
 pub use load::{KilnManifest, Loaded, load, load_manifest, resolve_name};
 pub use pipeline::{LocalRequest, Output, convert_local, convert_resolved};
