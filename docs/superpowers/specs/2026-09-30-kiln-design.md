@@ -7,8 +7,12 @@
 
 ### Revision history
 
-- **rev 2.2 (2026-10-02):** §5.2 and §6.2 layer cache keys include the verified `diff_id`, found by the M1b-1 task review: a key on the compressed digest alone let a warm store skip the `diff_id` check.
 - **rev 1 (2026-09-30):** initial design.
+- **rev 2 (2026-10-01):** incorporates the adversarial review of rev 1 (five reviewers, ~60 raw findings, 24 after dedup; none refuted). Decisions taken with the user:
+  - **A.** A vsock control channel between `kiln-init` and the host is part of v1. It replaces the config disk and the status sector.
+  - **B.** Implicit parent directories inherit attributes from lower layers, as containerd does.
+  - **C.** Hardening is in v1: unprivileged sandboxed VMMs, default-deny egress, verified kernels and init.
+  - **D.** The work is split into three milestones, each with its own implementation plan (§12).
 - **rev 2.1 (2026-10-01):** §6.3, §7.3 and §7.4 corrected to match containerd's overlay snapshotter, as found by the oracle while validating the M1a plan:
   - symlink modes are always 0777;
   - a hardlink header's metadata applies to its inode;
@@ -16,11 +20,7 @@
   - implicit directories described later keep their inherited xattrs.
 
   §7.4 also records three deliberate divergences, and §12 splits M1 into M1a and M1b.
-- **rev 2 (2026-10-01):** incorporates the adversarial review of rev 1 (five reviewers, ~60 raw findings, 24 after dedup; none refuted). Decisions taken with the user:
-  - **A.** A vsock control channel between `kiln-init` and the host is part of v1. It replaces the config disk and the status sector.
-  - **B.** Implicit parent directories inherit attributes from lower layers, as containerd does.
-  - **C.** Hardening is in v1: unprivileged sandboxed VMMs, default-deny egress, verified kernels and init.
-  - **D.** The work is split into three milestones, each with its own implementation plan (§12).
+- **rev 2.2 (2026-10-02):** §5.2 and §6.2 layer cache keys include the verified `diff_id`, found by the M1b-1 task review: a key on the compressed digest alone let a warm store skip the `diff_id` check. §7.6 states that cached layers do not count toward the per-image limit.
 
 ---
 
@@ -402,6 +402,8 @@ All limits are configurable. Exceeding one is a typed error naming the limit.
 | Path length / depth | 4096 bytes / 256 components |
 
 Traversals are iterative, never recursive.
+
+The per-image limit counts the bytes one conversion decompresses. Layers served from the layer cache are not decompressed and do not count, so the limit bounds the work a conversion does (T3), not the image's total size.
 
 ---
 
