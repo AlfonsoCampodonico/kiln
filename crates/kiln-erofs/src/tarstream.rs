@@ -182,11 +182,10 @@ fn walk<R: Read>(
                 kind: "conflicting long-name and PAX path".into(),
             });
         }
-        let raw_path = pax
-            .path
-            .clone()
-            .or(long_name.take())
-            .unwrap_or_else(|| header.path_bytes().into_owned());
+        let raw_path = match pax.path.clone().or(long_name.take()) {
+            Some(p) => p,
+            None => header_name(&header)?,
+        };
         let raw_link = pax
             .linkpath
             .clone()
@@ -237,6 +236,110 @@ fn trim_nul(mut v: Vec<u8>) -> Vec<u8> {
         v.pop();
     }
     v
+}
+
+/// How Go's `archive/tar` (containerd's parser) classifies a header block
+/// (`getFormat` in reader.go). The `tar` crate's own rules differ, so names and
+/// device numbers are read from the raw block with Go's rules instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoFormat {
+    V7,
+    Ustar,
+    Star,
+    Gnu,
+}
+
+fn go_format(b: &[u8]) -> GoFormat {
+    let (magic, version, trailer) = (&b[257..263], &b[263..265], &b[508..512]);
+    match () {
+        _ if magic == b"ustar\0" && trailer == b"tar\0" => GoFormat::Star,
+        // Go does not check the version for USTAR, unlike the `tar` crate.
+        _ if magic == b"ustar\0" => GoFormat::Ustar,
+        _ if magic == b"ustar " && version == b" \0" => GoFormat::Gnu,
+        _ => GoFormat::V7,
+    }
+}
+
+/// A NUL-terminated field (Go's `parseString`).
+fn c_string(f: &[u8]) -> &[u8] {
+    &f[..f.iter().position(|&c| c == 0).unwrap_or(f.len())]
+}
+
+/// Go's `parseNumeric`: base-256 when the high bit is set, else octal with NULs
+/// and spaces trimmed (empty is 0). `None` where Go reports a header error.
+fn go_numeric(f: &[u8]) -> Option<i64> {
+    if f.first().is_some_and(|&b| b & 0x80 != 0) {
+        let inv = if f[0] & 0x40 != 0 { 0xff } else { 0 };
+        let mut x: u64 = 0;
+        for (i, &c) in f.iter().enumerate() {
+            let c = if i == 0 { (c ^ inv) & 0x7f } else { c ^ inv };
+            if x >> 56 > 0 {
+                return None;
+            }
+            x = (x << 8) | c as u64;
+        }
+        if x >> 63 > 0 {
+            return None;
+        }
+        return Some(if inv == 0xff { !(x as i64) } else { x as i64 });
+    }
+    let s = std::str::from_utf8(f).ok()?.trim_matches([' ', '\0']);
+    if s.is_empty() {
+        return Some(0);
+    }
+    u64::from_str_radix(s, 8).ok().and_then(|v| i64::try_from(v).ok())
+}
+
+/// The name a header block carries by itself (before GNU long names or PAX
+/// paths), with Go's prefix rules: USTAR prefixes are 155 bytes and STAR's 131;
+/// GNU headers have none, except that Go falls back to the 155-byte field when
+/// the GNU atime/ctime fields do not parse and it holds ASCII (golang.org/issue/12594).
+fn header_name(header: &Header) -> Result<Vec<u8>> {
+    let b = header.as_bytes();
+    let name = c_string(&b[0..100]);
+    let prefix: &[u8] = match go_format(b) {
+        GoFormat::V7 => b"",
+        GoFormat::Ustar => c_string(&b[345..500]),
+        GoFormat::Star => {
+            if go_numeric(&b[476..488]).is_none() || go_numeric(&b[488..500]).is_none() {
+                return Err(Error::MalformedTar(format!(
+                    "STAR header for {:?} has invalid access or change times",
+                    lossy(name)
+                )));
+            }
+            c_string(&b[345..476])
+        }
+        GoFormat::Gnu => {
+            let unparsable = |f: &[u8]| f[0] != 0 && go_numeric(f).is_none();
+            let prefix = c_string(&b[345..500]);
+            if (unparsable(&b[345..357]) || unparsable(&b[357..369])) && prefix.is_ascii() {
+                prefix
+            } else {
+                b""
+            }
+        }
+    };
+    Ok(if prefix.is_empty() {
+        name.to_vec()
+    } else {
+        [prefix, b"/", name].concat()
+    })
+}
+
+/// Device numbers as Go reads them: parsed (and validated) for every non-V7
+/// header, whatever its entry type; V7 headers have none.
+fn header_devices(header: &Header, path: &[u8]) -> Result<(i64, i64)> {
+    let b = header.as_bytes();
+    if go_format(b) == GoFormat::V7 {
+        return Ok((0, 0));
+    }
+    match (go_numeric(&b[329..337]), go_numeric(&b[337..345])) {
+        (Some(major), Some(minor)) => Ok((major, minor)),
+        _ => Err(Error::MalformedTar(format!(
+            "invalid device number fields for {:?}",
+            lossy(path)
+        ))),
+    }
 }
 
 /// A numeric header field at `range`. Go's archive/tar (containerd) reads a field of
@@ -316,13 +419,12 @@ fn build_entry(
         mtime,
     };
     let xattrs = convert_xattrs(pax, &path, limits, warnings, suppressed_count)?;
+    let (dev_major, dev_minor) = header_devices(header, &path)?;
     let device = || -> Result<(u32, u32)> {
-        let major = numeric(header, 329..337, header.device_major())?.unwrap_or(0);
-        let minor = numeric(header, 337..345, header.device_minor())?.unwrap_or(0);
-        if major > 0xfff || minor > 0xf_ffff {
+        if !(0..=0xfff).contains(&dev_major) || !(0..=0xf_ffff).contains(&dev_minor) {
             return Err(unsupported("device number out of range"));
         }
-        Ok((major, minor))
+        Ok((dev_major as u32, dev_minor as u32))
     };
     let kind = match et {
         _ if typeflag == 0 && raw_path.ends_with(b"/") => EntryKind::Dir,
@@ -445,6 +547,117 @@ mod tests {
             Ok(())
         })?;
         Ok((out, warnings, n))
+    }
+
+    /// A raw header block (fields as in Go's reader.go), for format-detection tests.
+    struct Raw(Vec<u8>);
+
+    impl Raw {
+        fn new(name: &[u8], magic: &[u8; 6], version: &[u8; 2]) -> Self {
+            let mut b = vec![0u8; 512];
+            b[..name.len()].copy_from_slice(name);
+            b[100..108].copy_from_slice(b"0000644\0");
+            b[108..116].copy_from_slice(b"0000000\0");
+            b[116..124].copy_from_slice(b"0000000\0");
+            b[124..136].copy_from_slice(b"00000000000\0");
+            b[136..148].copy_from_slice(b"14000000000\0");
+            b[156] = b'0';
+            b[257..263].copy_from_slice(magic);
+            b[263..265].copy_from_slice(version);
+            Raw(b)
+        }
+        fn ustar(name: &[u8]) -> Self {
+            Self::new(name, b"ustar\0", b"00")
+        }
+        fn gnu(name: &[u8]) -> Self {
+            Self::new(name, b"ustar ", b" \0")
+        }
+        fn at(mut self, off: usize, data: &[u8]) -> Self {
+            self.0[off..off + data.len()].copy_from_slice(data);
+            self
+        }
+        fn tar(mut self) -> Vec<u8> {
+            self.0[148..156].copy_from_slice(b"        ");
+            let sum: u32 = self.0.iter().map(|&b| b as u32).sum();
+            self.0[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            let mut t = self.0;
+            t.resize(512 + 1024, 0);
+            t
+        }
+    }
+
+    fn first_path(tar: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(collect(&tar, &Limits::default())?.0.remove(0).0.path)
+    }
+
+    // Expected values below were checked against Go's archive/tar (containerd's parser).
+
+    #[test]
+    fn ustar_magic_with_any_version_uses_the_prefix() {
+        let t = Raw::ustar(b"file").at(263, b"xx").at(345, b"dir").tar();
+        assert_eq!(first_path(t).unwrap(), b"dir/file");
+    }
+
+    #[test]
+    fn star_trailer_limits_the_prefix_to_131_bytes() {
+        let t = Raw::ustar(b"file").at(345, &[b'p'; 131]).at(508, b"tar\0").tar();
+        let mut want = vec![b'p'; 131];
+        want.extend_from_slice(b"/file");
+        assert_eq!(first_path(t).unwrap(), want);
+    }
+
+    #[test]
+    fn star_header_with_unparseable_times_is_rejected() {
+        let t = Raw::ustar(b"file")
+            .at(345, b"dir")
+            .at(476, b"zzzz")
+            .at(508, b"tar\0")
+            .tar();
+        assert!(matches!(first_path(t), Err(Error::MalformedTar(_))));
+    }
+
+    #[test]
+    fn gnu_header_uses_an_ascii_prefix_only_when_its_times_do_not_parse() {
+        let text = Raw::gnu(b"file").at(345, b"dir").tar();
+        assert_eq!(first_path(text).unwrap(), b"dir/file");
+        let octal = Raw::gnu(b"file")
+            .at(345, b"00000000001\0")
+            .at(357, b"00000000002\0")
+            .tar();
+        assert_eq!(first_path(octal).unwrap(), b"file");
+        let non_ascii = Raw::gnu(b"file").at(345, b"d\xffr").tar();
+        assert_eq!(first_path(non_ascii).unwrap(), b"file");
+    }
+
+    #[test]
+    fn v7_header_never_has_a_prefix() {
+        let t = Raw::new(b"file", &[0; 6], &[0; 2])
+            .at(345, b"dir")
+            .at(329, b"zz\0")
+            .tar();
+        assert_eq!(first_path(t).unwrap(), b"file", "and V7 device fields are not parsed");
+    }
+
+    #[test]
+    fn device_numbers_are_read_for_ustar_magic_with_any_version() {
+        let t = Raw::ustar(b"dev/x")
+            .at(263, b"xx")
+            .at(156, b"3")
+            .at(329, b"0000001\0")
+            .at(337, b"0000003\0")
+            .tar();
+        let es = collect(&t, &Limits::default()).unwrap().0;
+        assert!(matches!(es[0].0.kind, EntryKind::CharDev { major: 1, minor: 3 }));
+    }
+
+    #[test]
+    fn garbage_device_fields_reject_any_non_v7_entry() {
+        for t in [
+            Raw::ustar(b"file").at(329, b"zz\0").tar(),
+            Raw::gnu(b"file").at(329, b"zz\0").tar(),
+        ] {
+            assert!(matches!(collect(&t, &Limits::default()), Err(Error::MalformedTar(_))));
+        }
     }
 
     #[test]
