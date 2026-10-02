@@ -184,3 +184,27 @@ fn rejects_unsupported_platforms() {
     let err = convert_local(&store, &path, &req(&[rv], "r"), &ConvertOptions::default()).unwrap_err();
     assert!(matches!(err, ImageError::UnsupportedPlatform(_)), "{err}");
 }
+
+#[test]
+fn squash_keeps_the_bottom_layers_warnings() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let l0 = TarBuilder::new()
+        .file("a", b"a", &Opts::default().xattr("trusted.overlay.opaque", b"y"))
+        .finish();
+    let l1 = TarBuilder::new().file("b", b"b", &Opts::default()).finish();
+    let l2 = TarBuilder::new().file("c", b"c", &Opts::default()).finish();
+    let path = layout(src.path(), &[arm()], &[gz(&l0), gz(&l1), gz(&l2)]);
+    let opts = ConvertOptions {
+        max_layers: 2,
+        ..Default::default()
+    };
+    let out = convert_local(&store, &path, &req(&[arm()], "w"), &opts).unwrap();
+    let c = &out.images[0];
+    assert_eq!((c.layers.len(), c.squashed), (2, 2));
+    assert!(
+        !c.layers[0].warnings.is_empty(),
+        "dropped-xattr warning survives the squash"
+    );
+}
