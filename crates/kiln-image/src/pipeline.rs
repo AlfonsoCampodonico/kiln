@@ -18,15 +18,19 @@ pub struct Output {
     pub images: Vec<Converted>,
 }
 
-/// Converts every resolved platform and writes the top-level blob.
+/// Converts every resolved platform and writes the top-level blob. Requested
+/// platforms that select the same source manifest (`linux/arm64` and
+/// `linux/arm64/v8`) are converted once.
 pub fn convert_resolved(
     store: &Store,
     resolved: &[ResolvedImage],
     reference: Option<&str>,
     opts: &ConvertOptions,
 ) -> Result<Output> {
+    let mut seen = std::collections::HashSet::new();
     let mut images = resolved
         .iter()
+        .filter(|r| seen.insert(r.manifest_digest.clone()))
         .map(|r| convert_image(store, r, reference, opts))
         .collect::<Result<Vec<_>>>()?;
     if let [one] = images.as_slice() {
