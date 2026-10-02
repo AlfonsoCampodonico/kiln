@@ -1,13 +1,18 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2: 2026-10-01)
-**Status:** Draft rev 2, awaiting review
+**Date:** 2026-09-30 (rev 2.2: 2026-10-02)
+**Status:** Draft rev 2.2, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:** `../../../../ROADMAP.md` (projects #1 snapshot registry and #2 agent sandbox)
 
 ### Revision history
 
 - **rev 1 (2026-09-30):** initial design.
+- **rev 2 (2026-10-01):** incorporates the adversarial review of rev 1 (five reviewers, ~60 raw findings, 24 after dedup; none refuted). Decisions taken with the user:
+  - **A.** A vsock control channel between `kiln-init` and the host is part of v1. It replaces the config disk and the status sector.
+  - **B.** Implicit parent directories inherit attributes from lower layers, as containerd does.
+  - **C.** Hardening is in v1: unprivileged sandboxed VMMs, default-deny egress, verified kernels and init.
+  - **D.** The work is split into three milestones, each with its own implementation plan (§12).
 - **rev 2.1 (2026-10-01):** §6.3, §7.3 and §7.4 corrected to match containerd's overlay snapshotter, as found by the oracle while validating the M1a plan:
   - symlink modes are always 0777;
   - a hardlink header's metadata applies to its inode;
@@ -15,11 +20,7 @@
   - implicit directories described later keep their inherited xattrs.
 
   §7.4 also records three deliberate divergences, and §12 splits M1 into M1a and M1b.
-- **rev 2 (2026-10-01):** incorporates the adversarial review of rev 1 (five reviewers, ~60 raw findings, 24 after dedup; none refuted). Decisions taken with the user:
-  - **A.** A vsock control channel between `kiln-init` and the host is part of v1. It replaces the config disk and the status sector.
-  - **B.** Implicit parent directories inherit attributes from lower layers, as containerd does.
-  - **C.** Hardening is in v1: unprivileged sandboxed VMMs, default-deny egress, verified kernels and init.
-  - **D.** The work is split into three milestones, each with its own implementation plan (§12).
+- **rev 2.2 (2026-10-02):** §5.2 and §6.2 layer cache keys include the verified `diff_id`, found by the M1b-1 task review: a key on the compressed digest alone let a warm store skip the `diff_id` check. §7.6 states that cached layers do not count toward the per-image limit.
 
 ---
 
@@ -210,9 +211,10 @@ $KILN_HOME/
   lock                                        # flock: shared for convert/build/pull/import/run-setup, exclusive for gc
   refs.json                                   # tag → digest index (single file, atomic replace; avoids case-insensitive FS collisions)
   blobs/sha256/<hex>
-  cache/layers/<src-digest>@<fmt>             # "erofs <digest>"  or  "parents <json list of implicit paths>"
-  cache/layers-ctx/<src-digest>@<fmt>@<ctx>   # erofs digest for a layer with inherited parents (§6.3)
+  cache/layers/<src-digest>@<diff-id-hex>@<fmt>            # "erofs <digest>"  or  "parents <json list of implicit paths>"
+  cache/layers-ctx/<src-digest>@<diff-id-hex>@<fmt>@<ctx>  # erofs digest for a layer with inherited parents (§6.3)
   cache/squash/<sha256(ordered erofs digests)>@<fmt>
+  cache/warnings/<layer cache key>             # JSON list of the layer's conversion warnings, removed with its cache/layers entry
   tmp/                                        # staging, same filesystem as blobs/
 ```
 
@@ -260,7 +262,7 @@ $KILN_HOME/
 
 ### 6.2 Convert layers
 
-- **Cache key:** compressed layer digest plus `erofsFormatVersion`.
+- **Cache key:** compressed layer digest, the verified `diff_id`, and `erofsFormatVersion`.
   - Same content with different compression gives a different key but the same erofs output. That costs a miss, never a wrong result.
 - **`erofs <digest>` entry:** the layer is independent of the layers below it. Done.
 - **`parents [paths]` entry:** the layer needs inherited attributes. Resolve them per §6.3 and look up `cache/layers-ctx/`.
@@ -281,7 +283,7 @@ A layer tar may contain `a/b/file` with no `a/` or `a/b/` header. overlayfs show
    - To finalise, resolve each implicit path in the **merged view of the lower layers** (layers `0..i-1`, applying their whiteouts and opaque markers) using the `kiln-erofs` reader.
    - If the path resolves to a directory, inherit its mode, uid, gid, mtime and xattrs. Otherwise, or if it is absent, use the defaults.
    - The context hash `ctx` is SHA-256 of the canonical encoding of the resolved `(path, attrs)` list.
-   - The erofs output is cached in `cache/layers-ctx/<src>@<fmt>@<ctx>`, and the layer is annotated with `dev.kiln.inherits`.
+   - The erofs output is cached in `cache/layers-ctx/<src>@<diff-id>@<fmt>@<ctx>`, and the layer is annotated with `dev.kiln.inherits`.
 4. **Defaults** for invented directories: mode `0755`, uid and gid `0`, mtime equal to the layer's base time (§7.3), no xattrs.
 5. **Described later:** a directory that was created implicitly and then described by its own header later in the same layer keeps that header's mode, uid, gid and mtime. The inherited xattrs lie under its own, as in containerd, so it is reported with the implicit directories too.
 
@@ -401,6 +403,8 @@ All limits are configurable. Exceeding one is a typed error naming the limit.
 | Path length / depth | 4096 bytes / 256 components |
 
 Traversals are iterative, never recursive.
+
+The per-image limit counts the bytes one conversion decompresses. Layers served from the layer cache are not decompressed and do not count, so the limit bounds the work a conversion does (T3), not the image's total size.
 
 ---
 
