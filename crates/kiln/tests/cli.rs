@@ -7,12 +7,16 @@ use kiln_oci::{ContainerConfig, Platform};
 use predicates::prelude::*;
 
 fn layout(dir: &Path, cmd: &str, layers: Vec<Vec<u8>>) -> PathBuf {
-    let mut b = LayoutBuilder::new(dir);
     let cfg = ContainerConfig {
         cmd: Some(vec![cmd.into()]),
         env: Some(vec!["A=1".into()]),
         ..Default::default()
     };
+    layout_with(dir, cfg, layers)
+}
+
+fn layout_with(dir: &Path, cfg: ContainerConfig, layers: Vec<Vec<u8>>) -> PathBuf {
+    let mut b = LayoutBuilder::new(dir);
     let layers: Vec<TestLayer> = layers.into_iter().map(TestLayer::tar).collect();
     let d = b.image(&Platform::parse("linux/arm64").unwrap(), &layers, cfg);
     b.add(d, None).finish()
@@ -110,7 +114,15 @@ fn json_convert_summary_reports_cache_hits() {
 fn image_strings_are_sanitised_in_inspect_and_errors() {
     let src = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let path = layout(&src.path().join("evil"), "\x1b]0;pwned\x07\x1b[2J", simple());
+    let cfg = ContainerConfig {
+        cmd: Some(vec!["\x1b]0;pwned\x07\x1b[2J".into()]),
+        entrypoint: Some(vec!["\x1b[2Jentry\x07".into()]),
+        env: Some(vec!["X=\x1b[2Jv".into()]),
+        working_dir: Some("/w\x1b[2Jd\x07".into()),
+        user: Some("u\x1b[2Js\x07".into()),
+        ..Default::default()
+    };
+    let path = layout_with(&src.path().join("evil"), cfg, simple());
     kiln(home.path())
         .args(["convert", "--platform", "linux/arm64"])
         .arg(&path)
@@ -123,18 +135,26 @@ fn image_strings_are_sanitised_in_inspect_and_errors() {
         .stdout(
             predicate::str::contains("\x1b")
                 .not()
-                .and(predicate::str::contains("\x07").not()),
+                .and(predicate::str::contains("\x07").not())
+                .and(predicate::str::contains("env:        X=[2Jv"))
+                .and(predicate::str::contains("entrypoint: [2Jentry"))
+                .and(predicate::str::contains("workdir:    /w[2Jd"))
+                .and(predicate::str::contains("user:       u[2Js")),
         );
 
     // A hostile tar path ends up in an error message.
     let bad = vec![TarBuilder::new().hardlink("x", "\x1b[31mmissing").finish()];
     let path = layout(&src.path().join("bad"), "sh", bad);
-    kiln(home.path())
+    let out = kiln(home.path())
         .args(["convert", "--platform", "linux/arm64"])
         .arg(&path)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("kiln: error:").and(predicate::str::contains("\x1b").not()));
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("kiln: error:") && !stderr.contains('\x1b'));
+    assert!(stderr.ends_with('\n'));
+    assert_eq!(stderr.trim_end_matches('\n').lines().count(), 1);
 }
 
 #[test]
