@@ -259,3 +259,61 @@ fn skips_docker_attestation_manifests_beside_the_image() {
     let r = resolve_local(&store, &LocalSource::detect(&path).unwrap(), None, &[arm()]).unwrap();
     assert_eq!(r[0].manifest_digest, img_digest);
 }
+
+#[test]
+fn a_descriptor_size_is_checked_even_when_the_blob_is_already_stored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path().join("store")).unwrap();
+    let layer = TestLayer::tar(layer_tar("a"));
+    let mut b = LayoutBuilder::new(&tmp.path().join("one"));
+    let m = b.image(&arm(), std::slice::from_ref(&layer), cfg());
+    let dir = b.add(m, None).finish();
+    let img = resolve_local(&store, &LocalSource::Layout(dir), None, &[arm()])
+        .unwrap()
+        .remove(0);
+
+    // A second layout whose manifest names the same layer digest with an inflated size.
+    let mut manifest = img.manifest.clone();
+    manifest.layers[0].size += 1;
+    let bytes = kiln_oci::canonical_json(&manifest);
+    let mut b2 = LayoutBuilder::new(&tmp.path().join("two"));
+    b2.blob(&store.read_metadata(&img.config_digest).unwrap());
+    b2.blob(&layer.blob);
+    let d = kiln_oci::Descriptor::new(media::OCI_MANIFEST, b2.blob(&bytes), bytes.len() as u64);
+    let dir2 = b2.add(d, None).finish();
+    let err = resolve_local(&store, &LocalSource::Layout(dir2), None, &[arm()]).unwrap_err();
+    assert!(
+        matches!(err, OciError::Store(kiln_store::StoreError::SizeMismatch { .. })),
+        "{err}"
+    );
+}
+
+#[test]
+fn oversized_metadata_is_a_typed_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut b = LayoutBuilder::new(&tmp.path().join("layout"));
+    let m = b.image(&arm(), &[TestLayer::tar(layer_tar("a"))], cfg());
+    let dir = b.add(m.clone(), None).finish();
+    let store = Store::open(tmp.path().join("store")).unwrap();
+
+    // A manifest descriptor claiming more than the metadata limit.
+    let mut huge = m.clone();
+    huge.size = kiln_store::MAX_METADATA_BLOB + 1;
+    let mut b2 = LayoutBuilder::new(&tmp.path().join("layout2"));
+    let dir2 = b2.add(huge, None).finish();
+    assert!(matches!(
+        resolve_local(&store, &LocalSource::Layout(dir2), None, &[arm()]),
+        Err(OciError::Store(kiln_store::StoreError::TooLarge { .. }))
+    ));
+
+    // An index.json larger than the limit.
+    fs::write(
+        dir.join("index.json"),
+        vec![b' '; kiln_store::MAX_METADATA_BLOB as usize + 1],
+    )
+    .unwrap();
+    assert!(matches!(
+        resolve_local(&store, &LocalSource::Layout(dir), None, &[arm()]),
+        Err(OciError::MetadataTooLarge { .. })
+    ));
+}

@@ -29,7 +29,10 @@ pub trait BlobSource {
         let mut buf = Vec::new();
         self.open_path(path)?.take(max + 1).read_to_end(&mut buf)?;
         if buf.len() as u64 > max {
-            return Err(OciError::BadArchive(format!("{path} is larger than {max} bytes")));
+            return Err(OciError::MetadataTooLarge {
+                path: path.to_string(),
+                max,
+            });
         }
         Ok(buf)
     }
@@ -137,10 +140,8 @@ impl TarArchive {
             let Some(name) = clean_path(&raw) else { continue };
             let kind = e.header().entry_type();
             if kind.is_file() {
-                let size = e
-                    .header()
-                    .entry_size()
-                    .map_err(|e| OciError::BadArchive(e.to_string()))?;
+                // The effective size: a PAX `size` record overrides the ustar field.
+                let size = e.size();
                 if regular.insert(name.clone(), (e.raw_file_position(), size)).is_some() {
                     return Err(OciError::BadArchive(format!("duplicate entry {name:?}")));
                 }
@@ -287,5 +288,48 @@ mod tests {
         let p = dir.path().join("a.tar.gz");
         fs::write(&p, [0x1f, 0x8b, 8, 0]).unwrap();
         assert!(matches!(TarArchive::open(&p), Err(OciError::BadArchive(_))));
+    }
+
+    #[test]
+    fn archive_indexes_the_effective_pax_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("pax.tar");
+        let mut b = tar::Builder::new(Vec::new());
+        b.append_pax_extensions([("size", &b"5"[..])]).unwrap();
+        // The ustar field says 3 bytes, but the PAX record says 5.
+        let mut h = tar::Header::new_ustar();
+        h.set_path("f").unwrap();
+        h.set_size(3);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append(&h, &b"ABCDE"[..]).unwrap();
+        let bytes = b.into_inner().unwrap();
+        fs::write(&p, &bytes).unwrap();
+        let mut want = String::new();
+        let mut reference = tar::Archive::new(&bytes[..]);
+        for e in reference.entries().unwrap() {
+            let mut e = e.unwrap();
+            if e.path().unwrap().to_str() == Some("f") {
+                e.read_to_string(&mut want).unwrap();
+            }
+        }
+        assert_eq!(want, "ABCDE", "the tar crate reads the PAX size");
+        let a = TarArchive::open(&p).unwrap();
+        let mut got = String::new();
+        a.open_path("f").unwrap().read_to_string(&mut got).unwrap();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn oversized_metadata_is_a_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("oci-layout"), b"{}").unwrap();
+        fs::write(dir.path().join("index.json"), vec![b' '; 11]).unwrap();
+        let l = DirLayout::open(dir.path()).unwrap();
+        assert!(matches!(
+            l.read_small("index.json", 10),
+            Err(OciError::MetadataTooLarge { max: 10, .. })
+        ));
+        assert_eq!(l.read_small("index.json", 11).unwrap().len(), 11);
     }
 }
