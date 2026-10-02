@@ -1,6 +1,58 @@
 # kiln formats
 
-This document is normative. It currently defines the **erofs profile** (format version 1). The image manifest (§5.1 of the design spec) and the control protocol (§9.5) are added by milestones M1b and M3.
+This document is normative. It defines the **kiln image** (schema version 1, provisional until M3 adds kernel and init layers) and the **erofs profile** (format version 1). The control protocol (§9.5 of the design spec) is added by milestone M3.
+
+## kiln image, schema version 1
+
+A kiln image is an OCI 1.1 artifact. All JSON kiln writes is serialised with keys sorted and no insignificant whitespace, so identical inputs give identical digests.
+
+### Index (multi-platform images)
+
+An OCI image index (`mediaType` `application/vnd.oci.image.index.v1+json`, `schemaVersion` 2) with `artifactType` `application/vnd.kiln.image.v1`. Each entry in `manifests` is a kiln manifest descriptor with `artifactType` `application/vnd.kiln.image.v1` and a `platform` (`os`, `architecture`, optional `variant`). Entries are sorted by platform (architecture, then os, then variant). A single-platform image is a bare manifest with no index.
+
+### Manifest
+
+An OCI image manifest (`mediaType` `application/vnd.oci.image.manifest.v1+json`, `schemaVersion` 2) with:
+- `artifactType`: `application/vnd.kiln.image.v1`. Readers reject manifests without it.
+- `config`: a descriptor with `mediaType` `application/vnd.kiln.image.config.v1+json`.
+- `layers`, in boot order:
+  1. Kernel, `application/vnd.kiln.kernel.v1` (from M3; absent in schema-1 images built before M3).
+  2. Init layer, `application/vnd.kiln.init.v1.erofs` (from M3; absent likewise).
+  3. App layers, lowest first, `application/vnd.kiln.layer.v1.erofs`: erofs profile images (below), applied as overlayfs lower layers.
+- App layer annotations, **informational only** (never used for caching or verification):
+  - `dev.kiln.source.digests`: the comma-separated digests of the OCI layers the erofs layer was built from, in order. A squashed bottom layer lists all of them.
+  - `dev.kiln.inherits`: `"true"` when the layer has implicit directories whose attributes came from the layers below it. Such a layer is only valid on top of exactly those layers.
+
+### Config
+
+```json
+{
+  "architecture": "arm64",
+  "erofsFormatVersion": 1,
+  "process": { "cmd": ["php", "-a"], "entrypoint": ["docker-php-entrypoint"], "env": ["PATH=/usr/local/bin:/usr/bin:/bin"], "stopSignal": "SIGQUIT", "user": "www-data", "workingDir": "/app" },
+  "schemaVersion": 1,
+  "source": { "manifestDigest": "sha256:…", "reference": "docker.io/library/php:8.4-cli" }
+}
+```
+- `schemaVersion`: 1. Readers reject other values.
+- `architecture`: `amd64` or `arm64`.
+- `process`: copied from the source OCI config. Empty lists and strings are omitted.
+- `kernel` (`{ "profile", "version" }`) and `init` (`{ "version" }`): set from M3, omitted before.
+- `source.manifestDigest`: the source OCI manifest. `source.reference` is present only for registry inputs. This is unverified provenance.
+- `erofsFormatVersion`: the erofs profile version of every app layer.
+- There is no kernel command line field and no kiln version field.
+
+### Local store (informative)
+
+`$KILN_HOME` (default `~/.local/share/kiln`) holds `blobs/sha256/<hex>`, `refs.json` (`{"refs": {"<name>": "<digest>"}}`), and four caches of small text files. Each entry is written only after the layer it describes has been verified and committed:
+- `cache/layers/<source layer digest>@<hex diff_id>@<format version>`: `erofs <digest>` for a layer that depends only on its tar, or `parents <JSON list of hex-encoded implicit paths>`.
+- `cache/layers-ctx/<source layer digest>@<hex diff_id>@<format version>@<ctx>`: the erofs digest for a layer with implicit parents. `ctx` is the hex SHA-256 of the JSON list, in implicit-path order, of `[hex(path), null]` (absent in the lowers, or not a directory) or `[hex(path), [mode, uid, gid, mtime_sec, mtime_nsec, [[xattr_index, hex(name), hex(value)], …]]]`.
+- `cache/squash/<hex SHA-256 of the newline-joined erofs digests>@<format version>`: a squashed bottom layer.
+- `cache/warnings/<layer cache key>`: the JSON list of warnings converting that layer produced, so a cache hit reports them too. Removed by GC together with the `cache/layers/` entry of the same name.
+
+Keying by the verified `diff_id` as well as the compressed digest ties a cache hit to the decompressed content the image config claims, so a blob listed with a different compression or a wrong `diff_id` misses instead of being served another image's filesystem.
+
+`:` in a cache key is written as `_` in its file name.
 
 ## erofs profile, version 1
 
@@ -119,10 +171,15 @@ A directory created because a descendant, whiteout or opaque marker needed it in
 
 ### Known divergences from containerd's applier
 
-kiln is checked against containerd's overlayfs snapshotter (kiln-erofs Task 14). It deliberately differs in three cases that image builders do not produce:
+kiln is checked against containerd's overlayfs snapshotter (kiln-erofs Task 14). It deliberately differs in these cases, which image builders do not produce:
 1. containerd sets directory mtimes in a final pass. If a later entry in the same layer replaced a directory, or one of its parents, with a non-directory, that pass fails or re-times the replacement. kiln keeps each entry's own attributes.
 2. containerd resolves an implicit directory's attributes by searching each lower layer on its own. It skips non-directories, ignores whiteouts and opaque directories, and fails on a file in the middle of the path. kiln uses the overlay view.
 3. containerd follows symlinks in lower layers while resolving parents. kiln does not.
+4. A tar may carry `trusted.overlay.*` xattrs in PAX records. containerd writes them to disk, where they can forge whiteouts, opaque directories or redirects. kiln drops them with a warning; overlay markers come only from `.wh.` entries.
+5. containerd ignores everything after a tar's end-of-archive marker. kiln requires the decompressed remainder to be zero padding and rejects the layer otherwise, so the bytes covered by `diff_id` mean one thing.
+6. A tar header whose size field holds only NULs and spaces: Go's `archive/tar` reads it as 0; kiln rejects the layer (the `tar` crate parses sizes itself).
+
+Other header numeric fields (mode, uid, gid, mtime, device numbers) that hold only NULs and spaces read as 0, as in Go's `archive/tar`.
 
 ### Determinism
 
