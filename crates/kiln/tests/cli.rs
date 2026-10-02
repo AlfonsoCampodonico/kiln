@@ -198,3 +198,79 @@ fn bench_emits_json() {
         assert!(v[k].is_u64(), "{k}");
     }
 }
+
+/// 100 independent one-file layers: no directories, so none needs its lowers.
+fn flat_layers(n: usize) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| {
+            TarBuilder::new()
+                .file(&format!("f{i}"), b"x", &Opts::default())
+                .finish()
+        })
+        .collect()
+}
+
+/// `ulimit -n` lowers both limits of the child, so only bounded phase-A file use passes.
+#[cfg(unix)]
+#[test]
+fn many_layers_convert_with_a_low_open_file_limit() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let path = layout(&src.path().join("app"), "php", flat_layers(100));
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg("ulimit -n 256 && exec \"$0\" \"$@\"")
+        .arg(assert_cmd::cargo::cargo_bin("kiln"))
+        .arg("--store")
+        .arg(home.path())
+        .args(["convert", "--platform", "linux/arm64"])
+        .arg(&path);
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("bottom 91 squashed"));
+}
+
+#[test]
+fn a_bad_tag_fails_before_any_conversion() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let path = layout(&src.path().join("app"), "php", simple());
+    kiln(home.path())
+        .args(["convert", "--platform", "linux/arm64", "--tag", "bad tag"])
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid --tag bad tag"));
+    let blobs = home.path().join("blobs/sha256");
+    assert!(!blobs.exists() || std::fs::read_dir(blobs).unwrap().next().is_none());
+    kiln(home.path())
+        .args(["import", "--from-store"])
+        .arg(home.path())
+        .args(["x:1", "--as", "bad name"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid name bad name"));
+}
+
+#[test]
+fn repeated_platform_flags_convert_once() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let path = layout(&src.path().join("app"), "php", simple());
+    let out = kiln(home.path())
+        .args([
+            "convert",
+            "--json",
+            "--platform",
+            "linux/arm64",
+            "--platform",
+            "linux/arm64",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["mediaType"], "application/vnd.oci.image.manifest.v1+json");
+    assert_eq!(v["images"].as_array().unwrap().len(), 1);
+}

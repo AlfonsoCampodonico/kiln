@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2: 2026-10-01)
-**Status:** Draft rev 2, awaiting review
+**Date:** 2026-09-30 (rev 2.2: 2026-10-02)
+**Status:** Draft rev 2.2, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:** `../../../../ROADMAP.md` (projects #1 snapshot registry and #2 agent sandbox)
 

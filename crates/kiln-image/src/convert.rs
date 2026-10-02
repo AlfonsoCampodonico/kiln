@@ -74,6 +74,15 @@ struct Pending {
     warnings: Vec<String>,
 }
 
+/// Result of streaming one layer in phase A. A layer with no implicit directories
+/// needs none of its lowers, so it is finished and committed on the spot (its
+/// temp file, writer handle and spill file are released); only layers that must
+/// inherit directory metadata stay open until phase B.
+enum Streamed {
+    Committed { erofs: Digest, warnings: Vec<String> },
+    Pending(Box<Pending>),
+}
+
 enum Plan {
     Done(Digest),
     Parents(Vec<Vec<u8>>),
@@ -116,7 +125,7 @@ fn stream_layer(
     i: usize,
     opts: &ConvertOptions,
     budget: &Arc<Budget>,
-) -> Result<Pending> {
+) -> Result<Streamed> {
     let desc = &img.manifest.layers[i];
     let compression = media::layer_compression(&desc.media_type)?;
     let max = layer_limit(
@@ -182,12 +191,20 @@ fn stream_layer(
         });
     }
     let implicit = writer.implicit_dirs();
-    Ok(Pending {
+    if implicit.is_empty() {
+        let (_out, summary) = writer.finish(&BTreeMap::new())?;
+        let erofs = store.commit(tmp)?;
+        return Ok(Streamed::Committed {
+            erofs,
+            warnings: summary.warnings,
+        });
+    }
+    Ok(Streamed::Pending(Box::new(Pending {
         tmp,
         writer,
         implicit,
         warnings: Vec::new(),
-    })
+    })))
 }
 
 /// Runs `stream_layer` for `todo` on up to `opts.jobs` threads; stops early on error.
@@ -197,7 +214,7 @@ fn stream_parallel(
     todo: &[usize],
     opts: &ConvertOptions,
     budget: &Arc<Budget>,
-) -> Result<BTreeMap<usize, Pending>> {
+) -> Result<BTreeMap<usize, Streamed>> {
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let results = Mutex::new(Vec::new());
@@ -222,13 +239,21 @@ fn stream_parallel(
     results.into_iter().map(|(i, r)| r.map(|p| (i, p))).collect()
 }
 
-/// Finalises `p` against `lowers`, commits it, then writes its cache entries.
+/// Completes a streamed layer against `lowers` and writes its cache entries
+/// (always in phase B, bottom-up, so a failing sibling leaves no entry).
 fn finish_layer(
     store: &Store,
     key: &str,
-    p: Pending,
+    streamed: Streamed,
     lowers: &mut [Image<File>],
 ) -> Result<(Digest, bool, Vec<String>)> {
+    let p = match streamed {
+        Streamed::Committed { erofs, warnings } => {
+            store.cache_put(CacheKind::Layers, key, &format!("erofs {erofs}"))?;
+            return Ok((erofs, false, warnings));
+        }
+        Streamed::Pending(p) => *p,
+    };
     let inherited: BTreeMap<Vec<u8>, DirAttrs> = if p.implicit.is_empty() {
         BTreeMap::new()
     } else {

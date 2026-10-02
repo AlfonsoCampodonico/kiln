@@ -208,3 +208,51 @@ fn squash_keeps_the_bottom_layers_warnings() {
         "dropped-xattr warning survives the squash"
     );
 }
+
+/// Regression: every streamed layer used to stay open until phase B, so images with
+/// more than ~84 layers hit macOS's default 256-descriptor limit on a cold convert.
+#[test]
+fn many_independent_layers_convert_and_squash() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let layers: Vec<TestLayer> = (0..120)
+        .map(|i| {
+            gz(&TarBuilder::new()
+                .file(&format!("f{i}"), &[i as u8; 16], &Opts::default())
+                .finish())
+        })
+        .collect();
+    let path = layout(src.path(), &[arm()], &layers);
+    let out = convert_local(&store, &path, &req(&[arm()], "many"), &ConvertOptions::default()).unwrap();
+    let c = &out.images[0];
+    assert_eq!((c.layers.len(), c.squashed), (10, 111));
+    let open = |i: usize| Image::open(store.open_blob(&c.layers[i].erofs).unwrap()).unwrap();
+    let mut bottom = open(0);
+    for name in ["f0", "f55", "f110"] {
+        assert!(
+            bottom.lookup(name.as_bytes()).unwrap().is_some(),
+            "{name} in the squashed layer"
+        );
+    }
+    assert!(open(9).lookup(b"f119").unwrap().is_some());
+    assert!(open(1).lookup(b"f111").unwrap().is_some());
+    let again = convert_local(&store, &path, &req(&[arm()], "many"), &ConvertOptions::default()).unwrap();
+    assert_eq!(again.digest, out.digest);
+    assert!(again.images[0].layers.iter().all(|l| l.cached));
+}
+
+#[test]
+fn golden_manifest_digest_is_stable() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let path = layout(src.path(), &[arm()], &[gz(&base(0o1777)), gz(&top())]);
+    let out = convert_local(&store, &path, &req(&[arm()], "g"), &ConvertOptions::default()).unwrap();
+    // Changes only with an erofs format bump or a deliberate kiln schema change (spec §6.6);
+    // update both together.
+    assert_eq!(
+        out.digest.to_string(),
+        "sha256:1d582c644583152fcf8d62bd7bdca95acb48e2ed0c4c03794267b791d7b47e33"
+    );
+}
