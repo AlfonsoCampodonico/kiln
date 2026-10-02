@@ -1,5 +1,6 @@
 //! Merged (overlayfs) views over kiln layers: parent inheritance (§6.3) and squash (§6.4).
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Seek, Write};
 use std::path::Path;
@@ -27,8 +28,9 @@ pub fn resolve_inherited<R: Read + Seek>(
     paths: &[Vec<u8>],
 ) -> Result<BTreeMap<Vec<u8>, DirAttrs>> {
     let mut out = BTreeMap::new();
+    let mut dirs = DirCache::new();
     for path in paths {
-        let Some((layer, nid)) = merged_lookup(lowers, path)? else {
+        let Some((layer, nid)) = merged_lookup(lowers, &mut dirs, path)? else {
             continue;
         };
         let img = &mut lowers[layer];
@@ -54,8 +56,29 @@ fn is_opaque(xattrs: &Xattrs) -> bool {
     xattrs.get(&XattrKey::opaque()).is_some_and(|v| v.as_slice() == b"y")
 }
 
+/// Parsed directories by `(layer, nid)`, so resolving many paths reads each directory once.
+type DirCache = HashMap<(usize, u64), HashMap<Vec<u8>, u64>>;
+
+fn child_nid<R: Read + Seek>(
+    img: &mut Image<R>,
+    dirs: &mut DirCache,
+    layer: usize,
+    dir: u64,
+    name: &[u8],
+) -> Result<Option<u64>> {
+    let entries = match dirs.entry((layer, dir)) {
+        Entry::Occupied(e) => e.into_mut(),
+        Entry::Vacant(e) => e.insert(img.read_dir(dir)?.into_iter().map(|e| (e.name, e.nid)).collect()),
+    };
+    Ok(entries.get(name).copied())
+}
+
 /// The topmost `(layer, nid)` providing `path` in the overlay of `layers`.
-fn merged_lookup<R: Read + Seek>(layers: &mut [Image<R>], path: &[u8]) -> Result<Option<(usize, u64)>> {
+fn merged_lookup<R: Read + Seek>(
+    layers: &mut [Image<R>],
+    dirs: &mut DirCache,
+    path: &[u8],
+) -> Result<Option<(usize, u64)>> {
     let comps: Vec<&[u8]> = components(path).collect();
     for layer in (0..layers.len()).rev() {
         let img = &mut layers[layer];
@@ -66,23 +89,23 @@ fn merged_lookup<R: Read + Seek>(layers: &mut [Image<R>], path: &[u8]) -> Result
         // overlayfs ignores an opaque marker on a layer's root directory.
         let mut opaque_above = false;
         for (i, c) in comps.iter().enumerate() {
-            let Some(entry) = img.read_dir(cur)?.into_iter().find(|e| e.name == *c) else {
+            let Some(nid) = child_nid(img, dirs, layer, cur, c)? else {
                 break;
             };
-            let info = img.inode(entry.nid)?;
+            let info = img.inode(nid)?;
             if info.is_whiteout() {
                 return Ok(None);
             }
             if i + 1 == comps.len() {
-                return Ok(Some((layer, entry.nid)));
+                return Ok(Some((layer, nid)));
             }
             if !info.is_dir() {
                 return Ok(None);
             }
-            if is_opaque(&img.xattrs(entry.nid)?) {
+            if is_opaque(&img.xattrs(nid)?) {
                 opaque_above = true;
             }
-            cur = entry.nid;
+            cur = nid;
         }
         if opaque_above {
             return Ok(None);
