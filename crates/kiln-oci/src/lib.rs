@@ -6,8 +6,14 @@
 mod error;
 pub mod media;
 mod platform;
+mod resolve;
+mod source;
+#[doc(hidden)]
+pub mod testlayout;
 mod types;
 
 pub use error::{OciError, Result};
 pub use platform::Platform;
+pub use resolve::{CONTAINERD_NAME, LocalSource, REF_NAME, ResolvedImage, resolve_local};
+pub use source::{BlobSource, DirLayout, TarArchive};
 pub use types::{ContainerConfig, Descriptor, ImageConfig, ImageIndex, ImageManifest, RootFs, canonical_json};
