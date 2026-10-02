@@ -2,6 +2,9 @@
 
 Usage: compare_tree.py REFERENCE CANDIDATE. Exits 1 if they differ. Paths that
 `docker export` adds for the container runtime are skipped.
+
+Directory mtimes are not compared: overlayfs reports the upper directory's mtime,
+which differs from containerd's final-pass mtime by design.
 """
 import hashlib
 import os

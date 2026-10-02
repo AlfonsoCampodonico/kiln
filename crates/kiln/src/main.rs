@@ -52,8 +52,10 @@ impl ConvertArgs {
     }
 
     fn platforms(&self) -> Result<Vec<Platform>> {
+        let mut seen = std::collections::HashSet::new();
         self.platforms
             .iter()
+            .filter(|p| seen.insert(p.as_str()))
             .map(|p| Platform::parse(p).with_context(|| format!("invalid --platform {}", clean_line(p))))
             .collect()
     }
@@ -181,6 +183,7 @@ fn run(cli: Cli) -> Result<()> {
                 Some(t) => t.clone(),
                 None => default_tag(path)?,
             };
+            kiln_store::check_ref_name(&tag).with_context(|| format!("invalid --tag {}", clean_line(&tag)))?;
             let platforms = args.platforms()?;
             let req = LocalRequest {
                 source_ref: source_ref.as_deref(),
@@ -218,6 +221,7 @@ fn run(cli: Cli) -> Result<()> {
             let store = open_store(&cli)?;
             let src = Store::open_read_only(from_store)?;
             let as_name = as_name.as_deref().unwrap_or(name);
+            kiln_store::check_ref_name(as_name).with_context(|| format!("invalid name {}", clean_line(as_name)))?;
             let r = import_image(&store, &src, name, as_name)?;
             println!(
                 "{as_name} → {} ({} blobs, {} copied)",
@@ -352,6 +356,9 @@ fn render_error(e: &anyhow::Error) -> String {
 }
 
 fn main() -> ExitCode {
+    // Many-layer images keep a few files open per layer; macOS defaults to 256.
+    // Best effort: the hard limit may already be the soft one.
+    let _ = rlimit::increase_nofile_limit(u64::MAX);
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
