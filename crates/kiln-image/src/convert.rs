@@ -71,7 +71,6 @@ struct Pending {
     tmp: TmpBlob,
     writer: LayerWriter<File>,
     implicit: Vec<Vec<u8>>,
-    warnings: Vec<String>,
 }
 
 /// Result of streaming one layer in phase A. A layer with no implicit directories
@@ -199,12 +198,7 @@ fn stream_layer(
             warnings: summary.warnings,
         });
     }
-    Ok(Streamed::Pending(Box::new(Pending {
-        tmp,
-        writer,
-        implicit,
-        warnings: Vec::new(),
-    })))
+    Ok(Streamed::Pending(Box::new(Pending { tmp, writer, implicit })))
 }
 
 /// Runs `stream_layer` for `todo` on up to `opts.jobs` threads; stops early on error.
@@ -239,38 +233,69 @@ fn stream_parallel(
     results.into_iter().map(|(i, r)| r.map(|p| (i, p))).collect()
 }
 
-/// Completes a streamed layer against `lowers` and writes its cache entries
+/// The finished layers below the current one. Their images are opened only while
+/// a layer resolves inherited directories, so phase B holds no descriptors otherwise.
+struct Lowers<'a> {
+    store: &'a Store,
+    digests: Vec<Digest>,
+}
+
+impl Lowers<'_> {
+    fn resolve(&self, paths: &[Vec<u8>]) -> Result<BTreeMap<Vec<u8>, DirAttrs>> {
+        let mut images = self
+            .digests
+            .iter()
+            .map(|d| Ok(Image::open(self.store.open_blob(d)?)?))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(kiln_erofs::resolve_inherited(&mut images, paths)?)
+    }
+}
+
+/// Records a layer's conversion warnings under its cache key, so a later cache hit
+/// reports them too. Written before the layer entry it annotates.
+fn save_warnings(store: &Store, key: &str, warnings: &[String]) -> Result<()> {
+    if warnings.is_empty() {
+        return Ok(());
+    }
+    let json = serde_json::to_string(warnings).expect("strings serialize");
+    Ok(store.cache_put(CacheKind::Warnings, key, &json)?)
+}
+
+fn cached_warnings(store: &Store, key: &str) -> Result<Vec<String>> {
+    let entry = store.cache_get(CacheKind::Warnings, key)?;
+    // A corrupt entry only loses warnings; it never affects the conversion.
+    Ok(entry.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
+}
+
+/// Completes a streamed layer against its lowers and writes its cache entries
 /// (always in phase B, bottom-up, so a failing sibling leaves no entry).
+/// `inherited` is passed when the caller already resolved the layer's parents.
 fn finish_layer(
     store: &Store,
     key: &str,
     streamed: Streamed,
-    lowers: &mut [Image<File>],
+    lowers: &Lowers,
+    inherited: Option<BTreeMap<Vec<u8>, DirAttrs>>,
 ) -> Result<(Digest, bool, Vec<String>)> {
     let p = match streamed {
         Streamed::Committed { erofs, warnings } => {
+            save_warnings(store, key, &warnings)?;
             store.cache_put(CacheKind::Layers, key, &format!("erofs {erofs}"))?;
             return Ok((erofs, false, warnings));
         }
         Streamed::Pending(p) => *p,
     };
-    let inherited: BTreeMap<Vec<u8>, DirAttrs> = if p.implicit.is_empty() {
-        BTreeMap::new()
-    } else {
-        kiln_erofs::resolve_inherited(lowers, &p.implicit)?
+    let inherited = match inherited {
+        Some(m) => m,
+        None => lowers.resolve(&p.implicit)?,
     };
     let (_out, summary) = p.writer.finish(&inherited)?;
     let d = store.commit(p.tmp)?;
-    if p.implicit.is_empty() {
-        store.cache_put(CacheKind::Layers, key, &format!("erofs {d}"))?;
-    } else {
-        let ctx = ctx_hash(&p.implicit, &inherited);
-        store.cache_put(CacheKind::LayersCtx, &format!("{key}@{ctx}"), &d.to_string())?;
-        store.cache_put(CacheKind::Layers, key, &parents_entry(&p.implicit))?;
-    }
-    let mut warnings = p.warnings;
-    warnings.extend(summary.warnings);
-    Ok((d, !p.implicit.is_empty(), warnings))
+    save_warnings(store, key, &summary.warnings)?;
+    let ctx = ctx_hash(&p.implicit, &inherited);
+    store.cache_put(CacheKind::LayersCtx, &format!("{key}@{ctx}"), &d.to_string())?;
+    store.cache_put(CacheKind::Layers, key, &parents_entry(&p.implicit))?;
+    Ok((d, true, summary.warnings))
 }
 
 fn squash_key(layers: &[LayerReport]) -> String {
@@ -340,31 +365,34 @@ pub fn convert_image(
 
     // Bottom-up: each layer's lowers are final before it is.
     let mut reports: Vec<LayerReport> = Vec::new();
-    let mut lowers: Vec<Image<File>> = Vec::new();
+    let mut lowers = Lowers {
+        store,
+        digests: Vec::new(),
+    };
     for (i, plan) in plans.into_iter().enumerate() {
         let src = &layers[i].digest;
         let lkey = layer_key(src, &img.config.rootfs.diff_ids[i]);
         let (erofs, cached, inherits, warnings) = match plan {
-            Plan::Done(d) => (d, true, false, Vec::new()),
+            Plan::Done(d) => (d, true, false, cached_warnings(store, &lkey)?),
             Plan::Parents(paths) => {
-                let inherited = kiln_erofs::resolve_inherited(&mut lowers, &paths)?;
+                let inherited = lowers.resolve(&paths)?;
                 let key = format!("{lkey}@{}", ctx_hash(&paths, &inherited));
                 match store.cache_get_blob(CacheKind::LayersCtx, &key)? {
-                    Some(d) => (d, true, true, Vec::new()),
+                    Some(d) => (d, true, true, cached_warnings(store, &lkey)?),
                     None => {
                         let p = stream_layer(store, img, i, opts, &budget)?;
-                        let (d, inherits, w) = finish_layer(store, &lkey, p, &mut lowers)?;
+                        let (d, inherits, w) = finish_layer(store, &lkey, p, &lowers, Some(inherited))?;
                         (d, false, inherits, w)
                     }
                 }
             }
             Plan::Convert => {
                 let p = pending.remove(&i).expect("streamed in phase A");
-                let (d, inherits, w) = finish_layer(store, &lkey, p, &mut lowers)?;
+                let (d, inherits, w) = finish_layer(store, &lkey, p, &lowers, None)?;
                 (d, false, inherits, w)
             }
         };
-        lowers.push(Image::open(store.open_blob(&erofs)?)?);
+        lowers.digests.push(erofs.clone());
         let size = store.blob_size(&erofs)?;
         reports.push(LayerReport {
             sources: vec![src.clone()],
@@ -375,7 +403,6 @@ pub fn convert_image(
             warnings,
         });
     }
-    drop(lowers);
 
     let mut squashed = 0;
     if reports.len() > opts.max_layers {

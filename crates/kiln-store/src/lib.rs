@@ -59,6 +59,7 @@ impl Store {
             "cache/layers",
             "cache/layers-ctx",
             "cache/squash",
+            "cache/warnings",
             "tmp",
         ] {
             fs::create_dir_all(root.join(dir))?;

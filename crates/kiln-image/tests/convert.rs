@@ -209,6 +209,29 @@ fn squash_keeps_the_bottom_layers_warnings() {
     );
 }
 
+#[test]
+fn warm_converts_report_the_same_warnings_as_cold_ones() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let opaque = || Opts::default().xattr("trusted.overlay.opaque", b"y");
+    // An independent layer and an inheriting one (tmp/ is implicit), each with a dropped xattr.
+    let l0 = TarBuilder::new()
+        .dir("tmp", &Opts::default().mode(0o1777))
+        .file("a", b"a", &opaque())
+        .finish();
+    let l1 = TarBuilder::new().file("tmp/b", b"b", &opaque()).finish();
+    let path = layout(src.path(), &[arm()], &[gz(&l0), gz(&l1)]);
+    let cold = convert_local(&store, &path, &req(&[arm()], "w"), &ConvertOptions::default()).unwrap();
+    let warm = convert_local(&store, &path, &req(&[arm()], "w"), &ConvertOptions::default()).unwrap();
+    let (c, w) = (&cold.images[0].layers, &warm.images[0].layers);
+    assert!(c[1].inherits && w.iter().all(|l| l.cached));
+    for i in 0..2 {
+        assert!(!c[i].warnings.is_empty(), "layer {i} warns");
+        assert_eq!(c[i].warnings, w[i].warnings, "layer {i}");
+    }
+}
+
 /// Regression: every streamed layer used to stay open until phase B, so images with
 /// more than ~84 layers hit macOS's default 256-descriptor limit on a cold convert.
 #[test]
