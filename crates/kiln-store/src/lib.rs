@@ -2,15 +2,21 @@
 //! the refs index, a store-wide lock and garbage collection.
 #![forbid(unsafe_code)]
 
+mod cache;
 mod digest;
 mod error;
+mod gc;
+mod refs;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+pub use cache::CacheKind;
 pub use digest::{Digest, Hasher, HashingReader};
 pub use error::{Result, StoreError};
+pub use gc::{GcReport, references};
+pub use refs::check_ref_name;
 
 /// Largest metadata blob (manifest, index, config) the store will load into memory.
 pub const MAX_METADATA_BLOB: u64 = 4 << 20;
@@ -228,6 +234,15 @@ impl Store {
         out.sort();
         Ok(out)
     }
+}
+
+/// Writes `bytes` to `path` atomically (temp file in `dir`, fsync, rename).
+pub(crate) fn write_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut tmp = tempfile::Builder::new().prefix("meta-").tempfile_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| StoreError::Io(e.error))?;
+    Ok(())
 }
 
 #[cfg(test)]
