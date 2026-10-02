@@ -33,3 +33,17 @@ fn imports_between_stores_verifying_blobs() {
     );
     assert_eq!(c.get_ref("app:1").unwrap(), None);
 }
+
+#[test]
+fn importing_a_large_non_metadata_blob_is_refused_before_copying() {
+    let (h1, h2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let src = Store::open(h1.path()).unwrap();
+    let big = src.put_bytes(&vec![0u8; (5 << 20) + 1]).unwrap();
+    let dst = Store::open(h2.path()).unwrap();
+    let err = import_image(&dst, &src, &big.to_string(), "x:1").unwrap_err();
+    assert!(
+        matches!(err, ImageError::Store(kiln_store::StoreError::TooLarge { .. })),
+        "{err}"
+    );
+    assert!(!dst.has_blob(&big));
+}

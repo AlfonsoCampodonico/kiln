@@ -114,8 +114,11 @@ pub fn run(src: &Path, platforms: &[Platform], opts: &ConvertOptions, top_bytes:
     let work = tempfile::tempdir()?;
     let store = Store::open(work.path().join("store"))?;
     let host = [Platform::host()];
-    let platforms = if platforms.is_empty() { &host[..] } else { platforms };
-    let platforms = &platforms[..1];
+    let platforms = match platforms {
+        [] => &host[..],
+        [_] => platforms,
+        _ => anyhow::bail!("bench measures one platform; pass at most one --platform"),
+    };
     let req = LocalRequest {
         source_ref: None,
         platforms,
@@ -123,7 +126,8 @@ pub fn run(src: &Path, platforms: &[Platform], opts: &ConvertOptions, top_bytes:
     };
     let (out, cold) = timed(|| Ok(convert_local(&store, src, &req, opts)?)).context("cold convert")?;
     let ((), warm) = timed(|| Ok(convert_local(&store, src, &req, opts).map(drop)?)).context("warm convert")?;
-    let derived = derive_changed_top(&store, src, platforms, top_bytes, &work.path().join("derived"))?;
+    let derived = derive_changed_top(&store, src, platforms, top_bytes, &work.path().join("derived"))
+        .context("deriving the changed-top-layer layout")?;
     let ((), changed) =
         timed(|| Ok(convert_local(&store, &derived, &req, opts).map(drop)?)).context("changed-top convert")?;
     Ok(json!({

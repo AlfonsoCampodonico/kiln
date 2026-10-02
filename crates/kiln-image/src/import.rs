@@ -1,7 +1,7 @@
 //! `kiln import --from-store`: copy a kiln image between stores, verifying every blob.
 
 use kiln_oci::{ImageIndex, ImageManifest};
-use kiln_store::{Digest, Store};
+use kiln_store::{Digest, MAX_METADATA_BLOB, Store, StoreError};
 
 use crate::error::{ImageError, Result, json};
 use crate::load::load;
@@ -38,7 +38,17 @@ pub fn import_image(dst: &Store, src: &Store, name: &str, as_name: &str) -> Resu
         blobs_copied: 0,
         bytes_copied: 0,
     };
-    copy(dst, src, &top, None, &mut report)?;
+    // The top blob is metadata: refuse a large one (say, a layer digest) before copying it.
+    let top_size = src.blob_size(&top)?;
+    if top_size > MAX_METADATA_BLOB {
+        return Err(StoreError::TooLarge {
+            digest: top,
+            size: top_size,
+            max: MAX_METADATA_BLOB,
+        }
+        .into());
+    }
+    copy(dst, src, &top, Some(top_size), &mut report)?;
     let top_bytes = dst.read_metadata(&top)?;
     let manifests: Vec<Digest> = match serde_json::from_slice::<ImageIndex>(&top_bytes) {
         Ok(index) => {
