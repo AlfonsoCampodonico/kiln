@@ -175,6 +175,22 @@ fn multiarch_produces_a_sorted_index() {
 }
 
 #[test]
+fn platform_aliases_for_one_manifest_convert_once() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let path = layout(src.path(), &[arm()], &[gz(&base(0o755))]);
+    let v8 = Platform::parse("linux/arm64/v8").unwrap();
+    let out = convert_local(&store, &path, &req(&[arm(), v8], "a"), &ConvertOptions::default()).unwrap();
+    assert_eq!(
+        out.media_type,
+        media::OCI_MANIFEST,
+        "not an index with the same image twice"
+    );
+    assert_eq!(out.images.len(), 1);
+}
+
+#[test]
 fn rejects_unsupported_platforms() {
     let src = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
