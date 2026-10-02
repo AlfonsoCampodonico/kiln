@@ -1,6 +1,7 @@
 //! The `kiln` CLI. Every string from an image is sanitised before printing (T8).
 #![forbid(unsafe_code)]
 
+mod bench;
 mod sanitize;
 
 use std::path::{Path, PathBuf};
@@ -97,6 +98,15 @@ enum Cmd {
     },
     /// Remove blobs and cache entries no tag reaches.
     Gc,
+    /// Measure convert performance on a local OCI layout (JSON on stdout).
+    Bench {
+        path: PathBuf,
+        #[command(flatten)]
+        args: ConvertArgs,
+        /// Size of the synthetic changed top layer (for tests).
+        #[arg(long, hide = true, default_value_t = bench::CHANGED_TOP_BYTES)]
+        changed_top_bytes: usize,
+    },
 }
 
 fn open_store(cli: &Cli) -> Result<Store> {
@@ -308,6 +318,14 @@ fn run(cli: Cli) -> Result<()> {
                 human_size(r.bytes_freed),
                 r.cache_entries_removed
             );
+        }
+        Cmd::Bench {
+            path,
+            args,
+            changed_top_bytes,
+        } => {
+            let report = bench::run(path, &args.platforms()?, &args.options(), *changed_top_bytes)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
     Ok(())
