@@ -66,11 +66,20 @@ impl Store {
         let mut report = GcReport::default();
         for kind in CacheKind::ALL {
             for (path, value) in self.cache_entries(kind)? {
-                let target = value.strip_prefix("erofs ").unwrap_or(&value).trim();
-                let dead = match Digest::parse(target) {
-                    Ok(d) => !live.contains(&d),
-                    // `parents [...]` entries name no blob; keep them.
-                    Err(_) => false,
+                let dead = if kind == CacheKind::Warnings {
+                    // Annotates the `Layers` entry of the same name, which ran just before.
+                    let layer = self
+                        .root
+                        .join(CacheKind::Layers.dir())
+                        .join(path.file_name().unwrap_or_default());
+                    !layer.exists()
+                } else {
+                    let target = value.strip_prefix("erofs ").unwrap_or(&value).trim();
+                    match Digest::parse(target) {
+                        Ok(d) => !live.contains(&d),
+                        // `parents [...]` entries name no blob; keep them.
+                        Err(_) => false,
+                    }
                 };
                 if dead {
                     fs::remove_file(path)?;
@@ -127,6 +136,36 @@ mod tests {
         assert!(s.cache_get(CacheKind::Layers, "k1@1").unwrap().is_none());
         assert!(s.cache_get(CacheKind::Layers, "k2@1").unwrap().is_some());
         assert!(s.cache_get(CacheKind::Layers, "k3@1").unwrap().is_some());
+    }
+
+    #[test]
+    fn warnings_entries_live_as_long_as_their_layer_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let live = s.put_bytes(b"live layer").unwrap();
+        let dead = s.put_bytes(b"dead layer").unwrap();
+        let manifest = serde_json::json!({"layers": [{"digest": live.to_string()}]});
+        let m = s.put_bytes(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        s.set_ref("app:1", &m).unwrap();
+        s.cache_put(CacheKind::Layers, "keep@1", &format!("erofs {live}"))
+            .unwrap();
+        s.cache_put(CacheKind::Warnings, "keep@1", r#"["w1"]"#).unwrap();
+        s.cache_put(CacheKind::Layers, "drop@1", &format!("erofs {dead}"))
+            .unwrap();
+        s.cache_put(CacheKind::Warnings, "drop@1", r#"["w2"]"#).unwrap();
+        s.cache_put(CacheKind::Warnings, "orphan@1", r#"["w3"]"#).unwrap();
+
+        let report = s.gc().unwrap();
+        assert_eq!(
+            s.cache_get(CacheKind::Warnings, "keep@1").unwrap().as_deref(),
+            Some(r#"["w1"]"#)
+        );
+        assert_eq!(s.cache_get(CacheKind::Warnings, "drop@1").unwrap(), None);
+        assert_eq!(s.cache_get(CacheKind::Warnings, "orphan@1").unwrap(), None);
+        assert_eq!(
+            report.cache_entries_removed, 3,
+            "drop's layer and warnings, and the orphan"
+        );
     }
 
     #[test]

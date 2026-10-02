@@ -15,18 +15,28 @@ pub enum CacheKind {
     LayersCtx,
     /// `<sha256 of ordered erofs digests>@<fmt>` → squashed erofs digest.
     Squash,
+    /// `<layer cache key>` → JSON list of the warnings converting that layer
+    /// produced, so cache hits report them too. Lives as long as its `Layers` entry.
+    Warnings,
 }
 
 impl CacheKind {
-    fn dir(self) -> &'static str {
+    pub(crate) fn dir(self) -> &'static str {
         match self {
             CacheKind::Layers => "cache/layers",
             CacheKind::LayersCtx => "cache/layers-ctx",
             CacheKind::Squash => "cache/squash",
+            CacheKind::Warnings => "cache/warnings",
         }
     }
 
-    pub(crate) const ALL: [CacheKind; 3] = [CacheKind::Layers, CacheKind::LayersCtx, CacheKind::Squash];
+    /// `Warnings` comes last: GC decides its entries after the `Layers` entries.
+    pub(crate) const ALL: [CacheKind; 4] = [
+        CacheKind::Layers,
+        CacheKind::LayersCtx,
+        CacheKind::Squash,
+        CacheKind::Warnings,
+    ];
 }
 
 fn check_key(key: &str) -> Result<()> {
