@@ -385,7 +385,10 @@ pub fn convert_image(
                     Some(d) => (d, true, true, cached_warnings(store, &lkey)?),
                     None => {
                         let p = stream_layer(store, img, i, opts, &budget)?;
-                        let (d, inherits, w) = finish_layer(store, &lkey, p, &lowers, Some(inherited))?;
+                        // Reuse the resolution only if the cached path list still matches
+                        // the layer (a stale entry must not change the output).
+                        let reuse = matches!(&p, Streamed::Pending(q) if q.implicit == paths);
+                        let (d, inherits, w) = finish_layer(store, &lkey, p, &lowers, reuse.then_some(inherited))?;
                         (d, false, inherits, w)
                     }
                 }

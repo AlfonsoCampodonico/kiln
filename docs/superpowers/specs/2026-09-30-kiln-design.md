@@ -214,6 +214,7 @@ $KILN_HOME/
   cache/layers/<src-digest>@<diff-id-hex>@<fmt>            # "erofs <digest>"  or  "parents <json list of implicit paths>"
   cache/layers-ctx/<src-digest>@<diff-id-hex>@<fmt>@<ctx>  # erofs digest for a layer with inherited parents (§6.3)
   cache/squash/<sha256(ordered erofs digests)>@<fmt>
+  cache/warnings/<layer cache key>             # JSON list of the layer's conversion warnings, removed with its cache/layers entry
   tmp/                                        # staging, same filesystem as blobs/
 ```
 
