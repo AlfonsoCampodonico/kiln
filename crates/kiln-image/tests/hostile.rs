@@ -130,3 +130,20 @@ fn a_failing_layer_leaves_no_entry_for_its_good_siblings_either() {
     // The good layer converts in parallel, but nothing is committed before phase B.
     rejects(&[good, bad], ConvertOptions::default());
 }
+
+#[test]
+fn warm_store_still_rejects_a_wrong_diff_id() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let (s1, s2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let good = gz(&base(0o755));
+    let mut wrong = good.clone();
+    wrong.diff_id = Digest::of(b"something else");
+    let p1 = layout(s1.path(), &[arm()], &[good]);
+    convert_local(&store, &p1, &req(&[arm()], "good"), &ConvertOptions::default()).unwrap();
+    // Same layer blob, now cached, but the second config lists a different diff_id.
+    let p2 = layout(s2.path(), &[arm()], &[wrong]);
+    let err = convert_local(&store, &p2, &req(&[arm()], "bad"), &ConvertOptions::default()).unwrap_err();
+    assert!(matches!(err, ImageError::DiffIdMismatch { layer: 0, .. }), "{err}");
+    assert_eq!(store.get_ref("bad").unwrap(), None);
+}
