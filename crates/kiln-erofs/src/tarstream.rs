@@ -239,6 +239,15 @@ fn trim_nul(mut v: Vec<u8>) -> Vec<u8> {
     v
 }
 
+/// A numeric header field at `range`. Go's archive/tar (containerd) reads a field of
+/// only NULs and spaces as 0, where the tar crate fails; match Go.
+fn numeric<T: Default>(header: &Header, range: std::ops::Range<usize>, parsed: io::Result<T>) -> Result<T> {
+    if header.as_bytes()[range].iter().all(|&b| b == 0 || b == b' ') {
+        return Ok(T::default());
+    }
+    parsed.map_err(tar_err)
+}
+
 fn to_u32(v: u64, what: &'static str, path: &[u8]) -> Result<u32> {
     u32::try_from(v).map_err(|_| Error::UnsupportedEntry {
         path: lossy(path),
@@ -284,25 +293,32 @@ fn build_entry(
     {
         return Err(unsupported("header-only entry with nonzero size"));
     }
-    let uid = to_u32(pax.uid.map_or_else(|| header.uid(), Ok).map_err(tar_err)?, "uid", &path)?;
-    let gid = to_u32(pax.gid.map_or_else(|| header.gid(), Ok).map_err(tar_err)?, "gid", &path)?;
+    let uid = match pax.uid {
+        Some(v) => v,
+        None => numeric(header, 108..116, header.uid())?,
+    };
+    let gid = match pax.gid {
+        Some(v) => v,
+        None => numeric(header, 116..124, header.gid())?,
+    };
+    let (uid, gid) = (to_u32(uid, "uid", &path)?, to_u32(gid, "gid", &path)?);
     let mtime = match pax.mtime {
         Some(t) => t,
         None => Timestamp {
-            sec: header.mtime().map_err(tar_err)? as i64,
+            sec: numeric(header, 136..148, header.mtime())? as i64,
             nsec: 0,
         },
     };
     let meta = Meta {
-        mode: header.mode().map_err(tar_err)? & 0o7777,
+        mode: numeric(header, 100..108, header.mode())? & 0o7777,
         uid,
         gid,
         mtime,
     };
     let xattrs = convert_xattrs(pax, &path, limits, warnings, suppressed_count)?;
     let device = || -> Result<(u32, u32)> {
-        let major = header.device_major().map_err(tar_err)?.unwrap_or(0);
-        let minor = header.device_minor().map_err(tar_err)?.unwrap_or(0);
+        let major = numeric(header, 329..337, header.device_major())?.unwrap_or(0);
+        let minor = numeric(header, 337..345, header.device_minor())?.unwrap_or(0);
         if major > 0xfff || minor > 0xf_ffff {
             return Err(unsupported("device number out of range"));
         }
@@ -429,6 +445,37 @@ mod tests {
             Ok(())
         })?;
         Ok((out, warnings, n))
+    }
+
+    #[test]
+    fn empty_numeric_fields_read_as_zero_like_go() {
+        let mut h = tar::Header::new_ustar();
+        h.set_path("dev/x").unwrap();
+        h.set_size(0);
+        h.set_entry_type(tar::EntryType::Char);
+        for r in [100..108, 108..116, 116..124, 136..148, 329..337, 337..345] {
+            h.as_mut_bytes()[r].fill(0);
+        }
+        h.as_mut_bytes()[108..116].copy_from_slice(b"        ");
+        h.set_cksum();
+        let mut tar = h.as_bytes().to_vec();
+        tar.resize(tar.len() + 1024, 0);
+        let (es, _, _) = collect(&tar, &Limits::default()).unwrap();
+        let m = &es[0].0.meta;
+        assert_eq!((m.mode, m.uid, m.gid, m.mtime.sec), (0, 0, 0, 0));
+        assert!(matches!(es[0].0.kind, EntryKind::CharDev { major: 0, minor: 0 }));
+    }
+
+    #[test]
+    fn malformed_numeric_fields_are_still_rejected() {
+        let mut h = tar::Header::new_ustar();
+        h.set_path("f").unwrap();
+        h.set_size(0);
+        h.as_mut_bytes()[108..116].copy_from_slice(b"12x4567\0");
+        h.set_cksum();
+        let mut tar = h.as_bytes().to_vec();
+        tar.resize(tar.len() + 1024, 0);
+        assert!(matches!(collect(&tar, &Limits::default()), Err(Error::MalformedTar(_))));
     }
 
     #[test]
