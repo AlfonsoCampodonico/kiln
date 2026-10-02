@@ -176,8 +176,9 @@ kiln is checked against containerd's overlayfs snapshotter (kiln-erofs Task 14).
 3. containerd follows symlinks in lower layers while resolving parents. kiln does not.
 4. A tar may carry `trusted.overlay.*` xattrs in PAX records. containerd writes them to disk, where they can forge whiteouts, opaque directories or redirects. kiln drops them with a warning; overlay markers come only from `.wh.` entries.
 5. containerd ignores everything after a tar's end-of-archive marker. kiln requires the decompressed remainder to be zero padding and rejects the layer otherwise, so the bytes covered by `diff_id` mean one thing.
+6. A tar header whose size field holds only NULs and spaces: Go's `archive/tar` reads it as 0; kiln rejects the layer (the `tar` crate parses sizes itself).
 
-Header numeric fields (mode, uid, gid, mtime, device numbers) that hold only NULs and spaces read as 0, as in Go's `archive/tar`.
+Other header numeric fields (mode, uid, gid, mtime, device numbers) that hold only NULs and spaces read as 0, as in Go's `archive/tar`.
 
 ### Determinism
 

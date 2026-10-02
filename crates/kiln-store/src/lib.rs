@@ -81,10 +81,15 @@ impl Store {
 
     /// `$KILN_HOME`, else `~/.local/share/kiln`.
     pub fn default_root() -> Result<PathBuf> {
-        if let Some(home) = std::env::var_os("KILN_HOME") {
-            return Ok(PathBuf::from(home));
+        Self::root_from(std::env::var_os("KILN_HOME"), std::env::var_os("HOME"))
+    }
+
+    /// An empty `KILN_HOME` counts as unset.
+    fn root_from(kiln_home: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> Result<PathBuf> {
+        if let Some(h) = kiln_home.filter(|h| !h.is_empty()) {
+            return Ok(PathBuf::from(h));
         }
-        let home = std::env::var_os("HOME").ok_or_else(|| StoreError::Invalid {
+        let home = home.ok_or_else(|| StoreError::Invalid {
             what: "environment",
             value: "neither KILN_HOME nor HOME is set".into(),
         })?;
@@ -259,6 +264,21 @@ pub(crate) fn write_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_kiln_home_counts_as_unset() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(Store::root_from(os("/k"), os("/h")).unwrap(), PathBuf::from("/k"));
+        assert_eq!(
+            Store::root_from(os(""), os("/h")).unwrap(),
+            PathBuf::from("/h/.local/share/kiln")
+        );
+        assert_eq!(
+            Store::root_from(None, os("/h")).unwrap(),
+            PathBuf::from("/h/.local/share/kiln")
+        );
+        assert!(Store::root_from(os(""), None).is_err());
+    }
 
     #[test]
     fn open_read_only_creates_nothing() {
