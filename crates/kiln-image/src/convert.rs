@@ -80,12 +80,14 @@ enum Plan {
     Convert,
 }
 
-fn layer_key(src: &Digest) -> String {
-    format!("{src}@{FORMAT_VERSION}")
+/// Keyed by the blob and the verified decompressed content (`diff_id`), so a hit
+/// implies the diff_id check already passed and compression cannot alias entries.
+fn layer_key(src: &Digest, diff_id: &Digest) -> String {
+    format!("{src}@{}@{FORMAT_VERSION}", diff_id.hex())
 }
 
-fn plan_layer(store: &Store, desc: &Descriptor) -> Result<Plan> {
-    let Some(entry) = store.cache_get(CacheKind::Layers, &layer_key(&desc.digest))? else {
+fn plan_layer(store: &Store, desc: &Descriptor, diff_id: &Digest) -> Result<Plan> {
+    let Some(entry) = store.cache_get(CacheKind::Layers, &layer_key(&desc.digest, diff_id))? else {
         return Ok(Plan::Convert);
     };
     if let Some(d) = entry.strip_prefix("erofs ").and_then(|d| Digest::parse(d.trim()).ok()) {
@@ -223,7 +225,7 @@ fn stream_parallel(
 /// Finalises `p` against `lowers`, commits it, then writes its cache entries.
 fn finish_layer(
     store: &Store,
-    src: &Digest,
+    key: &str,
     p: Pending,
     lowers: &mut [Image<File>],
 ) -> Result<(Digest, bool, Vec<String>)> {
@@ -234,13 +236,12 @@ fn finish_layer(
     };
     let (_out, summary) = p.writer.finish(&inherited)?;
     let d = store.commit(p.tmp)?;
-    let key = layer_key(src);
     if p.implicit.is_empty() {
-        store.cache_put(CacheKind::Layers, &key, &format!("erofs {d}"))?;
+        store.cache_put(CacheKind::Layers, key, &format!("erofs {d}"))?;
     } else {
         let ctx = ctx_hash(&p.implicit, &inherited);
         store.cache_put(CacheKind::LayersCtx, &format!("{key}@{ctx}"), &d.to_string())?;
-        store.cache_put(CacheKind::Layers, &key, &parents_entry(&p.implicit))?;
+        store.cache_put(CacheKind::Layers, key, &parents_entry(&p.implicit))?;
     }
     let mut warnings = p.warnings;
     warnings.extend(summary.warnings);
@@ -257,6 +258,7 @@ fn squash_bottom(store: &Store, layers: Vec<LayerReport>, k: usize) -> Result<Ve
     let (bottom, rest) = layers.split_at(k);
     let key = squash_key(bottom);
     let sources: Vec<Digest> = bottom.iter().flat_map(|l| l.sources.clone()).collect();
+    let warnings: Vec<String> = bottom.iter().flat_map(|l| l.warnings.iter().cloned()).collect();
     let (erofs, cached) = match store.cache_get_blob(CacheKind::Squash, &key)? {
         Some(d) => (d, true),
         None => {
@@ -278,7 +280,7 @@ fn squash_bottom(store: &Store, layers: Vec<LayerReport>, k: usize) -> Result<Ve
         size,
         cached,
         inherits: false,
-        warnings: Vec::new(),
+        warnings,
     }];
     out.extend_from_slice(rest);
     Ok(out)
@@ -299,7 +301,8 @@ pub fn convert_image(
     let layers = &img.manifest.layers;
     let plans = layers
         .iter()
-        .map(|d| plan_layer(store, d))
+        .enumerate()
+        .map(|(i, d)| plan_layer(store, d, &img.config.rootfs.diff_ids[i]))
         .collect::<Result<Vec<_>>>()?;
     let todo: Vec<usize> = plans
         .iter()
@@ -315,23 +318,24 @@ pub fn convert_image(
     let mut lowers: Vec<Image<File>> = Vec::new();
     for (i, plan) in plans.into_iter().enumerate() {
         let src = &layers[i].digest;
+        let lkey = layer_key(src, &img.config.rootfs.diff_ids[i]);
         let (erofs, cached, inherits, warnings) = match plan {
             Plan::Done(d) => (d, true, false, Vec::new()),
             Plan::Parents(paths) => {
                 let inherited = kiln_erofs::resolve_inherited(&mut lowers, &paths)?;
-                let key = format!("{}@{}", layer_key(src), ctx_hash(&paths, &inherited));
+                let key = format!("{lkey}@{}", ctx_hash(&paths, &inherited));
                 match store.cache_get_blob(CacheKind::LayersCtx, &key)? {
                     Some(d) => (d, true, true, Vec::new()),
                     None => {
                         let p = stream_layer(store, img, i, opts, &budget)?;
-                        let (d, inherits, w) = finish_layer(store, src, p, &mut lowers)?;
+                        let (d, inherits, w) = finish_layer(store, &lkey, p, &mut lowers)?;
                         (d, false, inherits, w)
                     }
                 }
             }
             Plan::Convert => {
                 let p = pending.remove(&i).expect("streamed in phase A");
-                let (d, inherits, w) = finish_layer(store, src, p, &mut lowers)?;
+                let (d, inherits, w) = finish_layer(store, &lkey, p, &mut lowers)?;
                 (d, false, inherits, w)
             }
         };

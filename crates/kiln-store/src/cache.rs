@@ -9,9 +9,9 @@ use crate::{Digest, Store, write_atomic};
 /// Which cache an entry lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheKind {
-    /// `<src-digest>@<fmt>` → `erofs <digest>` or `parents <json>`.
+    /// `<src-digest>@<diff_id hex>@<fmt>` → `erofs <digest>` or `parents <json>`.
     Layers,
-    /// `<src-digest>@<fmt>@<ctx>` → erofs digest of a layer with inherited parents.
+    /// `<src-digest>@<diff_id hex>@<fmt>@<ctx>` → erofs digest of a layer with inherited parents.
     LayersCtx,
     /// `<sha256 of ordered erofs digests>@<fmt>` → squashed erofs digest.
     Squash,
@@ -31,7 +31,7 @@ impl CacheKind {
 
 fn check_key(key: &str) -> Result<()> {
     let ok =
-        !key.is_empty() && key.len() <= 200 && key.bytes().all(|b| b.is_ascii_alphanumeric() || b"@:._-".contains(&b));
+        !key.is_empty() && key.len() <= 255 && key.bytes().all(|b| b.is_ascii_alphanumeric() || b"@:._-".contains(&b));
     if ok {
         Ok(())
     } else {
