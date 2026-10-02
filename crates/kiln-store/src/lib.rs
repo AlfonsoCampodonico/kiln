@@ -197,13 +197,28 @@ impl Store {
     /// Streams `r` to its end into the store, committing only if its content hashes
     /// to `expected` (and has `expected_size` bytes, when given). Spec §6.1 (T1).
     pub fn put_verified(&self, r: &mut dyn Read, expected: &Digest, expected_size: Option<u64>) -> Result<u64> {
+        let size_mismatch = |want: u64, actual: u64| StoreError::SizeMismatch {
+            digest: expected.clone(),
+            expected: want,
+            actual,
+        };
         if self.has_blob(expected) {
-            return self.blob_size(expected);
+            let actual = self.blob_size(expected)?;
+            return match expected_size {
+                Some(want) if want != actual => Err(size_mismatch(want, actual)),
+                _ => Ok(actual),
+            };
         }
         let mut tmp = self.tmp_blob()?;
-        let mut hashing = HashingReader::new(r);
+        // Read at most one byte past the expected size, so an oversized or endless
+        // source stops early instead of filling `tmp/`.
+        let limit = expected_size.map_or(u64::MAX, |want| want.saturating_add(1));
+        let mut hashing = HashingReader::new((&mut *r).take(limit));
         io::copy(&mut hashing, tmp.file_mut())?;
         let (actual, size) = hashing.finish_to_eof()?;
+        if let Some(want) = expected_size.filter(|&want| size > want) {
+            return Err(size_mismatch(want, size));
+        }
         if &actual != expected {
             return Err(StoreError::DigestMismatch {
                 expected: expected.clone(),
@@ -211,11 +226,7 @@ impl Store {
             });
         }
         if let Some(want) = expected_size.filter(|&s| s != size) {
-            return Err(StoreError::SizeMismatch {
-                digest: expected.clone(),
-                expected: want,
-                actual: size,
-            });
+            return Err(size_mismatch(want, size));
         }
         let committed = self.commit(tmp)?;
         debug_assert_eq!(&committed, expected);
@@ -297,6 +308,39 @@ mod tests {
         );
         assert_eq!(s.put_verified(&mut &b"good"[..], &want, Some(4)).unwrap(), 4);
         assert!(s.has_blob(&want));
+    }
+
+    #[test]
+    fn put_verified_checks_the_size_of_an_existing_blob() {
+        let (_d, s) = store();
+        let d = s.put_bytes(b"good").unwrap();
+        assert_eq!(s.put_verified(&mut io::empty(), &d, Some(4)).unwrap(), 4);
+        assert!(matches!(
+            s.put_verified(&mut io::empty(), &d, Some(99)),
+            Err(StoreError::SizeMismatch {
+                expected: 99,
+                actual: 4,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn put_verified_stops_reading_an_oversized_source() {
+        let (_d, s) = store();
+        let want = Digest::of(b"good");
+        let mut endless = io::repeat(0).take(10 * 1024 * 1024);
+        assert!(matches!(
+            s.put_verified(&mut endless, &want, Some(100)),
+            Err(StoreError::SizeMismatch {
+                expected: 100,
+                actual: 101,
+                ..
+            })
+        ));
+        assert_eq!(endless.limit(), 10 * 1024 * 1024 - 101, "read one byte past the limit");
+        assert!(!s.has_blob(&want));
+        assert_eq!(fs::read_dir(s.tmp_dir()).unwrap().count(), 0);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use kiln_store::{Digest, MAX_METADATA_BLOB, Store};
+use kiln_store::{Digest, MAX_METADATA_BLOB, Store, StoreError};
 use serde::Deserialize;
 
 use crate::error::{OciError, Result, json};
@@ -75,7 +75,18 @@ pub fn resolve_local(
 
 /// Copies a blob into the store, verifying digest and size.
 fn ingest(store: &Store, src: &dyn BlobSource, d: &Descriptor) -> Result<()> {
-    if !store.has_blob(&d.digest) {
+    if store.has_blob(&d.digest) {
+        // Already stored: the descriptor's size must still agree with it.
+        let actual = store.blob_size(&d.digest)?;
+        if actual != d.size {
+            return Err(StoreError::SizeMismatch {
+                digest: d.digest.clone(),
+                expected: d.size,
+                actual,
+            }
+            .into());
+        }
+    } else {
         let mut r = src.open_blob(&d.digest)?;
         store.put_verified(&mut r, &d.digest, Some(d.size))?;
     }
@@ -84,10 +95,12 @@ fn ingest(store: &Store, src: &dyn BlobSource, d: &Descriptor) -> Result<()> {
 
 fn ingest_metadata(store: &Store, src: &dyn BlobSource, d: &Descriptor) -> Result<Vec<u8>> {
     if d.size > MAX_METADATA_BLOB {
-        return Err(OciError::BadArchive(format!(
-            "{} is {} bytes, more than the metadata limit",
-            d.digest, d.size
-        )));
+        return Err(StoreError::TooLarge {
+            digest: d.digest.clone(),
+            size: d.size,
+            max: MAX_METADATA_BLOB,
+        }
+        .into());
     }
     ingest(store, src, d)?;
     Ok(store.read_metadata(&d.digest)?)

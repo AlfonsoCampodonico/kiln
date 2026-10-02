@@ -27,6 +27,8 @@ pub enum OciError {
     DiffIdCount { layers: usize, diff_ids: usize },
     #[error("invalid platform {0:?} (expected os/arch[/variant])")]
     BadPlatform(String),
+    #[error("{path} is larger than the {max}-byte metadata limit")]
+    MetadataTooLarge { path: String, max: u64 },
     #[error("malformed archive: {0}")]
     BadArchive(String),
 }
