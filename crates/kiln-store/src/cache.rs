@@ -40,8 +40,11 @@ impl CacheKind {
 }
 
 fn check_key(key: &str) -> Result<()> {
-    let ok =
-        !key.is_empty() && key.len() <= 255 && key.bytes().all(|b| b.is_ascii_alphanumeric() || b"@:._-".contains(&b));
+    let ok = !key.is_empty()
+        && key.len() <= 255
+        && key != "."
+        && key != ".."
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b"@:._-".contains(&b));
     if ok {
         Ok(())
     } else {
@@ -77,7 +80,10 @@ impl Store {
         let Some(v) = self.cache_get(kind, key)? else {
             return Ok(None);
         };
-        let d = Digest::parse(v.trim())?;
+        // A corrupt entry is a miss: the conversion is redone and the entry rewritten.
+        let Ok(d) = Digest::parse(v.trim()) else {
+            return Ok(None);
+        };
         Ok(self.has_blob(&d).then_some(d))
     }
 
@@ -126,8 +132,16 @@ mod tests {
     fn keys_cannot_escape_the_cache_dir() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
-        for bad in ["../refs.json", "a/b", "", "x y"] {
+        for bad in ["../refs.json", "a/b", "", "x y", ".", ".."] {
             assert!(s.cache_put(CacheKind::Layers, bad, "v").is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_corrupt_digest_entry_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        s.cache_put(CacheKind::Squash, "k@1", "not a digest").unwrap();
+        assert_eq!(s.cache_get_blob(CacheKind::Squash, "k@1").unwrap(), None);
     }
 }
