@@ -7,6 +7,7 @@
 
 ### Revision history
 
+- **rev 2.2 (2026-10-02):** §5.2 and §6.2 layer cache keys include the verified `diff_id`, found by the M1b-1 task review: a key on the compressed digest alone let a warm store skip the `diff_id` check.
 - **rev 1 (2026-09-30):** initial design.
 - **rev 2.1 (2026-10-01):** §6.3, §7.3 and §7.4 corrected to match containerd's overlay snapshotter, as found by the oracle while validating the M1a plan:
   - symlink modes are always 0777;
@@ -210,8 +211,8 @@ $KILN_HOME/
   lock                                        # flock: shared for convert/build/pull/import/run-setup, exclusive for gc
   refs.json                                   # tag → digest index (single file, atomic replace; avoids case-insensitive FS collisions)
   blobs/sha256/<hex>
-  cache/layers/<src-digest>@<fmt>             # "erofs <digest>"  or  "parents <json list of implicit paths>"
-  cache/layers-ctx/<src-digest>@<fmt>@<ctx>   # erofs digest for a layer with inherited parents (§6.3)
+  cache/layers/<src-digest>@<diff-id-hex>@<fmt>            # "erofs <digest>"  or  "parents <json list of implicit paths>"
+  cache/layers-ctx/<src-digest>@<diff-id-hex>@<fmt>@<ctx>  # erofs digest for a layer with inherited parents (§6.3)
   cache/squash/<sha256(ordered erofs digests)>@<fmt>
   tmp/                                        # staging, same filesystem as blobs/
 ```
@@ -260,7 +261,7 @@ $KILN_HOME/
 
 ### 6.2 Convert layers
 
-- **Cache key:** compressed layer digest plus `erofsFormatVersion`.
+- **Cache key:** compressed layer digest, the verified `diff_id`, and `erofsFormatVersion`.
   - Same content with different compression gives a different key but the same erofs output. That costs a miss, never a wrong result.
 - **`erofs <digest>` entry:** the layer is independent of the layers below it. Done.
 - **`parents [paths]` entry:** the layer needs inherited attributes. Resolve them per §6.3 and look up `cache/layers-ctx/`.
@@ -281,7 +282,7 @@ A layer tar may contain `a/b/file` with no `a/` or `a/b/` header. overlayfs show
    - To finalise, resolve each implicit path in the **merged view of the lower layers** (layers `0..i-1`, applying their whiteouts and opaque markers) using the `kiln-erofs` reader.
    - If the path resolves to a directory, inherit its mode, uid, gid, mtime and xattrs. Otherwise, or if it is absent, use the defaults.
    - The context hash `ctx` is SHA-256 of the canonical encoding of the resolved `(path, attrs)` list.
-   - The erofs output is cached in `cache/layers-ctx/<src>@<fmt>@<ctx>`, and the layer is annotated with `dev.kiln.inherits`.
+   - The erofs output is cached in `cache/layers-ctx/<src>@<diff-id>@<fmt>@<ctx>`, and the layer is annotated with `dev.kiln.inherits`.
 4. **Defaults** for invented directories: mode `0755`, uid and gid `0`, mtime equal to the layer's base time (§7.3), no xattrs.
 5. **Described later:** a directory that was created implicitly and then described by its own header later in the same layer keeps that header's mode, uid, gid and mtime. The inherited xattrs lie under its own, as in containerd, so it is reported with the implicit directories too.
 
