@@ -274,3 +274,16 @@ fn repeated_platform_flags_convert_once() {
     assert_eq!(v["mediaType"], "application/vnd.oci.image.manifest.v1+json");
     assert_eq!(v["images"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn bench_refuses_more_than_one_platform() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let path = layout(&src.path().join("app"), "php", simple());
+    kiln(home.path())
+        .args(["bench", "--platform", "linux/arm64", "--platform", "linux/amd64"])
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("at most one --platform"));
+}

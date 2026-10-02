@@ -17,7 +17,7 @@ docker save --platform "$platform" "$image" -o "$work/image.tar"
 mkdir "$work/layers"
 "$kiln" --store "$work/store" inspect --json cmp:1 \
   | python3 -c 'import json,sys; [print(l["digest"].split(":")[1]) for l in json.load(sys.stdin)["images"][0]["manifest"]["layers"]]' \
-  | nl -v0 -nrz -w2 | while read -r i hex; do cp "$work/store/blobs/sha256/$hex" "$work/layers/$i.erofs"; done
+  | nl -v0 -nrz -w3 | while read -r i hex; do cp "$work/store/blobs/sha256/$hex" "$work/layers/$i.erofs"; done
 cid=$(docker create --platform "$platform" "$image")
 docker export "$cid" -o "$work/ref.tar"
 docker rm "$cid" >/dev/null

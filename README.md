@@ -9,7 +9,8 @@ Status: milestone M1b. `kiln convert` works on local inputs. Registry pull and p
 ```bash
 cargo install --path crates/kiln
 
-# A local OCI layout or `docker save` archive (Docker 25+ writes OCI-in-tar).
+# A local OCI layout or `docker save` archive (Docker 25+ writes OCI-in-tar;
+# drop --platform if your Docker's `save` doesn't have it).
 docker save --platform linux/arm64 php:8.4-cli -o php.tar
 kiln convert --platform linux/arm64 --tag php:8.4-cli php.tar
 

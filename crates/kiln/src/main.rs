@@ -309,6 +309,8 @@ fn run(cli: Cli) -> Result<()> {
             }
             println!("{:<32} {:<19} {:<24} SIZE", "NAME", "DIGEST", "PLATFORMS");
             for (n, d, p, s) in rows {
+                // Names are validated when written, but refs.json may have been edited by hand.
+                let n = clean_line(&n);
                 println!("{n:<32} {:<19} {p:<24} {}", &d.to_string()[..19], human_size(s));
             }
         }
