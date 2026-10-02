@@ -72,6 +72,8 @@ impl Store {
         Ok(changed)
     }
 
+    /// Tags `d`. Callers hold the store's shared lock, so GC cannot remove `d`'s
+    /// blobs between their commit and this tag.
     pub fn set_ref(&self, name: &str, d: &Digest) -> Result<()> {
         check_ref_name(name)?;
         self.update_refs(|r| {

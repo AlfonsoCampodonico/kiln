@@ -152,7 +152,7 @@ fn resolve_layout(
             }
         },
     };
-    let image_name = names(top).into_iter().next();
+    let image_name = ref_name.map(str::to_string).or_else(|| names(top).into_iter().next());
     let bytes = ingest_metadata(store, src, top)?;
     if media::is_index(&top.media_type) {
         let inner: ImageIndex = json("image index", &bytes)?;
@@ -263,6 +263,12 @@ fn resolve_legacy(
             })?,
         None => match entries.as_slice() {
             [one] => one,
+            [] => {
+                return Err(OciError::NotAnImage(format!(
+                    "{} (its manifest.json lists no images)",
+                    src.describe()
+                )));
+            }
             many => {
                 return Err(OciError::AmbiguousRef {
                     available: many.iter().flat_map(tags).collect(),
@@ -277,6 +283,14 @@ fn resolve_legacy(
         return Err(OciError::DiffIdCount {
             layers: entry.layers.len(),
             diff_ids: config.rootfs.diff_ids.len(),
+        });
+    }
+    // Check the platform before copying any layer into the store.
+    let platform = config.platform();
+    if let Some(want) = platforms.iter().find(|want| !want.matches(&platform)) {
+        return Err(OciError::MissingPlatform {
+            wanted: want.to_string(),
+            available: vec![platform.to_string()],
         });
     }
     let mut layers = Vec::new();
@@ -300,24 +314,16 @@ fn resolve_legacy(
     };
     let manifest_bytes = canonical_json(&manifest);
     let manifest_digest = store.put_bytes(&manifest_bytes)?;
-    let platform = config.platform();
-    platforms
+    let ref_name = ref_name.map(str::to_string).or_else(|| tags(entry).into_iter().next());
+    Ok(platforms
         .iter()
-        .map(|want| {
-            if !want.matches(&platform) {
-                return Err(OciError::MissingPlatform {
-                    wanted: want.to_string(),
-                    available: vec![platform.to_string()],
-                });
-            }
-            Ok(ResolvedImage {
-                platform: platform.clone(),
-                manifest_digest: manifest_digest.clone(),
-                manifest: manifest.clone(),
-                config_digest: config_digest.clone(),
-                config: config.clone(),
-                ref_name: tags(entry).into_iter().next(),
-            })
+        .map(|_| ResolvedImage {
+            platform: platform.clone(),
+            manifest_digest: manifest_digest.clone(),
+            manifest: manifest.clone(),
+            config_digest: config_digest.clone(),
+            config: config.clone(),
+            ref_name: ref_name.clone(),
         })
-        .collect()
+        .collect())
 }

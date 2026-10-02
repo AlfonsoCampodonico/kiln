@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use kiln_store::Digest;
 
-use crate::media::{DOCKER_MANIFEST, OCI_CONFIG, OCI_INDEX, OCI_MANIFEST};
+use crate::media::{OCI_CONFIG, OCI_INDEX, OCI_MANIFEST};
 use crate::platform::Platform;
 use crate::resolve::REF_NAME;
 use crate::types::{ContainerConfig, Descriptor, ImageConfig, ImageIndex, ImageManifest, RootFs, canonical_json};
@@ -160,5 +160,4 @@ pub fn docker_legacy_archive(
     let manifest = serde_json::json!([{ "Config": cfg_name, "RepoTags": [tag], "Layers": layers }]);
     add("manifest.json", &serde_json::to_vec(&manifest).unwrap());
     fs::write(path, b.into_inner().unwrap()).unwrap();
-    let _ = DOCKER_MANIFEST;
 }

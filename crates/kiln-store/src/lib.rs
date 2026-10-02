@@ -243,7 +243,12 @@ impl Store {
     pub fn list_blobs(&self) -> Result<Vec<Digest>> {
         let mut out = Vec::new();
         for entry in fs::read_dir(self.root.join("blobs/sha256"))? {
-            let name = entry?.file_name();
+            let entry = entry?;
+            // Same rule as `has_blob`: only regular files are blobs.
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
             if let Some(d) = name.to_str().and_then(|n| Digest::parse(&format!("sha256:{n}")).ok()) {
                 out.push(d);
             }
@@ -279,6 +284,17 @@ mod tests {
             PathBuf::from("/h/.local/share/kiln")
         );
         assert!(Store::root_from(os(""), None).is_err());
+    }
+
+    #[test]
+    fn list_blobs_skips_non_regular_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let d = s.put_bytes(b"x").unwrap();
+        fs::create_dir(s.blob_path(&Digest::of(b"dir"))).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(s.blob_path(&d), s.blob_path(&Digest::of(b"link"))).unwrap();
+        assert_eq!(s.list_blobs().unwrap(), vec![d]);
     }
 
     #[test]

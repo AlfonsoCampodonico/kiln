@@ -197,8 +197,6 @@ fn diff_id_count_must_match_layers() {
 fn legacy_docker_archive_is_resolved_by_hashing_contents() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("img.tar");
-    let mut gzl = GzEncoder::new(Vec::new(), Compression::default());
-    gzl.write_all(&layer_tar("b")).unwrap();
     docker_legacy_archive(&path, &arm(), &[layer_tar("a"), layer_tar("b")], cfg(), "app:latest");
     let store = Store::open(tmp.path().join("store")).unwrap();
     let imgs = resolve_local(
@@ -213,11 +211,14 @@ fn legacy_docker_archive_is_resolved_by_hashing_contents() {
     assert_eq!(img.manifest.layers[0].digest, Digest::of(&layer_tar("a")));
     assert_eq!(img.manifest.layers[0].media_type, media::OCI_LAYER_TAR);
     assert!(store.has_blob(&img.manifest_digest));
-    // Wrong platform is reported.
+    assert_eq!(img.ref_name.as_deref(), Some("app:latest"), "the requested name");
+    // Wrong platform is reported before any layer is copied in.
+    let fresh = Store::open(tmp.path().join("fresh")).unwrap();
     assert!(matches!(
-        resolve_local(&store, &LocalSource::Archive(path), None, &[amd()]),
+        resolve_local(&fresh, &LocalSource::Archive(path), None, &[amd()]),
         Err(OciError::MissingPlatform { .. })
     ));
+    assert!(!fresh.has_blob(&Digest::of(&layer_tar("a"))));
 }
 
 #[test]
