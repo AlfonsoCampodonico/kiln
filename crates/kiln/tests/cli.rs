@@ -180,3 +180,21 @@ fn errors_print_each_cause_once() {
         "kiln: error: no image named \"nope:1\"\n"
     );
 }
+
+#[test]
+fn bench_emits_json() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let path = layout(&src.path().join("app"), "php", simple());
+    let out = kiln(home.path())
+        .args(["bench", "--platform", "linux/arm64", "--changed-top-bytes", "100000"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["layers"], 1);
+    for k in ["cold_ms", "warm_ms", "changed_top_ms"] {
+        assert!(v[k].is_u64(), "{k}");
+    }
+}
