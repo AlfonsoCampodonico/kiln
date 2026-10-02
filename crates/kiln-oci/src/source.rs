@@ -130,7 +130,11 @@ impl TarArchive {
         let mut regular: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         let mut links: Vec<(String, String)> = Vec::new();
         let mut ar = tar::Archive::new(f);
-        for entry in ar.entries().map_err(|e| OciError::BadArchive(e.to_string()))? {
+        // Seek past entry data instead of reading it: `docker save` files are large.
+        for entry in ar
+            .entries_with_seek()
+            .map_err(|e| OciError::BadArchive(e.to_string()))?
+        {
             let e = entry.map_err(|e| OciError::BadArchive(e.to_string()))?;
             let raw = String::from_utf8_lossy(&e.path_bytes()).into_owned();
             if raw.split('/').any(|c| c == "..") {

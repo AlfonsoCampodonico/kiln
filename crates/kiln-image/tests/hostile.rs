@@ -49,6 +49,44 @@ fn zero_padding_after_the_tar_end_is_fine() {
 }
 
 #[test]
+fn zstd_decompression_bomb() {
+    let tar = TarBuilder::new()
+        .file("zeros", &vec![0u8; 8 << 20], &Opts::default())
+        .finish();
+    let err = rejects(&[zst(&tar)], ConvertOptions::default());
+    assert!(
+        matches!(
+            err,
+            ImageError::LimitExceeded {
+                what: "expansion ratio",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn uncompressed_layer_over_the_per_layer_limit() {
+    let tar = TarBuilder::new()
+        .file("data", &vec![7u8; 64 << 10], &Opts::default())
+        .finish();
+    let mut opts = ConvertOptions::default();
+    opts.limits.max_layer_bytes = 16 << 10;
+    let err = rejects(&[TestLayer::tar(tar)], opts);
+    assert!(
+        matches!(
+            err,
+            ImageError::LimitExceeded {
+                what: "uncompressed bytes per layer",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[test]
 fn decompression_bomb() {
     let tar = TarBuilder::new()
         .file("zeros", &vec![0u8; 8 << 20], &Opts::default())
