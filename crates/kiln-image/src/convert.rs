@@ -304,6 +304,10 @@ fn squash_key(layers: &[LayerReport]) -> String {
 }
 
 /// Merges the bottom `k` layers into one (spec §6.4).
+///
+/// `kiln_erofs::squash` reads file data from every merged layer while it writes,
+/// so all `k` images are open at once. The CLI raises the soft descriptor limit;
+/// an image needing more than the hard limit allows would fail here.
 fn squash_bottom(store: &Store, layers: Vec<LayerReport>, k: usize) -> Result<Vec<LayerReport>> {
     let (bottom, rest) = layers.split_at(k);
     let key = squash_key(bottom);
