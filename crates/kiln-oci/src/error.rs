@@ -32,3 +32,10 @@ pub enum OciError {
 }
 
 pub type Result<T> = std::result::Result<T, OciError>;
+
+pub(crate) fn json<T: serde::de::DeserializeOwned>(what: &str, bytes: &[u8]) -> Result<T> {
+    serde_json::from_slice(bytes).map_err(|source| OciError::Json {
+        what: what.to_string(),
+        source,
+    })
+}
