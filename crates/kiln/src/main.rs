@@ -13,7 +13,7 @@ use kiln_oci::Platform;
 use kiln_store::Store;
 use serde_json::json;
 
-use crate::sanitize::{clean, clean_line};
+use crate::sanitize::clean_line;
 
 #[derive(Parser)]
 #[command(name = "kiln", version, about = "Build microVM images from OCI images")]
@@ -328,12 +328,32 @@ fn error_message(e: &anyhow::Error) -> String {
     msg
 }
 
+/// The single, sanitised stderr line for an error (newlines in image text cannot forge lines).
+fn render_error(e: &anyhow::Error) -> String {
+    format!("kiln: error: {}", clean_line(&error_message(e)))
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("kiln: error: {}", clean(&error_message(&e)));
+            eprintln!("{}", render_error(&e));
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_error_is_one_sanitised_line() {
+        let e = anyhow::anyhow!("bad path \x1b[31mevil\nkiln: error: forged").context("converting");
+        let s = render_error(&e);
+        assert!(!s.contains('\x1b'));
+        assert!(!s.contains('\n'));
+        assert!(s.starts_with("kiln: error: converting: "));
+        assert!(s.contains("[31mevil kiln: error: forged"));
     }
 }
