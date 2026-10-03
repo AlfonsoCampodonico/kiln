@@ -8,6 +8,8 @@ pub enum ImageError {
     Store(#[from] kiln_store::StoreError),
     #[error(transparent)]
     Oci(#[from] kiln_oci::OciError),
+    #[error(transparent)]
+    Registry(#[from] kiln_registry::RegistryError),
     #[error("erofs: {0}")]
     Erofs(#[from] kiln_erofs::Error),
     #[error("i/o error: {0}")]
@@ -33,6 +35,8 @@ pub enum ImageError {
     NotAKilnImage(Digest),
     #[error("unsupported kiln image schema version {0}")]
     UnknownSchema(u32),
+    #[error("{0} is not a kiln image (use `kiln convert` for OCI images)")]
+    NotKilnRemote(String),
     #[error("no image named {0:?}")]
     RefNotFound(String),
     #[error("invalid option: {0}")]

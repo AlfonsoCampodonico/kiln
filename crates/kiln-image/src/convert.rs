@@ -42,6 +42,23 @@ impl Default for ConvertOptions {
     }
 }
 
+/// Makes a layer blob available in the store just before the pipeline streams it.
+/// It is called only for layers that are converted, never for cache hits, from
+/// up to `jobs` threads at once.
+pub trait LayerSource: Sync {
+    fn fetch(&self, layer: &Descriptor) -> Result<()>;
+}
+
+/// Layers that resolve already verified into the store (local inputs).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StoredLayers;
+
+impl LayerSource for StoredLayers {
+    fn fetch(&self, _layer: &Descriptor) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// One erofs layer of a converted image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerReport {
@@ -124,8 +141,10 @@ fn stream_layer(
     i: usize,
     opts: &ConvertOptions,
     budget: &Arc<Budget>,
+    source: &dyn LayerSource,
 ) -> Result<Streamed> {
     let desc = &img.manifest.layers[i];
+    source.fetch(desc)?;
     let compression = media::layer_compression(&desc.media_type)?;
     let max = layer_limit(
         compression,
@@ -208,6 +227,7 @@ fn stream_parallel(
     todo: &[usize],
     opts: &ConvertOptions,
     budget: &Arc<Budget>,
+    source: &dyn LayerSource,
 ) -> Result<BTreeMap<usize, Streamed>> {
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
@@ -219,7 +239,7 @@ fn stream_parallel(
                     let Some(&i) = todo.get(next.fetch_add(1, Ordering::SeqCst)) else {
                         break;
                     };
-                    let r = stream_layer(store, img, i, opts, budget);
+                    let r = stream_layer(store, img, i, opts, budget, source);
                     if r.is_err() {
                         failed.store(true, Ordering::SeqCst);
                     }
@@ -341,11 +361,13 @@ fn squash_bottom(store: &Store, layers: Vec<LayerReport>, k: usize) -> Result<Ve
 }
 
 /// Converts the app layers of one resolved image and commits its kiln manifest.
+/// `source` provides the blobs of the layers that are not cache hits.
 pub fn convert_image(
     store: &Store,
     img: &ResolvedImage,
     reference: Option<&str>,
     opts: &ConvertOptions,
+    source: &dyn LayerSource,
 ) -> Result<Converted> {
     if opts.max_layers == 0 || opts.jobs == 0 {
         return Err(ImageError::BadOption("max-layers and jobs must be at least 1".into()));
@@ -365,7 +387,7 @@ pub fn convert_image(
         .map(|(i, _)| i)
         .collect();
     let budget = Arc::new(Budget::default());
-    let mut pending = stream_parallel(store, img, &todo, opts, &budget)?;
+    let mut pending = stream_parallel(store, img, &todo, opts, &budget, source)?;
 
     // Bottom-up: each layer's lowers are final before it is.
     let mut reports: Vec<LayerReport> = Vec::new();
@@ -384,7 +406,7 @@ pub fn convert_image(
                 match store.cache_get_blob(CacheKind::LayersCtx, &key)? {
                     Some(d) => (d, true, true, cached_warnings(store, &lkey)?),
                     None => {
-                        let p = stream_layer(store, img, i, opts, &budget)?;
+                        let p = stream_layer(store, img, i, opts, &budget, source)?;
                         // Reuse the resolution only if the cached path list still matches
                         // the layer (a stale entry must not change the output).
                         let reuse = matches!(&p, Streamed::Pending(q) if q.implicit == paths);
