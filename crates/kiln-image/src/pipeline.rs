@@ -6,7 +6,7 @@ use kiln_oci::media::{OCI_INDEX, OCI_MANIFEST};
 use kiln_oci::{Descriptor, ImageIndex, LocalSource, Platform, ResolvedImage, canonical_json, resolve_local};
 use kiln_store::{Digest, Store};
 
-use crate::convert::{ConvertOptions, Converted, convert_image};
+use crate::convert::{ConvertOptions, Converted, LayerSource, StoredLayers, convert_image};
 use crate::error::Result;
 use crate::types::KILN_ARTIFACT;
 
@@ -16,6 +16,9 @@ pub struct Output {
     pub digest: Digest,
     pub media_type: &'static str,
     pub images: Vec<Converted>,
+    /// Layer blobs downloaded from a registry (0 for local inputs).
+    pub layers_downloaded: usize,
+    pub bytes_downloaded: u64,
 }
 
 /// Converts every resolved platform and writes the top-level blob. Requested
@@ -26,18 +29,21 @@ pub fn convert_resolved(
     resolved: &[ResolvedImage],
     reference: Option<&str>,
     opts: &ConvertOptions,
+    source: &dyn LayerSource,
 ) -> Result<Output> {
     let mut seen = std::collections::HashSet::new();
     let mut images = resolved
         .iter()
         .filter(|r| seen.insert(r.manifest_digest.clone()))
-        .map(|r| convert_image(store, r, reference, opts))
+        .map(|r| convert_image(store, r, reference, opts, source))
         .collect::<Result<Vec<_>>>()?;
     if let [one] = images.as_slice() {
         return Ok(Output {
             digest: one.manifest_digest.clone(),
             media_type: OCI_MANIFEST,
             images,
+            layers_downloaded: 0,
+            bytes_downloaded: 0,
         });
     }
     images.sort_by(|a, b| a.platform.cmp(&b.platform));
@@ -61,6 +67,8 @@ pub fn convert_resolved(
         digest,
         media_type: OCI_INDEX,
         images,
+        layers_downloaded: 0,
+        bytes_downloaded: 0,
     })
 }
 
@@ -86,7 +94,7 @@ pub fn convert_local(store: &Store, path: &Path, req: &LocalRequest, opts: &Conv
         req.platforms
     };
     let resolved = resolve_local(store, &source, req.source_ref, platforms)?;
-    let out = convert_resolved(store, &resolved, None, opts)?;
+    let out = convert_resolved(store, &resolved, None, opts, &StoredLayers)?;
     if let Some(tag) = req.tag {
         store.set_ref(tag, &out.digest)?;
     }

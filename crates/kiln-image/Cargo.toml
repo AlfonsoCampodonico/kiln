@@ -9,6 +9,7 @@ description = "kiln image format and the verified OCI-to-erofs conversion pipeli
 flate2 = "1.1.10"
 kiln-erofs = { path = "../kiln-erofs" }
 kiln-oci = { path = "../kiln-oci" }
+kiln-registry = { path = "../kiln-registry" }
 kiln-store = { path = "../kiln-store" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
