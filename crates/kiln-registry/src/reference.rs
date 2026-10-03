@@ -149,7 +149,7 @@ pub fn api_host(registry: &str) -> &str {
     }
 }
 
-fn valid_tag(t: &str) -> bool {
+pub(crate) fn valid_tag(t: &str) -> bool {
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     !t.is_empty() && t.len() <= MAX_TAG && word(t.as_bytes()[0]) && t.bytes().all(|b| word(b) || b == b'.' || b == b'-')
 }

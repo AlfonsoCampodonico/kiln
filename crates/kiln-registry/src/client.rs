@@ -20,7 +20,7 @@ use url::{Host, Url};
 use crate::auth::{Challenge, Credential, DockerConfig, pick_challenge};
 use crate::error::{RegistryError, Result, redact, redact_str};
 use crate::policy::{CheckedResolver, Policy, Refusal, is_loopback_host, lookup};
-use crate::reference::{api_host, valid_domain, valid_repository};
+use crate::reference::{api_host, valid_domain, valid_repository, valid_tag};
 
 pub const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 pub const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -42,6 +42,17 @@ pub const MAX_REDIRECTS: usize = 5;
 /// Largest error body read for its message.
 const MAX_ERROR_BODY: u64 = 64 << 10;
 const DIGEST_HEADER: &str = "docker-content-digest";
+/// Time reqwest's blocking client allows per request, and the floor for uploads.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The slowest upload kiln waits for, in bytes per second.
+const MIN_UPLOAD_RATE: u64 = 128 << 10;
+
+/// How long an upload of `size` bytes may take. reqwest's blocking `.timeout` covers
+/// sending the body *and* waiting for the response as a whole, so a flat 60 s would
+/// fail any large layer: the allowance grows with the size instead.
+fn upload_timeout(size: u64) -> Duration {
+    REQUEST_TIMEOUT + Duration::from_secs(size / MIN_UPLOAD_RATE)
+}
 
 /// A manifest or index, verified against its digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +89,8 @@ struct Call<'a> {
     action: Action,
     accept: Option<&'a str>,
     payload: Payload<'a>,
+    /// Overrides the client's default timeout (uploads).
+    timeout: Option<Duration>,
 }
 
 impl<'a> Call<'a> {
@@ -89,6 +102,7 @@ impl<'a> Call<'a> {
             action,
             accept: None,
             payload: Payload::Empty,
+            timeout: None,
         }
     }
 }
@@ -151,7 +165,7 @@ impl Client {
             .dns_resolver(Arc::new(CheckedResolver { policy: policy.clone() }))
             .connect_timeout(Duration::from_secs(30))
             // Per read and per response: large blobs take as long as they take.
-            .timeout(Duration::from_secs(60))
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|e| RegistryError::Http {
                 method: "build".into(),
@@ -182,12 +196,7 @@ impl Client {
                 reason: "invalid repository",
             });
         }
-        let target_ok = !target.is_empty()
-            && target.len() <= 128 + 7
-            && target
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_.-:".contains(&b));
-        if !target_ok {
+        if !(valid_tag(target) || Digest::parse(target).is_ok()) {
             return Err(RegistryError::BadReference {
                 reference: target.to_string(),
                 reason: "invalid tag or digest",
@@ -227,7 +236,7 @@ impl Client {
         {
             return Err(mismatch(&h));
         }
-        let media_type = manifest_media_type(header_type.as_deref(), &bytes)?;
+        let media_type = manifest_media_type(&where_, header_type.as_deref(), &bytes)?;
         Ok(Manifest {
             bytes,
             digest,
@@ -316,6 +325,7 @@ impl Client {
         location.query_pairs_mut().append_pair("digest", &digest.to_string());
         let mut put = Call::new(Method::PUT, location, repo, Action::Push);
         put.payload = Payload::File(path);
+        put.timeout = Some(upload_timeout(std::fs::metadata(path)?.len()));
         let resp = self.success(self.execute(&put)?, &put, "upload")?;
         check_digest_header(&resp, digest, &put.url)?;
         Ok(true)
@@ -388,6 +398,9 @@ impl Client {
                 .header(CONTENT_TYPE, "application/octet-stream")
                 .body(Body::from(File::open(path)?)),
         };
+        if let Some(t) = call.timeout {
+            rb = rb.timeout(t);
+        }
         rb.send().map_err(|e| http_error(&call.method, url, e))
     }
 
@@ -593,9 +606,12 @@ fn media_type(h: &HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The manifest's type: the header when it names an accepted type, else the
-/// document's own `mediaType`. Schema 1 is refused either way.
-fn manifest_media_type(header: Option<&str>, bytes: &[u8]) -> Result<String> {
+/// The manifest's type. The document's own `mediaType` wins, so a registry cannot
+/// choose how digest-pinned bytes are read; an accepted `Content-Type` that
+/// disagrees with it is refused, and the header decides only when the document has
+/// no `mediaType`. A document with both `manifests` and `layers` is ambiguous and
+/// refused. Schema 1 is refused either way.
+fn manifest_media_type(url: &str, header: Option<&str>, bytes: &[u8]) -> Result<String> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Probe {
@@ -603,7 +619,15 @@ fn manifest_media_type(header: Option<&str>, bytes: &[u8]) -> Result<String> {
         schema_version: Option<u64>,
         #[serde(default)]
         media_type: Option<String>,
+        #[serde(default)]
+        manifests: Option<serde::de::IgnoredAny>,
+        #[serde(default)]
+        layers: Option<serde::de::IgnoredAny>,
     }
+    let bad = |reason: String| RegistryError::BadResponse {
+        url: url.to_string(),
+        reason,
+    };
     let probe: Option<Probe> = serde_json::from_slice(bytes).ok();
     let body_type = probe.as_ref().and_then(|p| p.media_type.clone());
     let schema1 = probe.as_ref().is_some_and(|p| p.schema_version == Some(1));
@@ -615,12 +639,25 @@ fn manifest_media_type(header: Option<&str>, bytes: &[u8]) -> Result<String> {
     {
         return Err(RegistryError::Schema1);
     }
-    [header, body_type.as_deref()]
-        .into_iter()
-        .flatten()
-        .find(|t| MANIFEST_TYPES.contains(t))
-        .map(str::to_string)
-        .ok_or_else(|| RegistryError::UnsupportedManifest(header.or(body_type.as_deref()).unwrap_or("").to_string()))
+    if probe
+        .as_ref()
+        .is_some_and(|p| p.manifests.is_some() && p.layers.is_some())
+    {
+        return Err(bad("document has both manifests and layers".into()));
+    }
+    match body_type.as_deref() {
+        Some(t) if MANIFEST_TYPES.contains(&t) => match header {
+            Some(h) if MANIFEST_TYPES.contains(&h) && h != t => Err(bad(format!(
+                "Content-Type {h:?} disagrees with the document's mediaType {t:?}"
+            ))),
+            _ => Ok(t.to_string()),
+        },
+        Some(t) => Err(RegistryError::UnsupportedManifest(t.to_string())),
+        None => match header {
+            Some(h) if MANIFEST_TYPES.contains(&h) => Ok(h.to_string()),
+            other => Err(RegistryError::UnsupportedManifest(other.unwrap_or("").to_string())),
+        },
+    }
 }
 
 fn check_digest_header(resp: &Response, digest: &Digest, url: &Url) -> Result<()> {
@@ -708,24 +745,77 @@ mod tests {
 
     #[test]
     fn manifest_types_come_from_the_header_or_the_body() {
-        assert_eq!(manifest_media_type(Some(OCI_INDEX), b"{}").unwrap(), OCI_INDEX);
+        assert_eq!(manifest_media_type("u", Some(OCI_INDEX), b"{}").unwrap(), OCI_INDEX);
         let body = format!(r#"{{"schemaVersion":2,"mediaType":"{DOCKER_MANIFEST}"}}"#);
         assert_eq!(
-            manifest_media_type(Some("application/json"), body.as_bytes()).unwrap(),
+            manifest_media_type("u", Some("application/json"), body.as_bytes()).unwrap(),
             DOCKER_MANIFEST
         );
         assert!(matches!(
-            manifest_media_type(Some(DOCKER_SCHEMA1[1]), b"{}"),
+            manifest_media_type("u", Some(DOCKER_SCHEMA1[1]), b"{}"),
             Err(RegistryError::Schema1)
         ));
         assert!(matches!(
-            manifest_media_type(Some(OCI_MANIFEST), br#"{"schemaVersion":1}"#),
+            manifest_media_type("u", Some(OCI_MANIFEST), br#"{"schemaVersion":1}"#),
             Err(RegistryError::Schema1)
         ));
         assert!(matches!(
-            manifest_media_type(Some("text/html"), b"<html>"),
+            manifest_media_type("u", Some("text/html"), b"<html>"),
             Err(RegistryError::UnsupportedManifest(t)) if t == "text/html"
         ));
+    }
+
+    #[test]
+    fn the_documents_media_type_wins_over_the_header() {
+        let manifest = format!(r#"{{"schemaVersion":2,"mediaType":"{OCI_MANIFEST}","layers":[]}}"#);
+        // No header, or one that is not an accepted type: the body decides.
+        assert_eq!(
+            manifest_media_type("u", None, manifest.as_bytes()).unwrap(),
+            OCI_MANIFEST
+        );
+        assert_eq!(
+            manifest_media_type("u", Some("text/plain"), manifest.as_bytes()).unwrap(),
+            OCI_MANIFEST
+        );
+        // An accepted header that disagrees is refused, whichever way round.
+        assert!(matches!(
+            manifest_media_type("u", Some(OCI_INDEX), manifest.as_bytes()),
+            Err(RegistryError::BadResponse { .. })
+        ));
+        let index = format!(r#"{{"schemaVersion":2,"mediaType":"{OCI_INDEX}","manifests":[]}}"#);
+        assert!(matches!(
+            manifest_media_type("u", Some(OCI_MANIFEST), index.as_bytes()),
+            Err(RegistryError::BadResponse { .. })
+        ));
+        // The header decides only when the body has no mediaType.
+        assert_eq!(
+            manifest_media_type("u", Some(OCI_INDEX), br#"{"schemaVersion":2,"manifests":[]}"#).unwrap(),
+            OCI_INDEX
+        );
+        // A body type that is not a manifest type is unsupported even under an accepted header.
+        assert!(matches!(
+            manifest_media_type("u", Some(OCI_MANIFEST), br#"{"mediaType":"text/html"}"#),
+            Err(RegistryError::UnsupportedManifest(t)) if t == "text/html"
+        ));
+        // Both manifests and layers: ambiguous.
+        for doc in [
+            br#"{"schemaVersion":2,"manifests":[],"layers":[]}"#.as_slice(),
+            format!(r#"{{"mediaType":"{OCI_MANIFEST}","manifests":[],"layers":[]}}"#).as_bytes(),
+        ] {
+            assert!(matches!(
+                manifest_media_type("u", Some(OCI_MANIFEST), doc),
+                Err(RegistryError::BadResponse { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn upload_timeouts_grow_with_the_size() {
+        assert_eq!(upload_timeout(0), Duration::from_secs(60));
+        assert_eq!(upload_timeout(MIN_UPLOAD_RATE - 1), Duration::from_secs(60));
+        assert_eq!(upload_timeout(MIN_UPLOAD_RATE), Duration::from_secs(61));
+        // A 1 GiB layer gets 60 s plus 8192 s at 128 KiB/s.
+        assert_eq!(upload_timeout(1 << 30), Duration::from_secs(60 + 8192));
     }
 
     #[test]
@@ -743,6 +833,21 @@ mod tests {
         assert!(c.endpoint("../x", "manifests", "v1").is_err());
         assert!(c.endpoint("a", "manifests", "v1/../../x").is_err());
         assert!(c.endpoint("a", "manifests", "v1?x").is_err());
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert!(c.endpoint("a", "manifests", &digest).is_ok());
+        assert!(c.endpoint("a", "manifests", "v1.2-rc_3").is_ok());
+        for bad in [
+            "..",
+            ".x",
+            "-x",
+            "",
+            "a:b",
+            &format!("sha512:{}", "a".repeat(128)),
+            &format!("sha256:{}", "A".repeat(64)),
+            &format!("sha256:{}", "a".repeat(63)),
+        ] {
+            assert!(c.endpoint("a", "manifests", bad).is_err(), "{bad}");
+        }
         assert!(Client::new("bad host", DockerConfig::anonymous()).is_err());
     }
 
