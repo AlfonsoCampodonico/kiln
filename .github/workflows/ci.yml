@@ -14,6 +14,23 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+  registries:
+    runs-on: ubuntu-24.04
+    services:
+      distribution:
+        image: registry:3
+        ports:
+          - 5000:5000
+      zot:
+        image: ghcr.io/project-zot/zot:v2.1.21
+        ports:
+          - 5001:5000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p kiln-image --test registries
+        env:
+          KILN_TEST_REGISTRIES: localhost:5000,localhost:5001
   golden-immutable:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
