@@ -1,5 +1,5 @@
 //! Registry credentials from Docker's `config.json` (including `credsStore` and
-//! `credHelpers`).
+//! `credHelpers`), and the `WWW-Authenticate` challenges registries send.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -268,6 +268,67 @@ fn entry_credential(path: &Path, e: &AuthEntry) -> Result<Option<Credential>> {
     }
 }
 
+/// A parsed `WWW-Authenticate` challenge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Challenge {
+    Basic,
+    Bearer { realm: String, service: Option<String> },
+}
+
+/// Picks the challenge to answer from all `WWW-Authenticate` values: Bearer if
+/// offered, else Basic.
+pub(crate) fn pick_challenge<'a>(values: impl IntoIterator<Item = &'a str>) -> Option<Challenge> {
+    let all: Vec<Challenge> = values.into_iter().filter_map(parse_challenge).collect();
+    all.iter()
+        .find(|c| matches!(c, Challenge::Bearer { .. }))
+        .or_else(|| all.first())
+        .cloned()
+}
+
+fn parse_challenge(header: &str) -> Option<Challenge> {
+    let header = header.trim();
+    let (scheme, params) = header.split_once(' ').unwrap_or((header, ""));
+    if scheme.eq_ignore_ascii_case("basic") {
+        return Some(Challenge::Basic);
+    }
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let params = parse_params(params)?;
+    Some(Challenge::Bearer {
+        realm: params.get("realm")?.clone(),
+        service: params.get("service").cloned(),
+    })
+}
+
+/// `key=value` or `key="quoted \" value"` pairs separated by commas.
+fn parse_params(s: &str) -> Option<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    let mut chars = s.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace() || *c == ',').is_some() {}
+        if chars.peek().is_none() {
+            return Some(out);
+        }
+        let key: String = std::iter::from_fn(|| chars.next_if(|c| *c != '=' && *c != ',')).collect();
+        chars.next_if_eq(&'=')?;
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut value = String::new();
+        if chars.next_if_eq(&'"').is_some() {
+            loop {
+                match chars.next()? {
+                    '"' => break,
+                    '\\' => value.push(chars.next()?),
+                    c => value.push(c),
+                }
+            }
+        } else {
+            value.extend(std::iter::from_fn(|| chars.next_if(|c| *c != ',')));
+        }
+        out.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +503,33 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("boom") && !err.contains("Broken pipe"), "{err}");
+    }
+
+    #[test]
+    fn parses_challenges() {
+        assert_eq!(
+            pick_challenge([
+                r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull""#
+            ]),
+            Some(Challenge::Bearer {
+                realm: "https://auth.docker.io/token".into(),
+                service: Some("registry.docker.io".into()),
+            })
+        );
+        assert_eq!(pick_challenge([r#"Basic realm="x""#]), Some(Challenge::Basic));
+        assert_eq!(
+            pick_challenge([
+                r#"Basic realm="x""#,
+                r#"bearer realm=https://a/t , service = "s \"q\"""#
+            ]),
+            Some(Challenge::Bearer {
+                realm: "https://a/t".into(),
+                service: Some("s \"q\"".into()),
+            }),
+            "Bearer is preferred, case-insensitive, unquoted values allowed"
+        );
+        assert_eq!(pick_challenge(["Bearer service=\"s\""]), None, "no realm");
+        assert_eq!(pick_challenge(["Negotiate abc"]), None);
+        assert_eq!(pick_challenge([r#"Bearer realm="unterminated"#]), None);
     }
 }
