@@ -3,6 +3,8 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   dockerhub:
     strategy:
@@ -20,9 +22,9 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
+          umask 077
           dir="$RUNNER_TEMP/docker-config"
           mkdir -p "$dir"
-          umask 077
           if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
             auth=$(printf '%s:%s' "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" | base64 | tr -d '\n')
             printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}' "$auth" > "$dir/config.json"
@@ -34,3 +36,7 @@ jobs:
       - run: cargo test --release -p kiln-image --test dockerhub
         env:
           KILN_TEST_DOCKERHUB: "1"
+      - name: Remove the temporary Docker config
+        if: always()
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/docker-config"

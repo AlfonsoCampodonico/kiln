@@ -9,12 +9,13 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use kiln_image::ImageError;
 use kiln_image::{
     ConvertOptions, LocalRequest, Output, RegistryRequest, convert_local, convert_registry, import_image, load,
     pull_image, push_image, resolve_name,
 };
-use kiln_oci::Platform;
-use kiln_registry::{Client, DockerConfig, Reference};
+use kiln_oci::{OciError, Platform};
+use kiln_registry::{Client, DockerConfig, Reference, RegistryError};
 use kiln_store::Store;
 use serde_json::json;
 
@@ -207,8 +208,39 @@ fn classify_source<'a>(source: &'a str, source_ref: Option<&str>) -> Result<Sour
             clean_line(source)
         )
     })?;
-    let c = client_for(&r)?;
+    let c = client_for(&r).map_err(|e| {
+        let hint = e.downcast_ref::<RegistryError>().is_some_and(suggests_a_mistyped_path);
+        e.context(no_local_path(&r, hint))
+    })?;
     Ok(Source::Registry(r, Box::new(c)))
+}
+
+/// The registry error inside a convert error, if that is what it is.
+fn registry_error(e: &ImageError) -> Option<&RegistryError> {
+    match e {
+        ImageError::Registry(r) | ImageError::Oci(OciError::Registry(r)) => Some(r),
+        _ => None,
+    }
+}
+
+/// Whether a registry error may just mean the source was meant as a local path
+/// that does not exist: the image or its registry was not found, or was refused.
+fn suggests_a_mistyped_path(e: &RegistryError) -> bool {
+    matches!(
+        e,
+        RegistryError::NotFound { .. } | RegistryError::Unauthorized { .. } | RegistryError::Resolve { .. }
+    )
+}
+
+/// The context of a failed registry convert: the reference, and that no local
+/// path of that name exists either when the error suggests one was meant.
+fn no_local_path(r: &Reference, hint: bool) -> String {
+    let r = clean_line(&r.to_string());
+    if hint {
+        format!("{r} (no such local path either)")
+    } else {
+        r
+    }
 }
 
 fn default_tag(path: &Path) -> Result<String> {
@@ -223,6 +255,11 @@ fn default_tag(path: &Path) -> Result<String> {
             clean_line(&path.display().to_string())
         ),
     }
+}
+
+/// The plural suffix for a count of `n`.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 fn human_size(n: u64) -> String {
@@ -300,8 +337,14 @@ fn run(cli: Cli) -> Result<()> {
                         platforms: &platforms,
                         tag: Some(&tag),
                     };
-                    convert_registry(&store, client, r, &req, &args.options())
-                        .with_context(|| format!("{} (no such local path either)", clean_line(&r.to_string())))?
+                    convert_registry(&store, client, r, &req, &args.options()).map_err(|e| {
+                        if matches!(e, ImageError::KilnRemote(_)) {
+                            // Already names the reference and says what to do.
+                            return anyhow::Error::from(e);
+                        }
+                        let hint = registry_error(&e).is_some_and(suggests_a_mistyped_path);
+                        anyhow::Error::from(e).context(no_local_path(r, hint))
+                    })?
                 }
             };
             if *json {
@@ -311,10 +354,11 @@ fn run(cli: Cli) -> Result<()> {
             for c in &out.images {
                 let cached = c.layers.iter().filter(|l| l.cached).count();
                 print!(
-                    "{}  {}  {} layers ({cached} cached)",
+                    "{}  {}  {} layer{} ({cached} cached)",
                     clean_line(&c.platform.to_string()),
                     c.manifest_digest,
-                    c.layers.len()
+                    c.layers.len(),
+                    plural(c.layers.len())
                 );
                 if c.squashed > 0 {
                     print!(", bottom {} squashed", c.squashed);
@@ -326,8 +370,9 @@ fn run(cli: Cli) -> Result<()> {
             }
             if out.layers_downloaded > 0 {
                 println!(
-                    "downloaded {} layers ({})",
+                    "downloaded {} layer{} ({})",
                     out.layers_downloaded,
+                    plural(out.layers_downloaded),
                     human_size(out.bytes_downloaded)
                 );
             }
@@ -529,6 +574,37 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_missing_or_refused_images_suggest_a_mistyped_path() {
+        let not_found = RegistryError::NotFound {
+            what: "manifest",
+            url: "u".into(),
+            detail: String::new(),
+        };
+        let unauthorized = RegistryError::Unauthorized {
+            url: "u".into(),
+            status: 401,
+            detail: String::new(),
+        };
+        let resolve = RegistryError::Resolve {
+            host: "h".into(),
+            source: std::io::Error::other("no such host"),
+        };
+        for e in [not_found, unauthorized, resolve] {
+            assert!(suggests_a_mistyped_path(&e), "{e}");
+            let e = ImageError::Oci(OciError::Registry(e));
+            assert!(registry_error(&e).is_some_and(suggests_a_mistyped_path), "{e}");
+        }
+        assert!(!suggests_a_mistyped_path(&RegistryError::Schema1));
+        assert!(registry_error(&ImageError::UnsupportedPlatform("linux/s390x".into())).is_none());
+        let r = Reference::parse("php:8.4-cli").unwrap();
+        assert_eq!(
+            no_local_path(&r, true),
+            "docker.io/library/php:8.4-cli (no such local path either)"
+        );
+        assert_eq!(no_local_path(&r, false), "docker.io/library/php:8.4-cli");
+    }
 
     #[test]
     fn render_error_is_one_sanitised_line() {

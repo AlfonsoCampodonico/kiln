@@ -318,7 +318,8 @@ fn convert_push_and_pull_through_a_registry() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("downloaded 1 layers")
+            predicate::str::contains("downloaded 1 layer (")
+                .and(predicate::str::contains("1 layer (0 cached)"))
                 .and(predicate::str::contains(format!("{source} → sha256:"))),
         );
     let warm = stdout_json(
@@ -495,13 +496,67 @@ fn a_source_spelled_like_a_path_is_never_looked_up_in_a_registry() {
 }
 
 #[test]
-fn a_failed_registry_convert_says_there_was_no_local_path_either() {
+fn a_registry_convert_that_finds_nothing_says_there_was_no_local_path_either() {
+    let src = tempfile::tempdir().unwrap();
+    let reg = registry_with_image(src.path(), Config::default());
     let home = tempfile::tempdir().unwrap();
     let empty = tempfile::tempdir().unwrap();
     kiln(home.path())
         .env("DOCKER_CONFIG", empty.path())
-        .args(["convert", "localhost:1/app:v1"])
+        .args(["convert", &format!("{}/app:missing", reg.host())])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("(no such local path either)"));
+        .stderr(predicate::str::contains("not found").and(predicate::str::contains("(no such local path either)")));
+}
+
+#[test]
+fn other_registry_convert_errors_do_not_mention_local_paths() {
+    let src = tempfile::tempdir().unwrap();
+    let mut b = LayoutBuilder::new(src.path());
+    let layers: Vec<TestLayer> = simple().into_iter().map(TestLayer::tar).collect();
+    let s390x = Platform::parse("linux/s390x").unwrap();
+    let d = b.image(&s390x, &layers, ContainerConfig::default());
+    b.add(d, Some("v1")).finish();
+    let reg = TestRegistry::serve_layout(src.path(), Config::default());
+    let home = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    let out = kiln(home.path())
+        .env("DOCKER_CONFIG", empty.path())
+        .args([
+            "convert",
+            "--platform",
+            "linux/s390x",
+            &format!("{}/app:v1", reg.host()),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported platform") && !stderr.contains("local path"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn converting_a_kiln_image_from_a_registry_suggests_kiln_pull() {
+    let src = tempfile::tempdir().unwrap();
+    let reg = registry_with_image(src.path(), Config::default());
+    let home = tempfile::tempdir().unwrap();
+    let source = format!("{}/team/app:v1", reg.host());
+    let dest = format!("{}/team/kiln:v1", reg.host());
+    kiln(home.path())
+        .args(["convert", "--platform", "linux/arm64", &source])
+        .assert()
+        .success();
+    kiln(home.path()).args(["push", &source, &dest]).assert().success();
+    kiln(home.path())
+        .args(["convert", "--platform", "linux/arm64", &dest])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("is a kiln image")
+                .and(predicate::str::contains("kiln pull"))
+                .and(predicate::str::contains("local path").not()),
+        );
 }
