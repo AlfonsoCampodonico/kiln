@@ -71,6 +71,11 @@ pub fn redact(url: &Url) -> String {
     }
 }
 
+/// Redacts a URL given as text; text that does not parse is replaced entirely.
+pub(crate) fn redact_str(s: &str) -> String {
+    Url::parse(s).map_or_else(|_| "<invalid url>".to_string(), |u| redact(&u))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +84,7 @@ mod tests {
     fn redact_drops_userinfo_query_and_fragment() {
         let u = Url::parse("https://user:secret@cdn.example.com:8443/blobs/x?X-Amz-Signature=abc#frag").unwrap();
         assert_eq!(redact(&u), "https://cdn.example.com:8443/blobs/x");
+        assert_eq!(redact_str("http://[::1]/v2/?t=1"), "http://[::1]/v2/");
+        assert_eq!(redact_str("not a url?token=1"), "<invalid url>");
     }
 }
