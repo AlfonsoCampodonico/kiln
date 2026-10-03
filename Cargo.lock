@@ -837,11 +837,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "base64",
  "clap",
  "flate2",
  "kiln-erofs",
  "kiln-image",
  "kiln-oci",
+ "kiln-registry",
  "kiln-store",
  "predicates",
  "rlimit",

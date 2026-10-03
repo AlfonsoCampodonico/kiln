@@ -4,6 +4,7 @@ use assert_cmd::Command;
 use kiln_erofs::testtar::{Opts, TarBuilder};
 use kiln_oci::testlayout::{LayoutBuilder, TestLayer};
 use kiln_oci::{ContainerConfig, Platform};
+use kiln_registry::testregistry::{Config, TestRegistry};
 use predicates::prelude::*;
 
 fn layout(dir: &Path, cmd: &str, layers: Vec<Vec<u8>>) -> PathBuf {
@@ -286,4 +287,161 @@ fn bench_refuses_more_than_one_platform() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("at most one --platform"));
+}
+
+/// A tagged layout (`v1`) served by an in-process registry.
+fn registry_with_image(dir: &Path, config: Config) -> TestRegistry {
+    let mut b = LayoutBuilder::new(dir);
+    let layers: Vec<TestLayer> = simple().into_iter().map(TestLayer::tar).collect();
+    let cfg = ContainerConfig {
+        cmd: Some(vec!["php".into()]),
+        ..Default::default()
+    };
+    let d = b.image(&Platform::parse("linux/arm64").unwrap(), &layers, cfg);
+    b.add(d, Some("v1")).finish();
+    TestRegistry::serve_layout(dir, config)
+}
+
+fn stdout_json(out: std::process::Output) -> serde_json::Value {
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn convert_push_and_pull_through_a_registry() {
+    let src = tempfile::tempdir().unwrap();
+    let reg = registry_with_image(src.path(), Config::default());
+    let (home, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let source = format!("{}/team/app:v1", reg.host());
+    kiln(home.path())
+        .args(["convert", "--platform", "linux/arm64", &source])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("downloaded 1 layers")
+                .and(predicate::str::contains(format!("{source} → sha256:"))),
+        );
+    let warm = stdout_json(
+        kiln(home.path())
+            .args(["convert", "--json", "--platform", "linux/arm64", &source])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(warm["layersDownloaded"], 0);
+    assert_eq!(warm["tag"], source.as_str());
+    kiln(home.path())
+        .args(["inspect", &source])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{source} (unverified provenance)")));
+
+    let dest = format!("{}/team/kiln:v1", reg.host());
+    let pushed = stdout_json(
+        kiln(home.path())
+            .args(["push", "--json", &source, &dest])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(pushed["digest"], warm["digest"]);
+    assert!(pushed["blobs"].as_u64().unwrap() >= 2);
+    let pulled = stdout_json(
+        kiln(other.path())
+            .args(["pull", "--json", "--tag", "copy:1", &dest])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(pulled["digest"], warm["digest"]);
+    kiln(other.path())
+        .args(["pull", &dest])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{dest} → sha256:")));
+    kiln(other.path())
+        .args(["ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("copy:1").and(predicate::str::contains(&dest)));
+
+    // Pulling something that is not a kiln image says what to do instead.
+    kiln(other.path())
+        .args(["pull", &source])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("use `kiln convert`"));
+}
+
+#[test]
+fn registry_credentials_come_from_a_credential_helper_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let src = tempfile::tempdir().unwrap();
+    let reg = registry_with_image(
+        src.path(),
+        Config {
+            basic: Some(("kiln".into(), "hunter2".into())),
+            ..Default::default()
+        },
+    );
+    let home = tempfile::tempdir().unwrap();
+    let source = format!("{}/app:v1", reg.host());
+    let empty = tempfile::tempdir().unwrap();
+    let out = kiln(home.path())
+        .env("DOCKER_CONFIG", empty.path())
+        .args(["convert", "--platform", "linux/arm64", &source])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("authentication failed") && stderr.contains("no credentials"),
+        "{stderr}"
+    );
+
+    let bin = tempfile::tempdir().unwrap();
+    let helper = bin.path().join("docker-credential-kilntest");
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\nread server\nprintf '{\"Username\":\"kiln\",\"Secret\":\"hunter2\"}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = tempfile::tempdir().unwrap();
+    std::fs::write(
+        config.path().join("config.json"),
+        serde_json::to_vec(&serde_json::json!({"credHelpers": {reg.host(): "kilntest"}})).unwrap(),
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin.path().display(), std::env::var("PATH").unwrap_or_default());
+    kiln(home.path())
+        .env("DOCKER_CONFIG", config.path())
+        .env("PATH", path)
+        .args(["convert", "--platform", "linux/arm64", &source])
+        .assert()
+        .success();
+    // The password never reaches the registry in the clear (basic auth is base64), nor any output.
+    let basic = format!(
+        "Basic {}",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "kiln:hunter2")
+    );
+    assert!(
+        reg.log()
+            .iter()
+            .any(|l| l.authorization.as_deref() == Some(basic.as_str()))
+    );
+}
+
+#[test]
+fn a_source_that_is_neither_a_path_nor_a_reference_is_explained() {
+    let home = tempfile::tempdir().unwrap();
+    kiln(home.path())
+        .args(["convert", "./no/such/Dir"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "./no/such/Dir is not an existing path or a valid image reference",
+        ));
+    kiln(home.path())
+        .args(["convert", "--ref", "x", "localhost:1/app:v1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--ref selects an image inside a local source"));
 }
