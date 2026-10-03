@@ -87,13 +87,40 @@ fn resolves_manifest_and_config_but_fetches_no_layers() {
     );
     assert_eq!(f.reg.blob_requests("GET"), 1, "only the config");
 
-    // Warm: only the tag is asked for again.
+    // Warm: the tag is resolved with a single HEAD; nothing is fetched.
     let before = f.reg.log().len();
     let again = f.resolve(&[arm()]).unwrap();
     assert_eq!(again[0].manifest_digest, img.manifest_digest);
     let after = f.reg.log();
     assert_eq!(after.len() - before, 1);
-    assert!(after.last().unwrap().path.ends_with("/manifests/v1"));
+    let last = after.last().unwrap();
+    assert_eq!(
+        (last.method.as_str(), last.path.as_str()),
+        ("HEAD", "/v2/team/app/manifests/v1")
+    );
+    assert_eq!(f.reg.manifest_requests("GET"), 1, "only the cold run's GET, by digest");
+}
+
+#[test]
+fn a_child_that_is_not_a_manifest_is_refused_before_it_is_fetched() {
+    let mut child = None;
+    let f = Fixture::new(|b| {
+        let mut m = b.image(&arm(), &[layer("a")], cfg());
+        m.media_type = media::OCI_INDEX.into();
+        child = Some(m.digest.clone());
+        b.multiarch(vec![m])
+    });
+    let err = f.resolve(&[arm()]).unwrap_err();
+    assert!(
+        matches!(&err, OciError::UnsupportedMediaType(t) if t == media::OCI_INDEX),
+        "{err}"
+    );
+    let child = child.unwrap().to_string();
+    assert!(
+        !f.reg.log().iter().any(|l| l.path.ends_with(&child)),
+        "{:?}",
+        f.reg.log()
+    );
 }
 
 #[test]

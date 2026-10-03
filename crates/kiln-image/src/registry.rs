@@ -95,9 +95,10 @@ fn check_registry(client: &Client, reference: &Reference) -> Result<()> {
 }
 
 /// Resolve, fetch and convert a registry image under the store's shared lock.
-/// Only layers that are not cache hits are downloaded, so a warm convert fetches
-/// just the manifests and config (spec §6.2). The kiln config records the
-/// normalised reference.
+/// Only layers that are not cache hits are downloaded, and manifests and configs
+/// already in the store are not fetched again, so a warm convert by tag makes a
+/// single manifest HEAD (spec §6.2). The kiln config records the normalised
+/// reference.
 pub fn convert_registry(
     store: &Store,
     client: &Client,
@@ -113,7 +114,11 @@ pub fn convert_registry(
     } else {
         req.platforms
     };
-    let resolved = resolve_registry(store, client, reference, platforms)?;
+    let resolved = resolve_registry(store, client, reference, platforms).map_err(|e| match e {
+        // Only a kiln image has a kiln config: say what to do with it.
+        OciError::UnsupportedMediaType(t) if t == KILN_CONFIG => ImageError::KilnRemote(reference.to_string()),
+        e => e.into(),
+    })?;
     let layers = RegistryLayers {
         store,
         client,
@@ -145,8 +150,21 @@ pub struct TransferReport {
 
 const PULLED_LAYER_TYPES: [&str; 3] = [KILN_LAYER, KILN_KERNEL, KILN_INIT];
 
+/// The most per-platform manifests a pulled kiln index may list; kiln builds at
+/// most one per supported platform.
+pub const MAX_PULLED_MANIFESTS: usize = 8;
+
 fn not_kiln(reference: &Reference) -> ImageError {
     ImageError::NotKilnRemote(reference.to_string())
+}
+
+/// A per-platform manifest that must be a kiln image's.
+fn kiln_manifest(reference: &Reference, bytes: &[u8]) -> Result<ImageManifest> {
+    let m: ImageManifest = json("kiln manifest", bytes)?;
+    if m.artifact_type.as_deref() != Some(KILN_ARTIFACT) || m.config.media_type != KILN_CONFIG {
+        return Err(not_kiln(reference));
+    }
+    Ok(m)
 }
 
 /// Pulls a kiln image (all platforms of an index) and tags it `tag`. Every blob
@@ -157,39 +175,43 @@ pub fn pull_image(store: &Store, client: &Client, reference: &Reference, tag: &s
     kiln_store::check_ref_name(tag)?;
     let _lock = store.lock_shared()?;
     let repo = reference.repository();
-    let top = client.get_manifest(repo, &reference.target())?;
+    let top = client.resolve_manifest(repo, &reference.target(), store)?;
     store.put_bytes(&top.bytes)?;
-    let manifests: Vec<Digest> = match top.media_type.as_str() {
+    let manifests: Vec<(Digest, ImageManifest)> = match top.media_type.as_str() {
         OCI_INDEX => {
             let index: ImageIndex = json("kiln index", &top.bytes)?;
-            if index.artifact_type.as_deref() != Some(KILN_ARTIFACT) {
+            if index.artifact_type.as_deref() != Some(KILN_ARTIFACT) || index.manifests.is_empty() {
                 return Err(not_kiln(reference));
             }
-            for d in &index.manifests {
-                if d.media_type != OCI_MANIFEST {
-                    return Err(not_kiln(reference));
-                }
-                fetch_manifest(store, client, repo, d)?;
+            // The whole index is checked before any of its manifests is requested.
+            if index.manifests.len() > MAX_PULLED_MANIFESTS {
+                return Err(ImageError::LimitExceeded {
+                    what: "manifests in a kiln index",
+                    max: MAX_PULLED_MANIFESTS as u64,
+                });
             }
-            if index.manifests.is_empty() {
+            if index.manifests.iter().any(|d| d.media_type != OCI_MANIFEST) {
                 return Err(not_kiln(reference));
             }
-            index.manifests.into_iter().map(|d| d.digest).collect()
+            index
+                .manifests
+                .iter()
+                .map(|d| {
+                    let bytes = fetch_manifest(store, client, repo, d)?;
+                    Ok((d.digest.clone(), kiln_manifest(reference, &bytes)?))
+                })
+                .collect::<Result<_>>()?
         }
-        OCI_MANIFEST => vec![top.digest.clone()],
+        OCI_MANIFEST => vec![(top.digest.clone(), kiln_manifest(reference, &top.bytes)?)],
         _ => return Err(not_kiln(reference)),
     };
-    // First pass: validate every platform before fetching anything of any of them.
+    // Validate every platform before fetching any blob of any of them.
     let limits = ConvertOptions::default();
     let max_blob = max_blob_bytes(&limits);
     let mut validated = Vec::with_capacity(manifests.len());
     let mut unique = HashSet::new();
     let mut declared = 0u64;
-    for digest in &manifests {
-        let m: ImageManifest = json("kiln manifest", &store.read_metadata(digest)?)?;
-        if m.artifact_type.as_deref() != Some(KILN_ARTIFACT) || m.config.media_type != KILN_CONFIG {
-            return Err(not_kiln(reference));
-        }
+    for (digest, m) in manifests {
         if m.config.size > MAX_METADATA_BLOB {
             return Err(StoreError::TooLarge {
                 digest: m.config.digest.clone(),

@@ -452,3 +452,189 @@ fn push_checks_every_blob_before_uploading_any() {
         reg.log()
     );
 }
+
+/// Requests for any of `digests` (manifest or blob, any method) after the first `from`.
+fn requests_for(
+    reg: &kiln_registry::testregistry::TestRegistry,
+    from: usize,
+    digests: &[&kiln_store::Digest],
+) -> usize {
+    reg.log()[from..]
+        .iter()
+        .filter(|l| digests.iter().any(|d| l.path.ends_with(&d.to_string())))
+        .count()
+}
+
+#[test]
+fn pull_refuses_an_index_of_more_than_eight_manifests_before_fetching_any() {
+    let (reg, store, _home, digest) = pushed_two_platform_image();
+    let mut index: ImageIndex = serde_json::from_slice(&store.read_metadata(&digest).unwrap()).unwrap();
+    let children: Vec<_> = index.manifests.iter().map(|d| d.digest.clone()).collect();
+    index.manifests = (0..9).map(|i| index.manifests[i % 2].clone()).collect();
+    reg.put_manifest("many", OCI_INDEX, &canonical_json(&index));
+
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh = Store::open(fresh.path()).unwrap();
+    let before = reg.log().len();
+    let err = pull_image(
+        &fresh,
+        &client(&reg.host()),
+        &reference(&reg.host(), "kiln/two:many"),
+        "many",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ImageError::LimitExceeded {
+                what: "manifests in a kiln index",
+                max: 8
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        requests_for(&reg, before, &children.iter().collect::<Vec<_>>()),
+        0,
+        "no child manifest requested: {:?}",
+        &reg.log()[before..]
+    );
+    assert_eq!(fresh.get_ref("many").unwrap(), None);
+}
+
+#[test]
+fn pull_refuses_an_index_entry_that_is_not_a_manifest_before_fetching_any() {
+    let (reg, store, _home, digest) = pushed_two_platform_image();
+    let mut index: ImageIndex = serde_json::from_slice(&store.read_metadata(&digest).unwrap()).unwrap();
+    let children: Vec<_> = index.manifests.iter().map(|d| d.digest.clone()).collect();
+    // The first entry is a valid kiln manifest; the second claims to be an index.
+    index.manifests[1].media_type = OCI_INDEX.into();
+    reg.put_manifest("nested", OCI_INDEX, &canonical_json(&index));
+
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh = Store::open(fresh.path()).unwrap();
+    let before = reg.log().len();
+    let err = pull_image(
+        &fresh,
+        &client(&reg.host()),
+        &reference(&reg.host(), "kiln/two:nested"),
+        "nested",
+    )
+    .unwrap_err();
+    assert!(matches!(err, ImageError::NotKilnRemote(_)), "{err}");
+    assert_eq!(
+        requests_for(&reg, before, &children.iter().collect::<Vec<_>>()),
+        0,
+        "neither entry requested: {:?}",
+        &reg.log()[before..]
+    );
+}
+
+#[test]
+fn a_warm_convert_by_tag_makes_one_manifest_head_and_no_get() {
+    let src = tempfile::tempdir().unwrap();
+    let path = layout(src.path(), &[arm(), amd()], &[gz(&base(0o1777))]);
+    let reg = serve(&path);
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let c = client(&reg.host());
+    let r = reference(&reg.host(), "x:app");
+    let opts = ConvertOptions::default();
+    let platforms = [arm(), amd()];
+    let cold = convert_registry(&store, &c, &r, &registry_req(&platforms, "a"), &opts).unwrap();
+    // Cold: a HEAD for the tag, then the index by digest and both children.
+    assert_eq!(reg.manifest_requests("HEAD"), 1);
+    assert_eq!(reg.manifest_requests("GET"), 3);
+    let index_get = reg
+        .log()
+        .into_iter()
+        .find(|l| l.method == "GET" && l.path.contains("/manifests/"))
+        .unwrap();
+    assert!(
+        index_get.path.contains("/manifests/sha256:"),
+        "the index is fetched by the digest the HEAD reported, not by tag: {index_get:?}"
+    );
+    assert!(
+        !reg.log()
+            .iter()
+            .any(|l| l.method == "GET" && l.path.ends_with("/manifests/app"))
+    );
+
+    let before = reg.log().len();
+    let warm = convert_registry(&store, &c, &r, &registry_req(&platforms, "a"), &opts).unwrap();
+    assert_eq!(warm.digest, cold.digest);
+    let log = reg.log();
+    let warm_log: Vec<_> = log[before..]
+        .iter()
+        .map(|l| (l.method.as_str(), l.path.as_str()))
+        .collect();
+    assert_eq!(
+        warm_log,
+        vec![("HEAD", "/v2/x/manifests/app")],
+        "a warm convert is a single manifest HEAD"
+    );
+    assert_eq!(reg.manifest_requests("GET"), 3, "no manifest GET when warm");
+}
+
+#[test]
+fn converting_a_kiln_image_says_to_pull_it() {
+    let (reg, _store, _home, _digest) = pushed_two_platform_image();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let err = convert_registry(
+        &store,
+        &client(&reg.host()),
+        &reference(&reg.host(), "kiln/two:v1"),
+        &registry_req(&[arm()], "k"),
+        &ConvertOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, ImageError::KilnRemote(_)), "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("is a kiln image") && msg.contains("`kiln pull`"), "{msg}");
+    assert_eq!(store.get_ref("k").unwrap(), None);
+}
+
+#[test]
+fn a_layer_redirect_to_a_refused_destination_fails_the_convert() {
+    let src = tempfile::tempdir().unwrap();
+    let layer = gz(&base(0o755));
+    let layer_digest = kiln_store::Digest::of(&layer.blob);
+    let path = layout(src.path(), &[arm()], &[layer]);
+    let reg = kiln_registry::testregistry::TestRegistry::serve_layout(
+        &path,
+        kiln_registry::testregistry::Config {
+            redirect_blobs: Some("https://169.254.169.254/latest/?sig=SECRET&d=".into()),
+            redirect_only: Some(layer_digest.clone()),
+            ..Default::default()
+        },
+    );
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let c = client(&reg.host());
+    let m: ImageManifest = serde_json::from_slice(&c.get_manifest("x", "app").unwrap().bytes).unwrap();
+    let err = convert_registry(
+        &store,
+        &c,
+        &reference(&reg.host(), "x:app"),
+        &registry_req(&[arm()], "a"),
+        &ConvertOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ImageError::Registry(kiln_registry::RegistryError::Refused { .. })),
+        "{err}"
+    );
+    assert!(!err.to_string().contains("SECRET"), "{err}");
+    assert!(
+        store.has_blob(&m.config.digest),
+        "the config was fetched without a redirect"
+    );
+    assert!(!store.has_blob(&layer_digest));
+    assert_eq!(
+        layer_requests(&reg, &layer_digest),
+        1,
+        "one GET, answered with the redirect"
+    );
+    assert_eq!(store.get_ref("a").unwrap(), None);
+}
