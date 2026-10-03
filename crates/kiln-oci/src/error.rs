@@ -5,6 +5,8 @@ use thiserror::Error;
 pub enum OciError {
     #[error(transparent)]
     Store(#[from] kiln_store::StoreError),
+    #[error(transparent)]
+    Registry(#[from] kiln_registry::RegistryError),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid {what}: {source}")]

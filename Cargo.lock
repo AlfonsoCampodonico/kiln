@@ -882,6 +882,7 @@ name = "kiln-oci"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "kiln-registry",
  "kiln-store",
  "serde",
  "serde_json",
