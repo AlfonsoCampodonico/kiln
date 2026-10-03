@@ -1,0 +1,36 @@
+name: dockerhub
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+jobs:
+  dockerhub:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Docker Hub credentials in a temporary Docker config
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/docker-config"
+          mkdir -p "$dir"
+          umask 077
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            auth=$(printf '%s:%s' "$DOCKERHUB_USERNAME" "$DOCKERHUB_TOKEN" | base64 | tr -d '\n')
+            printf '{"auths":{"https://index.docker.io/v1/":{"auth":"%s"}}}' "$auth" > "$dir/config.json"
+          else
+            echo "::warning::DOCKERHUB_USERNAME or DOCKERHUB_TOKEN is not set; pulling anonymously"
+            echo '{}' > "$dir/config.json"
+          fi
+          echo "DOCKER_CONFIG=$dir" >> "$GITHUB_ENV"
+      - run: cargo test --release -p kiln-image --test dockerhub
+        env:
+          KILN_TEST_DOCKERHUB: "1"
