@@ -123,8 +123,16 @@ impl DockerConfig {
         if bytes.len() as u64 > MAX_CONFIG {
             return Err(bad("larger than 1 MiB".into()));
         }
-        // serde_json's message names a line and column, never the content.
-        let file = serde_json::from_slice(&bytes).map_err(|e| bad(e.to_string()))?;
+        // serde_json's own message can quote a string value (a secret) on a type
+        // mismatch, so only the category and position are reported.
+        let file = serde_json::from_slice(&bytes).map_err(|e| {
+            bad(format!(
+                "invalid JSON ({:?}) at line {} column {}",
+                e.classify(),
+                e.line(),
+                e.column()
+            ))
+        })?;
         Ok(Some((path, file)))
     }
 
@@ -201,7 +209,14 @@ impl DockerConfig {
         if out.stdout.len() as u64 > MAX_CONFIG {
             return Err(fail("output larger than 1 MiB".into()));
         }
-        let o: HelperOutput = serde_json::from_slice(&out.stdout).map_err(|e| fail(format!("invalid output: {e}")))?;
+        let o: HelperOutput = serde_json::from_slice(&out.stdout).map_err(|e| {
+            fail(format!(
+                "invalid output (JSON {:?}) at line {} column {}",
+                e.classify(),
+                e.line(),
+                e.column()
+            ))
+        })?;
         Ok(Some(if o.username == "<token>" {
             Credential::IdentityToken(o.secret)
         } else {
@@ -369,7 +384,31 @@ mod tests {
             Err(RegistryError::CredentialHelper { .. })
         ));
         let (_d, evil) = config(r#"{"credsStore":"../../bin/sh"}"#);
-        assert!(evil.credential("docker.io").is_err());
+        assert!(
+            matches!(evil.credential("docker.io"), Err(RegistryError::CredentialHelper { reason, .. }) if reason.contains("invalid helper name"))
+        );
+    }
+
+    #[test]
+    fn json_errors_never_quote_values() {
+        let (_d, c) = config(r#"{"auths":{"ghcr.io":"c2VjcmV0LXZhbHVl"}}"#);
+        let err = c.credential("ghcr.io").unwrap_err().to_string();
+        assert!(
+            err.contains("docker config") && !err.contains("c2VjcmV0LXZhbHVl"),
+            "{err}"
+        );
+        let bin = tempfile::tempdir().unwrap();
+        helper(bin.path(), "bare", r#"printf '"ghp_supersecrettoken"'"#);
+        let (_d, c) = config(r#"{"credsStore":"bare"}"#);
+        let err = c
+            .with_helper_path(bin.path())
+            .credential("docker.io")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("docker-credential-bare") && !err.contains("ghp_supersecrettoken"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -377,9 +416,9 @@ mod tests {
         let s = format!(
             "{:?} {:?}",
             basic("u", "hunter2").unwrap(),
-            Credential::IdentityToken("tok".into())
+            Credential::IdentityToken("idtok-9f3a7c".into())
         );
-        assert!(!s.contains("hunter2") && !s.contains("tok)"), "{s}");
+        assert!(!s.contains("hunter2") && !s.contains("idtok-9f3a7c"), "{s}");
     }
 
     #[test]
