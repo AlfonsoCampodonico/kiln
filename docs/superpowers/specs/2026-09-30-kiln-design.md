@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.4: 2026-10-02)
-**Status:** Draft rev 2.4, awaiting review
+**Date:** 2026-09-30 (rev 2.5: 2026-10-03)
+**Status:** Draft rev 2.5, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:** `../../../../ROADMAP.md` (projects #1 snapshot registry and #2 agent sandbox)
 
@@ -30,6 +30,14 @@
   - `deny-all` honours `allow`;
   - pasta's version floor is documented rather than checked.
 
+- **rev 2.5 (2026-10-03):** §4.2 aligned with the validated M1b-2 plan:
+  - T2's exception means the same address class as the registry's own addresses;
+  - token realms and upload locations get the same destination check as redirects;
+  - credentials go only to the registry's own origin;
+  - proxies are not used;
+  - plain HTTP is allowed only for loopback registries;
+  - `pull` fetches every platform of a kiln image;
+  - registry inputs are tagged and looked up by their normalised reference.
 ---
 
 ## 1. Goals
@@ -168,7 +176,7 @@ VMM-neutral VM lifecycle, sandboxing, networking and kernel profiles.
 | Crate | Responsibility | Depends on |
 |---|---|---|
 | `kiln-store` | Content-addressed blob store, layer caches, refs index, store lock, GC, artifact fetch by pinned digest. | — |
-| `kiln-registry` | Minimal OCI distribution client: bearer and basic token auth, `~/.docker/config.json` including `credsStore`/`credHelpers` (exec `docker-credential-*`), HEAD/GET of manifests and indexes, verified blob GET, monolithic blob PUT, manifest PUT. Enforces T2: descriptor `urls` are never fetched; redirects are HTTPS-only, at most 5, and never to loopback, link-local, private or CGNAT destinations (checked after DNS resolution) unless the configured registry host is itself in such a range. Query strings and userinfo are redacted from errors. | `reqwest`, `kiln-store` |
+| `kiln-registry` | Minimal OCI distribution client: bearer and basic token auth, `~/.docker/config.json` including `credsStore`/`credHelpers` (exec `docker-credential-*`), HEAD/GET of manifests and indexes, verified blob GET, monolithic blob PUT, manifest PUT. Enforces T2:<ul><li>Descriptor `urls` are never fetched.</li><li>Redirects are HTTPS-only (plain HTTP only from a loopback registry to loopback) and at most 5.</li><li>Redirects never go to loopback, link-local, private, CGNAT, multicast or reserved destinations, unless that address class is one the configured registry host itself resolves to (so a loopback registry may redirect to loopback, never to link-local). The check runs after DNS resolution, and connections are pinned to the checked addresses.</li><li>Token realms and upload `Location`s get the same check.</li><li>Credentials are sent only to the registry's own origin, never to a redirect target such as a CDN.</li><li>Proxies are not used, since a proxy would resolve names outside the check.</li><li>Plain HTTP is used only for loopback registries.</li></ul>Query strings, userinfo and tokens are redacted from errors. | `reqwest`, `kiln-store` |
 | `kiln-oci` | Resolve references and platforms; read OCI image layouts and `docker save` archives, hashing every file (filenames and `manifest.json` are never trusted). | `kiln-registry`, `kiln-store` |
 | `kiln-erofs` | erofs **writer** (tar stream → erofs) and **reader** (lookup, readdir, attributes, file data). Implements the erofs profile in §7 and the layer semantics in §7.4. Pure `Read`/`Write + Seek`. | — |
 | `kiln-init` | Static musl PID 1 for the guest, including the guest side of the control protocol. | — (guest only) |
