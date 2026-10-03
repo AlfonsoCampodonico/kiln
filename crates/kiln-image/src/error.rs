@@ -37,6 +37,8 @@ pub enum ImageError {
     UnknownSchema(u32),
     #[error("{0} is not a kiln image (use `kiln convert` for OCI images)")]
     NotKilnRemote(String),
+    #[error("{0} is a kiln image, not an OCI image to convert (use `kiln pull` to fetch it)")]
+    KilnRemote(String),
     #[error("no image named {0:?}")]
     RefNotFound(String),
     #[error("invalid option: {0}")]
