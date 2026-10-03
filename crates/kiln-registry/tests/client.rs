@@ -427,3 +427,68 @@ fn pushes_authenticate_for_the_push_scope() {
     assert!(c.push_blob("out", &img.layer, &path).unwrap());
     assert!(reg.has_blob(&img.layer));
 }
+
+#[test]
+fn a_token_realm_at_a_refused_destination_is_refused() {
+    let img = image();
+    let reg = serve(
+        &img,
+        Config {
+            bearer: Some(Bearer::default()),
+            bearer_realm: Some("https://169.254.169.254/token?sig=SECRET".into()),
+            ..Default::default()
+        },
+    );
+    let err = anonymous(&reg).get_manifest("r", "v1").unwrap_err();
+    assert!(matches!(err, RegistryError::Refused { .. }), "{err}");
+    assert!(!err.to_string().contains("SECRET"), "{err}");
+    assert_eq!(reg.requests("/token"), 0);
+}
+
+#[test]
+fn an_upload_location_at_a_refused_destination_is_refused() {
+    let img = image();
+    let path = img.dir.path().join("blobs/sha256").join(img.layer.hex());
+    for location in [
+        "https://169.254.169.254/v2/out/blobs/uploads/1?sig=SECRET",
+        "http://example.com/v2/out/blobs/uploads/1?sig=SECRET",
+        "https://user:SECRET@example.com/up",
+    ] {
+        let reg = TestRegistry::start(Config {
+            upload_location: Some(location.into()),
+            ..Default::default()
+        });
+        let err = anonymous(&reg).push_blob("out", &img.layer, &path).unwrap_err();
+        assert!(matches!(err, RegistryError::Refused { .. }), "{location}: {err}");
+        assert!(!err.to_string().contains("SECRET"), "{err}");
+        assert!(!reg.has_blob(&img.layer));
+        assert_eq!(reg.log().iter().filter(|l| l.method == "PUT").count(), 0);
+    }
+}
+
+#[test]
+fn a_content_type_that_disagrees_with_the_document_is_refused() {
+    let img = image();
+    let reg = serve(&img, Config::default());
+    let manifest = serde_json::to_vec(&json!({"schemaVersion": 2, "mediaType": OCI_MANIFEST, "layers": []})).unwrap();
+    reg.put_manifest("lying", OCI_INDEX, &manifest);
+    let err = anonymous(&reg).get_manifest("r", "lying").unwrap_err();
+    assert!(matches!(err, RegistryError::BadResponse { .. }), "{err}");
+    // The same bytes served under their own type are fine.
+    reg.put_manifest("honest", OCI_MANIFEST, &manifest);
+    assert_eq!(
+        anonymous(&reg).get_manifest("r", "honest").unwrap().media_type,
+        OCI_MANIFEST
+    );
+}
+
+#[test]
+fn a_document_that_is_both_an_index_and_a_manifest_is_refused() {
+    let img = image();
+    let reg = serve(&img, Config::default());
+    let both = serde_json::to_vec(&json!({"schemaVersion": 2, "manifests": [], "layers": []})).unwrap();
+    reg.put_manifest("both", OCI_INDEX, &both);
+    let err = anonymous(&reg).get_manifest("r", "both").unwrap_err();
+    assert!(matches!(err, RegistryError::BadResponse { .. }), "{err}");
+    assert!(err.to_string().contains("both manifests and layers"), "{err}");
+}

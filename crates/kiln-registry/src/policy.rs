@@ -54,6 +54,10 @@ impl AddrClass {
             Self::Cgnat
         } else if a == 0 {
             Self::Unspecified
+        } else if ip.octets()[..3] == [192, 0, 0] {
+            // 192.0.0.0/24 (IETF protocol assignments), which holds Oracle Cloud's
+            // legacy metadata address 192.0.0.192.
+            Self::Reserved
         } else if ip.is_multicast() || a >= 240 {
             Self::Reserved
         } else {
@@ -65,6 +69,13 @@ impl AddrClass {
         // IPv4-mapped (::ffff:a.b.c.d) and NAT64 (64:ff9b::a.b.c.d) addresses reach
         // the embedded IPv4 address.
         if let Some(v4) = ip.to_ipv4_mapped() {
+            return Self::of_v4(v4);
+        }
+        // IPv4-compatible (::a.b.c.d), except `::` and `::1`, which are their own classes.
+        if !ip.is_unspecified()
+            && !ip.is_loopback()
+            && let Some(v4) = ip.to_ipv4()
+        {
             return Self::of_v4(v4);
         }
         let s = ip.segments();
@@ -246,6 +257,10 @@ mod tests {
             ("100.128.0.1", AddrClass::Public),
             ("0.0.0.0", AddrClass::Unspecified),
             ("0.1.2.3", AddrClass::Unspecified),
+            ("192.0.0.192", AddrClass::Reserved),
+            ("192.0.0.0", AddrClass::Reserved),
+            ("192.0.1.1", AddrClass::Public),
+            ("192.0.2.1", AddrClass::Public),
             ("224.0.0.1", AddrClass::Reserved),
             ("255.255.255.255", AddrClass::Reserved),
             ("::1", AddrClass::Loopback),
@@ -259,6 +274,10 @@ mod tests {
             ("::ffff:10.0.0.1", AddrClass::Private),
             ("64:ff9b::a9fe:a9fe", AddrClass::LinkLocal),
             ("64:ff9b::808:808", AddrClass::Public),
+            ("::a9fe:a9fe", AddrClass::LinkLocal),
+            ("::10.0.0.1", AddrClass::Private),
+            ("::c000:c0", AddrClass::Reserved),
+            ("::808:808", AddrClass::Public),
         ] {
             assert_eq!(AddrClass::of(ip(addr)), class, "{addr}");
         }
@@ -269,7 +288,15 @@ mod tests {
         let loopback = Policy::new(&[ip("127.0.0.1")], true);
         assert!(loopback.check_addrs("h", &[ip("127.0.0.2"), ip("::1")]).is_ok());
         assert!(loopback.check_addrs("h", &[ip("1.1.1.1")]).is_ok());
-        for bad in ["169.254.169.254", "10.0.0.1", "100.64.0.1", "0.0.0.0", "fe80::1"] {
+        for bad in [
+            "169.254.169.254",
+            "10.0.0.1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "fe80::1",
+            "192.0.0.192",
+            "::a9fe:a9fe",
+        ] {
             assert!(loopback.check_addrs("h", &[ip(bad)]).is_err(), "{bad}");
         }
         let public = Policy::new(&[ip("104.16.0.1")], false);

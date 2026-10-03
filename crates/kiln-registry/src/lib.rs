@@ -5,6 +5,8 @@
 //!   redirects, token realms and upload locations must be https and must not lead
 //!   to loopback, link-local, private, CGNAT or unspecified addresses unless the
 //!   registry itself is in that class (T2).
+//! - Credentials go only to the registry's own origin and to the token realm the
+//!   registry names (the token protocol requires it), never to redirect targets.
 //! - Errors carry redacted URLs and never credentials or tokens (spec §13).
 #![forbid(unsafe_code)]
 

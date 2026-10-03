@@ -5,7 +5,7 @@
 //! ref names) are visible in every repository. Knobs add auth, blob redirects, a
 //! corrupted digest and a lying digest header.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
@@ -41,6 +41,10 @@ pub struct Config {
     pub corrupt: Option<Digest>,
     /// Send a `Docker-Content-Digest` header that does not match.
     pub wrong_digest_header: bool,
+    /// The realm in bearer challenges (the registry's own `/token` if `None`).
+    pub bearer_realm: Option<String>,
+    /// The `Location` of started blob uploads (the registry's own if `None`).
+    pub upload_location: Option<String>,
 }
 
 /// One request the registry saw.
@@ -64,7 +68,8 @@ struct State {
     addr: SocketAddr,
     content: Mutex<Content>,
     log: Mutex<Vec<Logged>>,
-    tokens: Mutex<HashSet<String>>,
+    /// Issued tokens and the scope each was issued for.
+    tokens: Mutex<HashMap<String, String>>,
     next_id: AtomicU64,
     stop: AtomicBool,
 }
@@ -332,6 +337,16 @@ fn route(s: &State, req: &Request) -> Reply {
     Reply::error(404, "NOT_FOUND")
 }
 
+/// Whether a token issued for `scope` may make this request: reads need `pull`,
+/// everything else `pull,push`, both on the request's own repository.
+fn scope_allows(scope: &str, repo: &str, method: &str) -> bool {
+    if repo.is_empty() {
+        return true;
+    }
+    let read = matches!(method, "GET" | "HEAD");
+    scope == format!("repository:{repo}:pull,push") || (read && scope == format!("repository:{repo}:pull"))
+}
+
 fn authorize(s: &State, req: &Request, repo: &str) -> Option<Reply> {
     if let Some((u, p)) = &s.config.basic
         && !basic_matches(req, u, p)
@@ -343,12 +358,15 @@ fn authorize(s: &State, req: &Request, repo: &str) -> Option<Reply> {
             .headers
             .get("authorization")
             .and_then(|a| a.strip_prefix("Bearer "))
-            .is_some_and(|t| s.tokens.lock().unwrap().contains(t));
+            .and_then(|t| s.tokens.lock().unwrap().get(t).cloned())
+            .is_some_and(|scope| scope_allows(&scope, repo, &req.method));
         if !ok {
-            let challenge = format!(
-                r#"Bearer realm="http://{}/token",service="kiln-test",scope="repository:{repo}:pull""#,
-                s.addr
-            );
+            let realm = s
+                .config
+                .bearer_realm
+                .clone()
+                .unwrap_or_else(|| format!("http://{}/token", s.addr));
+            let challenge = format!(r#"Bearer realm="{realm}",service="kiln-test",scope="repository:{repo}:pull""#);
             return Some(Reply::error(401, "UNAUTHORIZED").header("WWW-Authenticate", challenge));
         }
     }
@@ -359,9 +377,9 @@ fn token(s: &State, req: &Request) -> Reply {
     let Some(bearer) = &s.config.bearer else {
         return Reply::error(404, "NOT_FOUND");
     };
-    let issue = |field: &str| {
+    let issue = |field: &str, scope: String| {
         let t = format!("tok-{}", s.next_id.fetch_add(1, Ordering::SeqCst));
-        s.tokens.lock().unwrap().insert(t.clone());
+        s.tokens.lock().unwrap().insert(t.clone(), scope);
         Reply::new(200)
             .header("Content-Type", "application/json")
             .body(format!(r#"{{"{field}":"{t}","expires_in":300}}"#))
@@ -369,7 +387,13 @@ fn token(s: &State, req: &Request) -> Reply {
     match req.method.as_str() {
         "GET" => match &bearer.credentials {
             Some((u, p)) if !basic_matches(req, u, p) => Reply::error(401, "UNAUTHORIZED"),
-            _ => issue("token"),
+            _ => {
+                let scope = url::form_urlencoded::parse(req.query.as_bytes())
+                    .find(|(k, _)| k == "scope")
+                    .map(|(_, v)| v.into_owned())
+                    .unwrap_or_default();
+                issue("token", scope)
+            }
         },
         "POST" => {
             let form: HashMap<String, String> = url::form_urlencoded::parse(&req.body).into_owned().collect();
@@ -377,7 +401,7 @@ fn token(s: &State, req: &Request) -> Reply {
                 && bearer.refresh_token.is_some()
                 && form.get("refresh_token") == bearer.refresh_token.as_ref();
             if ok {
-                issue("access_token")
+                issue("access_token", form.get("scope").cloned().unwrap_or_default())
             } else {
                 Reply::error(401, "UNAUTHORIZED")
             }
@@ -460,7 +484,12 @@ fn blob_upload(s: &State, req: &Request, repo: &str, upload: &str) -> Reply {
     match (req.method.as_str(), upload) {
         ("POST", "") => {
             let id = s.next_id.fetch_add(1, Ordering::SeqCst);
-            Reply::new(202).header("Location", format!("/v2/{repo}/blobs/uploads/{id}?_state=s{id}"))
+            let location = s
+                .config
+                .upload_location
+                .clone()
+                .unwrap_or_else(|| format!("/v2/{repo}/blobs/uploads/{id}?_state=s{id}"));
+            Reply::new(202).header("Location", location)
         }
         ("PUT", _) => {
             let digest = url::form_urlencoded::parse(req.query.as_bytes())
