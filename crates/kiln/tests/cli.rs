@@ -427,21 +427,81 @@ fn registry_credentials_come_from_a_credential_helper_on_path() {
             .iter()
             .any(|l| l.authorization.as_deref() == Some(basic.as_str()))
     );
+    // Neither the failed nor the successful run printed the password.
+    assert!(!stderr.contains("hunter2"));
+    let plain: &[&str] = &["convert", "--platform", "linux/arm64", source.as_str()];
+    let json: &[&str] = &["convert", "--json", "--platform", "linux/arm64", source.as_str()];
+    for args in [plain, json] {
+        let out = kiln(home.path())
+            .env("DOCKER_CONFIG", config.path())
+            .env(
+                "PATH",
+                format!("{}:{}", bin.path().display(), std::env::var("PATH").unwrap_or_default()),
+            )
+            .args(args)
+            .output()
+            .unwrap();
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success() && !all.contains("hunter2"), "{all}");
+    }
 }
 
 #[test]
 fn a_source_that_is_neither_a_path_nor_a_reference_is_explained() {
     let home = tempfile::tempdir().unwrap();
     kiln(home.path())
-        .args(["convert", "./no/such/Dir"])
+        .args(["convert", "Not A Reference!"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "./no/such/Dir is not an existing path or a valid image reference",
+            "Not A Reference! is not an existing path or a valid image reference",
         ));
     kiln(home.path())
         .args(["convert", "--ref", "x", "localhost:1/app:v1"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--ref selects an image inside a local source"));
+    // A rejected invocation creates nothing.
+    assert!(!home.path().join("refs.json").exists());
+}
+
+#[test]
+fn a_source_spelled_like_a_path_is_never_looked_up_in_a_registry() {
+    let home = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    for src in [
+        "app.tar",
+        "build/app.tar",
+        "app.tar.gz",
+        "app.tgz",
+        "./nope",
+        "../nope",
+        "/no/such/nope",
+        "~/nope",
+    ] {
+        kiln(home.path())
+            .env("DOCKER_CONFIG", empty.path())
+            .args(["convert", src])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!("{src}: no such file or directory")));
+    }
+    // Nothing was created: the store was never opened.
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_failed_registry_convert_says_there_was_no_local_path_either() {
+    let home = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    kiln(home.path())
+        .env("DOCKER_CONFIG", empty.path())
+        .args(["convert", "localhost:1/app:v1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("(no such local path either)"));
 }

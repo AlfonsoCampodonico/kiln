@@ -69,6 +69,11 @@ impl ConvertArgs {
 enum Cmd {
     /// Convert an image: a local OCI layout directory or `docker save` archive,
     /// or else a registry reference such as `php:8.4-cli`.
+    ///
+    /// An existing local path always wins over a reference of the same name;
+    /// write the full reference (`docker.io/library/php`) to force the registry.
+    /// A source that starts with `./`, `../`, `/` or `~`, or ends in `.tar`,
+    /// `.tar.gz` or `.tgz`, is always a path and is never looked up in a registry.
     Convert {
         #[arg(value_name = "PATH|REF")]
         source: String,
@@ -147,15 +152,63 @@ fn open_store(cli: &Cli) -> Result<Store> {
 /// A registry reference, and a client for its registry with the Docker config's credentials.
 fn registry(reference: &str) -> Result<(Reference, Client)> {
     let r = Reference::parse(reference)?;
-    let c = Client::new(r.registry(), DockerConfig::from_env())?;
+    let c = client_for(&r)?;
     Ok((r, c))
+}
+
+fn client_for(r: &Reference) -> Result<Client> {
+    Ok(Client::new(r.registry(), DockerConfig::from_env())?)
 }
 
 /// The tag for a registry image: `--tag`, else the normalised reference.
 fn reference_tag(tag: Option<&str>, r: &Reference) -> Result<String> {
-    let tag = tag.map_or_else(|| r.to_string(), str::to_string);
-    kiln_store::check_ref_name(&tag).with_context(|| format!("invalid tag {}; pass --tag", clean_line(&tag)))?;
-    Ok(tag)
+    match tag {
+        Some(t) => {
+            kiln_store::check_ref_name(t).context("invalid --tag")?;
+            Ok(t.to_string())
+        }
+        None => {
+            let t = r.to_string();
+            kiln_store::check_ref_name(&t).context("cannot use the reference as a local name; pass --tag")?;
+            Ok(t)
+        }
+    }
+}
+
+/// Whether a source is spelled like a path, so that it is never taken for a registry reference.
+fn looks_like_path(source: &str) -> bool {
+    ["./", "../", "/", "~"].iter().any(|p| source.starts_with(p))
+        || [".tar", ".tar.gz", ".tgz"].iter().any(|s| source.ends_with(s))
+}
+
+/// What `kiln convert` was asked to convert, decided before anything is created.
+enum Source<'a> {
+    Local(&'a Path),
+    Registry(Reference, Box<Client>),
+}
+
+fn classify_source<'a>(source: &'a str, source_ref: Option<&str>) -> Result<Source<'a>> {
+    let path = Path::new(source);
+    if path
+        .try_exists()
+        .with_context(|| format!("cannot access {}", clean_line(source)))?
+    {
+        return Ok(Source::Local(path));
+    }
+    if looks_like_path(source) {
+        bail!("{}: no such file or directory", clean_line(source));
+    }
+    if source_ref.is_some() {
+        bail!("--ref selects an image inside a local source; it does not apply to registry references");
+    }
+    let r = Reference::parse(source).with_context(|| {
+        format!(
+            "{} is not an existing path or a valid image reference",
+            clean_line(source)
+        )
+    })?;
+    let c = client_for(&r)?;
+    Ok(Source::Registry(r, Box::new(c)))
 }
 
 fn default_tag(path: &Path) -> Result<String> {
@@ -219,37 +272,37 @@ fn run(cli: Cli) -> Result<()> {
             args,
             json,
         } => {
-            let store = open_store(&cli)?;
             let platforms = args.platforms()?;
-            let path = Path::new(source);
-            let (out, tag) = if path.exists() {
-                let tag = match tag {
-                    Some(t) => t.clone(),
-                    None => default_tag(path)?,
-                };
-                kiln_store::check_ref_name(&tag).with_context(|| format!("invalid --tag {}", clean_line(&tag)))?;
-                let req = LocalRequest {
-                    source_ref: source_ref.as_deref(),
-                    platforms: &platforms,
-                    tag: Some(&tag),
-                };
-                (convert_local(&store, path, &req, &args.options())?, tag)
-            } else {
-                if source_ref.is_some() {
-                    bail!("--ref selects an image inside a local source; it does not apply to registry references");
+            let source = classify_source(source, source_ref.as_deref())?;
+            let tag = match &source {
+                Source::Local(path) => {
+                    let tag = match tag {
+                        Some(t) => t.clone(),
+                        None => default_tag(path)?,
+                    };
+                    kiln_store::check_ref_name(&tag).with_context(|| format!("invalid --tag {}", clean_line(&tag)))?;
+                    tag
                 }
-                let (r, client) = registry(source).with_context(|| {
-                    format!(
-                        "{} is not an existing path or a valid image reference",
-                        clean_line(source)
-                    )
-                })?;
-                let tag = reference_tag(tag.as_deref(), &r)?;
-                let req = RegistryRequest {
-                    platforms: &platforms,
-                    tag: Some(&tag),
-                };
-                (convert_registry(&store, &client, &r, &req, &args.options())?, tag)
+                Source::Registry(r, _) => reference_tag(tag.as_deref(), r)?,
+            };
+            let store = open_store(&cli)?;
+            let out = match &source {
+                Source::Local(path) => {
+                    let req = LocalRequest {
+                        source_ref: source_ref.as_deref(),
+                        platforms: &platforms,
+                        tag: Some(&tag),
+                    };
+                    convert_local(&store, path, &req, &args.options())?
+                }
+                Source::Registry(r, client) => {
+                    let req = RegistryRequest {
+                        platforms: &platforms,
+                        tag: Some(&tag),
+                    };
+                    convert_registry(&store, client, r, &req, &args.options())
+                        .with_context(|| format!("{} (no such local path either)", clean_line(&r.to_string())))?
+                }
             };
             if *json {
                 println!("{}", serde_json::to_string_pretty(&convert_summary(&out, &tag))?);
