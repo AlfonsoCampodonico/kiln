@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.5: 2026-10-03)
-**Status:** Draft rev 2.5, awaiting review
+**Date:** 2026-09-30 (rev 2.6: 2026-10-03)
+**Status:** Draft rev 2.6, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:** `../../../../ROADMAP.md` (projects #1 snapshot registry and #2 agent sandbox)
 
@@ -40,6 +40,12 @@
   - plain HTTP is allowed only for loopback registries;
   - `pull` fetches every platform of a kiln image;
   - registry inputs are tagged and looked up by their normalised reference.
+- **rev 2.6 (2026-10-03):** §9.4, §9.5, §9.6 and §14 aligned with the validated M3a plan:
+  - vsock endpoints follow vmkit's `<vsock socket>_<port>`;
+  - the supervision order kills and reaps the other processes before draining stdio;
+  - stop signals are limited to 1–31;
+  - the ext4 template lives in the crate that embeds it;
+  - Cloud Hypervisor 53 cannot grow the scratch disk online beyond about 8 GiB.
 ---
 
 ## 1. Goals
@@ -187,7 +193,7 @@ VMM-neutral VM lifecycle, sandboxing, networking and kernel profiles.
 | `kiln` (bin) | CLI: `convert`, `build`, `pull`, `push`, `import`, `run`, `inspect`, `ls`, `gc`, `bench`. | all of the above, `vmkit` |
 
 Other repo contents:
-- `assets/ext4-template.img.zst` with its reproducible generation script (§9.4).
+- `assets/make-ext4-template.sh`, the reproducible generation script for `crates/kiln-image/assets/ext4-template.img.zst` (§9.4).
 - `lima/kiln.yaml` (§10).
 - `tools/oracle/`: a Go test helper wrapping containerd's `archive.Apply` (§11.2).
 - `xtask/`.
@@ -519,7 +525,7 @@ Inside the VM's own net namespace:
 
 ### 9.4 Scratch disk and `--persist`
 
-- **Template.** `assets/ext4-template.img.zst` is created by a committed script with pinned e2fsprogs:
+- **Template.** `crates/kiln-image/assets/ext4-template.img.zst` is created by the committed script `assets/make-ext4-template.sh` with pinned e2fsprogs:
   - `mke2fs -t ext4 -b 4096 -I 256 -i 65536 -O meta_bg,^resize_inode -U <fixed> -E hash_seed=<fixed>`, 64 MiB.
   - The template is committed and embedded in `kiln` (a few KB compressed), so no `mkfs` is needed anywhere.
 - **Per run:** the template is decompressed to a sparse file in the run dir and extended to `--disk` (default 4 GiB).
@@ -532,7 +538,7 @@ Inside the VM's own net namespace:
 
 ### 9.5 Control protocol (`kiln-proto`, normative in `docs/format.md`, T9)
 
-**Transport:** hybrid vsock. The guest connects to host CID 2. The VMM maps guest port `P` to the host UDS `/vm/sock/v.sock_P`, which is `<run-dir>/v.sock_P` on the host.
+**Transport:** hybrid vsock. The guest connects to host CID 2. The VMM maps guest port `P` to the host Unix socket `<vsock socket>_P`, where `<vsock socket>` is the path vmkit reports for the VM (`Vm::vsock_socket()`); kiln listens on each port's socket before boot.
 
 | Port | Stream | Direction |
 |---|---|---|
@@ -595,7 +601,8 @@ Each stage reports `Stage { n }`. A failure reports `InitFailed` when the contro
 7. **Supervise:**
    - Reap all children.
    - Handle `Shutdown`, `Signal` and `WindowSize`. SIGINT (from Ctrl-Alt-Del) is treated as `Shutdown`.
-   - When the main process exits: drain stdout and stderr to EOF, send `Exited`, SIGKILL any remaining processes, `syncfs`, remount the upper read-only on a best-effort basis (EBUSY ignored), and exit via `exitMethod`.
+   - When the main process exits: SIGKILL and reap every remaining process, drain stdout and stderr to EOF, send `Exited`, `syncfs`, remount the scratch disk read-only on a best-effort basis (EBUSY ignored), and exit via `exitMethod`. Killing the rest before draining matches Docker (a container ends with its PID 1) and keeps a background process that holds stdout from blocking the drain forever.
+   - Stop signals and forwarded signals are numbers 1–31; images whose `STOPSIGNAL` is a real-time signal are refused with an error.
 
 ### 9.7 `kiln run`
 
@@ -733,7 +740,7 @@ Each item has a defined fallback, so none blocks the design.
 | Cloud Hypervisor's vsock uses the same `<uds>_<port>` hybrid scheme as Firecracker for guest-initiated connections. | M2 | A per-driver port-to-path mapping inside `vmkit`. |
 | Cloud Hypervisor exits on guest power-off on both arches (ACPI S5 on x86_64, PSCI SYSTEM_OFF on aarch64). Source-level reading suggests yes. | M2 | Treat a guest halt detected by the event monitor as the end of the VM. |
 | Cloud Hypervisor aarch64 works under Lima nested virtualization on Apple Silicon (GIC/ITS). | M2 | Local aarch64 development is Firecracker-only. Cloud Hypervisor aarch64 is tested on the bare-metal runner. |
-| The ext4 template with the §9.4 parameters grows online to ≥ 64 GiB. | M3 | Several template sizes embedded, picking the nearest. |
+| The ext4 template with the §9.4 parameters grows online to ≥ 64 GiB. | M3 | Several template sizes embedded, picking the nearest. **Result (M3a):** true on Firecracker. On Cloud Hypervisor 53 under nested virtualization, growth past about 8 GiB hangs: CH advertises WRITE_ZEROES without a sparse backend. The default 4 GiB disk works on both; re-check on newer CH and bare metal. |
 | Crate names `kiln-*` and `vmkit` are free on crates.io. | M1 | Rename before first publish. |
 
 ---
