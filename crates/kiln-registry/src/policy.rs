@@ -2,8 +2,11 @@
 //!
 //! Every connection the client makes goes through [`CheckedResolver`], which refuses
 //! a host when any of its addresses is loopback, link-local, private, CGNAT,
-//! unspecified or reserved, unless the configured registry's own addresses are in
-//! that same class. The connection then uses exactly the addresses that were
+//! unspecified or reserved. The registry's own host may use the classes its
+//! addresses were in when the client was made; any other host (a redirect, token
+//! realm or upload location the registry handed out) may use a non-public class
+//! only when the registry has no public address at all, and then only the
+//! registry's classes. The connection then uses exactly the addresses that were
 //! checked, so DNS rebinding cannot slip past. Hosts given as IP literals never
 //! reach a resolver, so [`Policy::check_url`] checks them before the request.
 
@@ -30,7 +33,9 @@ pub enum AddrClass {
     Cgnat,
     /// 0.0.0.0/8 and `::`.
     Unspecified,
-    /// Multicast, broadcast and 240.0.0.0/4.
+    /// Multicast, broadcast, 240.0.0.0/4, 192.0.0.0/24, and the IPv6 ranges that
+    /// lead somewhere else: site-local fec0::/10, 6to4 2002::/16 and local-use
+    /// NAT64 64:ff9b:1::/48.
     Reserved,
 }
 
@@ -91,7 +96,14 @@ impl AddrClass {
             Self::LinkLocal
         } else if s[0] & 0xfe00 == 0xfc00 {
             Self::Private
-        } else if ip.is_multicast() {
+        } else if ip.is_multicast()
+            // Site-local (deprecated, but still routed inside some networks).
+            || s[0] & 0xffc0 == 0xfec0
+            // 6to4: the embedded IPv4 address is reached through a relay.
+            || s[0] == 0x2002
+            // Local-use NAT64 (RFC 8215): translated to an address of the operator's choosing.
+            || s[..3] == [0x64, 0xff9b, 1]
+        {
             Self::Reserved
         } else {
             Self::Public
@@ -129,28 +141,47 @@ impl std::error::Error for Refusal {}
 /// The destinations one registry client may contact.
 #[derive(Debug, Clone)]
 pub(crate) struct Policy {
-    /// Non-public classes allowed because the registry itself is in them.
+    /// The registry's host (a name or an IP literal, without port).
+    host: String,
+    /// The classes of the registry's own addresses, which its own host may use.
+    own: BTreeSet<AddrClass>,
+    /// Non-public classes other hosts may use: the registry's, but only when it
+    /// has no public address. A public registry that also resolves to a private
+    /// address must not open the private network to every URL it hands out.
     allowed: BTreeSet<AddrClass>,
     /// The registry is spoken to over plain http (it is on loopback).
     plain_http: bool,
 }
 
 impl Policy {
-    pub(crate) fn new(registry_addrs: &[IpAddr], plain_http: bool) -> Self {
+    pub(crate) fn new(host: &str, registry_addrs: &[IpAddr], plain_http: bool) -> Self {
+        let own: BTreeSet<AddrClass> = registry_addrs.iter().map(|&ip| AddrClass::of(ip)).collect();
+        let allowed = if own.contains(&AddrClass::Public) {
+            BTreeSet::new()
+        } else {
+            own.clone()
+        };
         Self {
-            allowed: registry_addrs.iter().map(|&ip| AddrClass::of(ip)).collect(),
+            host: host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase(),
+            own,
+            allowed,
             plain_http,
         }
     }
 
-    /// Refuses `host` if any of its addresses is in a class the registry is not in.
+    /// Refuses `host` if any of its addresses is in a non-public class it may not use.
     pub(crate) fn check_addrs(&self, host: &str, addrs: &[IpAddr]) -> Result<(), Refusal> {
         if addrs.is_empty() {
             return Err(Refusal(format!("{host} has no addresses")));
         }
+        let allowed = if host.eq_ignore_ascii_case(&self.host) {
+            &self.own
+        } else {
+            &self.allowed
+        };
         for &ip in addrs {
             let class = AddrClass::of(ip);
-            if class != AddrClass::Public && !self.allowed.contains(&class) {
+            if class != AddrClass::Public && !allowed.contains(&class) {
                 let ip = ip.to_string();
                 return Err(Refusal(if ip == host {
                     format!("{ip} is a {class} address")
@@ -278,6 +309,15 @@ mod tests {
             ("::10.0.0.1", AddrClass::Private),
             ("::c000:c0", AddrClass::Reserved),
             ("::808:808", AddrClass::Public),
+            ("fec0::1", AddrClass::Reserved),
+            ("feff:ffff::1", AddrClass::Reserved),
+            ("fe7f::1", AddrClass::Public),
+            ("2002:a9fe:a9fe::1", AddrClass::Reserved),
+            ("2002::", AddrClass::Reserved),
+            ("2003::1", AddrClass::Public),
+            ("64:ff9b:1::a9fe:a9fe", AddrClass::Reserved),
+            ("64:ff9b:1:ffff::1", AddrClass::Reserved),
+            ("64:ff9b:2::1", AddrClass::Public),
         ] {
             assert_eq!(AddrClass::of(ip(addr)), class, "{addr}");
         }
@@ -285,7 +325,7 @@ mod tests {
 
     #[test]
     fn a_registry_may_reach_only_its_own_class() {
-        let loopback = Policy::new(&[ip("127.0.0.1")], true);
+        let loopback = Policy::new("registry.example", &[ip("127.0.0.1")], true);
         assert!(loopback.check_addrs("h", &[ip("127.0.0.2"), ip("::1")]).is_ok());
         assert!(loopback.check_addrs("h", &[ip("1.1.1.1")]).is_ok());
         for bad in [
@@ -299,7 +339,7 @@ mod tests {
         ] {
             assert!(loopback.check_addrs("h", &[ip(bad)]).is_err(), "{bad}");
         }
-        let public = Policy::new(&[ip("104.16.0.1")], false);
+        let public = Policy::new("registry.example", &[ip("104.16.0.1")], false);
         assert!(public.check_addrs("h", &[ip("1.1.1.1")]).is_ok());
         // One bad address refuses the whole host.
         let err = public
@@ -307,15 +347,42 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.0, "cdn resolves to 127.0.0.1, a loopback address");
         assert!(public.check_addrs("h", &[]).is_err());
-        let private = Policy::new(&[ip("10.0.0.5")], false);
+        let private = Policy::new("registry.example", &[ip("10.0.0.5")], false);
         assert!(private.check_addrs("h", &[ip("10.9.9.9")]).is_ok());
         assert!(private.check_addrs("h", &[ip("169.254.169.254")]).is_err());
     }
 
     #[test]
+    fn a_registry_with_a_public_address_hands_out_only_public_urls() {
+        // The registry resolves to a public and a private address.
+        let mixed = Policy::new("Registry.Example", &[ip("104.16.0.1"), ip("10.0.0.5")], false);
+        // Its own host still reaches both...
+        assert!(
+            mixed
+                .check_addrs("registry.example", &[ip("104.16.0.1"), ip("10.0.0.5")])
+                .is_ok()
+        );
+        // ...but nothing it hands out may lead into the private network.
+        let err = mixed.check_addrs("cdn.example", &[ip("10.9.9.9")]).unwrap_err();
+        assert_eq!(err.0, "cdn.example resolves to 10.9.9.9, a private address");
+        assert!(mixed.check_addrs("cdn.example", &[ip("1.1.1.1")]).is_ok());
+        let url = |s: &str| Url::parse(s).unwrap();
+        assert!(mixed.check_url(&url("https://10.0.0.5/x")).is_err());
+        // A registry with no public address may hand out its own classes.
+        let private = Policy::new("registry.example", &[ip("10.0.0.5"), ip("fd00::5")], false);
+        assert!(
+            private
+                .check_addrs("cdn.example", &[ip("10.9.9.9"), ip("fd00::9")])
+                .is_ok()
+        );
+        assert!(private.check_url(&url("https://10.9.9.9/x")).is_ok());
+        assert!(private.check_addrs("cdn.example", &[ip("100.64.0.1")]).is_err());
+    }
+
+    #[test]
     fn urls_need_https_except_between_loopback_hosts() {
         let url = |s: &str| Url::parse(s).unwrap();
-        let loopback_http = Policy::new(&[ip("127.0.0.1")], true);
+        let loopback_http = Policy::new("registry.example", &[ip("127.0.0.1")], true);
         assert!(loopback_http.check_url(&url("http://127.0.0.1:9/x")).is_ok());
         assert!(loopback_http.check_url(&url("http://localhost:9/x")).is_ok());
         assert!(loopback_http.check_url(&url("http://[::1]:9/x")).is_ok());
@@ -332,7 +399,7 @@ mod tests {
         ] {
             assert!(loopback_http.check_url(&url(bad)).is_err(), "{bad}");
         }
-        let public = Policy::new(&[ip("104.16.0.1")], false);
+        let public = Policy::new("registry.example", &[ip("104.16.0.1")], false);
         assert!(public.check_url(&url("http://127.0.0.1/x")).is_err());
         assert!(public.check_url(&url("https://127.0.0.1/x")).is_err());
         let err = public
@@ -344,7 +411,7 @@ mod tests {
 
     #[test]
     fn resolved_names_are_checked_and_pinned() {
-        let public = Policy::new(&[ip("104.16.0.1")], false);
+        let public = Policy::new("registry.example", &[ip("104.16.0.1")], false);
         let rebinding = |_: &str| Ok(vec![ip("1.2.3.4"), ip("169.254.169.254")]);
         let err = resolve_checked(&public, "evil.example", rebinding).unwrap_err();
         assert!(err.downcast_ref::<Refusal>().is_some(), "{err}");

@@ -492,3 +492,166 @@ fn a_document_that_is_both_an_index_and_a_manifest_is_refused() {
     assert!(matches!(err, RegistryError::BadResponse { .. }), "{err}");
     assert!(err.to_string().contains("both manifests and layers"), "{err}");
 }
+
+/// Method and path of every request after the first `from`.
+fn requests_since(reg: &TestRegistry, from: usize) -> Vec<(String, String)> {
+    reg.log()[from..]
+        .iter()
+        .map(|l| (l.method.clone(), l.path.clone()))
+        .collect()
+}
+
+#[test]
+fn tags_resolve_with_a_head_and_stored_manifests_are_not_fetched_again() {
+    let img = image();
+    let reg = serve(&img, Config::default());
+    let c = anonymous(&reg);
+    let (_d, s) = store();
+    let tag = "/v2/r/manifests/v1".to_string();
+    let by_digest = format!("/v2/r/manifests/{}", img.manifest);
+    // Cold: HEAD for the digest, then GET by that digest.
+    let m = c.resolve_manifest("r", "v1", &s).unwrap();
+    assert_eq!(
+        (m.digest.clone(), m.media_type.as_str()),
+        (img.manifest.clone(), OCI_MANIFEST)
+    );
+    assert_eq!(
+        requests_since(&reg, 0),
+        vec![("HEAD".into(), tag.clone()), ("GET".into(), by_digest.clone())]
+    );
+    // Warm: the HEAD alone, answered from the store with the same checks.
+    s.put_bytes(&m.bytes).unwrap();
+    let before = reg.log().len();
+    assert_eq!(c.resolve_manifest("r", "v1", &s).unwrap(), m);
+    assert_eq!(requests_since(&reg, before), vec![("HEAD".into(), tag.clone())]);
+    // Digest targets are fetched as before.
+    let before = reg.log().len();
+    assert_eq!(c.resolve_manifest("r", &img.manifest.to_string(), &s).unwrap(), m);
+    assert_eq!(requests_since(&reg, before), vec![("GET".into(), by_digest)]);
+    // A missing tag is not found, without a GET.
+    let before = reg.log().len();
+    assert!(matches!(
+        c.resolve_manifest("r", "nope", &s),
+        Err(RegistryError::NotFound { what: "manifest", .. })
+    ));
+    assert_eq!(
+        requests_since(&reg, before),
+        vec![("HEAD".into(), "/v2/r/manifests/nope".into())]
+    );
+}
+
+#[test]
+fn a_head_without_a_digest_falls_back_to_a_get_by_tag() {
+    let img = image();
+    let reg = serve(
+        &img,
+        Config {
+            head_without_digest: true,
+            ..Default::default()
+        },
+    );
+    let (_d, s) = store();
+    let m = anonymous(&reg).resolve_manifest("r", "v1", &s).unwrap();
+    assert_eq!(m.digest, img.manifest);
+    let tag = "/v2/r/manifests/v1".to_string();
+    assert_eq!(
+        requests_since(&reg, 0),
+        vec![("HEAD".into(), tag.clone()), ("GET".into(), tag)]
+    );
+}
+
+#[test]
+fn a_head_reporting_a_digest_the_bytes_do_not_match_is_an_error() {
+    let img = image();
+    let reg = serve(
+        &img,
+        Config {
+            wrong_digest_header: true,
+            ..Default::default()
+        },
+    );
+    let (_d, s) = store();
+    // The manifest is then fetched by the reported digest, which this registry
+    // does not have: nothing unverified is used.
+    let err = anonymous(&reg).resolve_manifest("r", "v1", &s).unwrap_err();
+    assert!(matches!(err, RegistryError::NotFound { .. }), "{err}");
+    assert!(!s.has_blob(&img.manifest));
+}
+
+#[test]
+fn an_anonymous_401_after_the_token_dance_hints_at_a_missing_repository() {
+    let img = image();
+    let reg = serve(
+        &img,
+        Config {
+            bearer: Some(Bearer {
+                credentials: None,
+                refresh_token: None,
+            }),
+            hidden_repos: vec!["library/nope".into()],
+            ..Default::default()
+        },
+    );
+    let (_d, s) = store();
+    let hint = "the repository may not exist, or it needs `docker login`";
+    for err in [
+        anonymous(&reg).get_manifest("library/nope", "v1").unwrap_err(),
+        anonymous(&reg).resolve_manifest("library/nope", "v1", &s).unwrap_err(),
+    ] {
+        assert!(matches!(err, RegistryError::Unauthorized { status: 401, .. }), "{err}");
+        assert!(err.to_string().contains(hint), "{err}");
+    }
+    assert!(reg.requests("/token") >= 2, "a token was fetched before giving up");
+    // With credentials, a 401 is just an authentication failure.
+    let (_c, creds) = docker_config(json!({"auths": {reg.host(): {"auth": auth("bob", "pw")}}}));
+    let err = client(&reg, creds).get_manifest("library/nope", "v1").unwrap_err();
+    assert!(
+        matches!(err, RegistryError::Unauthorized { .. }) && !err.to_string().contains(hint),
+        "{err}"
+    );
+    // Other repositories are served.
+    assert_eq!(anonymous(&reg).get_manifest("r", "v1").unwrap().digest, img.manifest);
+}
+
+#[test]
+fn a_revoked_token_is_replaced_once_and_the_request_succeeds() {
+    let img = image();
+    let reg = serve(
+        &img,
+        Config {
+            bearer: Some(Bearer::default()),
+            ..Default::default()
+        },
+    );
+    let c = anonymous(&reg);
+    c.get_manifest("r", "v1").unwrap();
+    assert_eq!(reg.requests("/token"), 1);
+    reg.revoke_tokens();
+    let before = reg.log().len();
+    assert_eq!(c.get_manifest("r", "v1").unwrap().digest, img.manifest);
+    let log = reg.log()[before..].to_vec();
+    let seen: Vec<_> = log.iter().map(|l| (l.method.as_str(), l.path.as_str())).collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("GET", "/v2/r/manifests/v1"),
+            ("GET", "/token"),
+            ("GET", "/v2/r/manifests/v1")
+        ],
+        "the stale token is refused, a new one fetched once, and the request retried"
+    );
+    assert_ne!(
+        log[0].authorization, log[2].authorization,
+        "the retry uses the new token"
+    );
+    assert!(
+        log[0]
+            .authorization
+            .as_deref()
+            .is_some_and(|a| a.starts_with("Bearer "))
+    );
+    // The new token is reused.
+    let before = reg.log().len();
+    c.get_manifest("r", "v1").unwrap();
+    assert_eq!(reg.log().len() - before, 1);
+}

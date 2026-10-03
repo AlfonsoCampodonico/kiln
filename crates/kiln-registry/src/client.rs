@@ -156,7 +156,11 @@ impl Client {
             })?,
             None => unreachable!("http URLs have hosts"),
         };
-        let policy = Arc::new(Policy::new(&addrs, plain_http));
+        let policy = Arc::new(Policy::new(
+            base.host_str().expect("http URLs have hosts"),
+            &addrs,
+            plain_http,
+        ));
         let http = reqwest::blocking::Client::builder()
             .user_agent(concat!("kiln/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
@@ -242,6 +246,49 @@ impl Client {
             digest,
             media_type,
         })
+    }
+
+    /// A manifest or index by tag or digest, sparing the registry a GET when it
+    /// can. A tag is resolved with a HEAD first (Docker Hub counts manifest GETs
+    /// against its pull limit, not HEADs): when the `Docker-Content-Digest` it
+    /// reports is already in `store`, the stored bytes are used, after the same
+    /// checks as a download; otherwise the manifest is fetched by that digest. A
+    /// HEAD that reports no digest, or fails for any reason but a missing manifest
+    /// or refused credentials, falls back to a GET by tag. Digest targets are
+    /// fetched as by [`Client::get_manifest`].
+    pub fn resolve_manifest(&self, repo: &str, target: &str, store: &Store) -> Result<Manifest> {
+        if Digest::parse(target).is_ok() {
+            return self.get_manifest(repo, target);
+        }
+        let head = match self.head_manifest(repo, target) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                return Err(RegistryError::NotFound {
+                    what: "manifest",
+                    url: redact(&self.endpoint(repo, "manifests", target)?),
+                    detail: String::new(),
+                });
+            }
+            Err(e @ (RegistryError::Unauthorized { .. } | RegistryError::NotFound { .. })) => return Err(e),
+            Err(_) => return self.get_manifest(repo, target),
+        };
+        let Some(digest) = head.digest else {
+            return self.get_manifest(repo, target);
+        };
+        if store.has_blob(&digest)
+            && let Ok(bytes) = store.read_metadata(&digest)
+            && bytes.len() as u64 <= MAX_MANIFEST
+            && Digest::of(&bytes) == digest
+        {
+            let where_ = redact(&self.endpoint(repo, "manifests", &digest.to_string())?);
+            let media_type = manifest_media_type(&where_, head.media_type.as_deref(), &bytes)?;
+            return Ok(Manifest {
+                bytes,
+                digest,
+                media_type,
+            });
+        }
+        self.get_manifest(repo, &digest.to_string())
     }
 
     /// HEADs a manifest; `None` if the registry does not have it.
@@ -554,11 +601,19 @@ impl Client {
                 url,
                 detail: error_detail(resp),
             },
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => RegistryError::Unauthorized {
-                url,
-                status: status.as_u16(),
-                detail: error_detail(resp),
-            },
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                let mut detail = error_detail(resp);
+                // Refused even after the token dance, without credentials: Docker Hub
+                // answers so for a repository that does not exist, too.
+                if status == StatusCode::UNAUTHORIZED && matches!(self.credential(), Ok(None)) {
+                    detail.push_str(" (the repository may not exist, or it needs `docker login`)");
+                }
+                RegistryError::Unauthorized {
+                    url,
+                    status: status.as_u16(),
+                    detail,
+                }
+            }
             _ => RegistryError::Status {
                 method: call.method.to_string(),
                 url,
@@ -884,7 +939,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let mut c = Client::new("127.0.0.1:1", DockerConfig::anonymous()).unwrap();
         // Pretend the registry is public: loopback destinations are then refused.
-        let policy = Arc::new(Policy::new(&["93.184.216.34".parse().unwrap()], true));
+        let policy = Arc::new(Policy::new(
+            "registry.example",
+            &["93.184.216.34".parse().unwrap()],
+            true,
+        ));
         c.http = reqwest::blocking::Client::builder()
             .no_proxy()
             .dns_resolver(Arc::new(CheckedResolver { policy }))

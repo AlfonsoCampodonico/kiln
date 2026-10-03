@@ -3,7 +3,8 @@
 //! Blobs live in one namespace for every repository. Tags pushed over HTTP belong
 //! to their repository; the tags of a served OCI image layout (its `index.json`
 //! ref names) are visible in every repository. Knobs add auth, blob redirects, a
-//! corrupted digest and a lying digest header.
+//! corrupted digest, a lying digest header, repositories that refuse anonymous
+//! tokens, and token revocation.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -37,10 +38,17 @@ pub struct Config {
     pub bearer: Option<Bearer>,
     /// Answer blob GETs with a 307 to `<prefix><digest>`.
     pub redirect_blobs: Option<String>,
+    /// Redirect only this blob (with `redirect_blobs`); every blob if `None`.
+    pub redirect_only: Option<Digest>,
+    /// Repositories that answer 401 to every request, even with a token, as Docker
+    /// Hub does for a repository that does not exist (with bearer auth).
+    pub hidden_repos: Vec<String>,
     /// Serve these bytes, with the last byte flipped, for this digest.
     pub corrupt: Option<Digest>,
     /// Send a `Docker-Content-Digest` header that does not match.
     pub wrong_digest_header: bool,
+    /// Answer manifest HEADs without a `Docker-Content-Digest` header.
+    pub head_without_digest: bool,
     /// The realm in bearer challenges (the registry's own `/token` if `None`).
     pub bearer_realm: Option<String>,
     /// The `Location` of started blob uploads (the registry's own if `None`).
@@ -152,6 +160,19 @@ impl TestRegistry {
     /// How many requests (any method) hit `path`.
     pub fn requests(&self, path: &str) -> usize {
         self.log().iter().filter(|l| l.path == path).count()
+    }
+
+    /// Requests with `method` whose path contains `/manifests/`.
+    pub fn manifest_requests(&self, method: &str) -> usize {
+        self.log()
+            .iter()
+            .filter(|l| l.method == method && l.path.contains("/manifests/"))
+            .count()
+    }
+
+    /// Forgets every issued bearer token, as if each had expired.
+    pub fn revoke_tokens(&self) {
+        self.state.tokens.lock().unwrap().clear();
     }
 
     /// Requests whose path contains `/blobs/sha256:` (blob GETs and HEADs).
@@ -326,6 +347,7 @@ fn route(s: &State, req: &Request) -> Reply {
             Ok(d) => {
                 if req.method == "GET"
                     && let Some(prefix) = &s.config.redirect_blobs
+                    && s.config.redirect_only.as_ref().is_none_or(|only| *only == d)
                 {
                     return Reply::new(307).header("Location", format!("{prefix}{d}"));
                 }
@@ -354,12 +376,14 @@ fn authorize(s: &State, req: &Request, repo: &str) -> Option<Reply> {
         return Some(Reply::error(401, "UNAUTHORIZED").header("WWW-Authenticate", r#"Basic realm="kiln-test""#));
     }
     if s.config.bearer.is_some() {
-        let ok = req
-            .headers
-            .get("authorization")
-            .and_then(|a| a.strip_prefix("Bearer "))
-            .and_then(|t| s.tokens.lock().unwrap().get(t).cloned())
-            .is_some_and(|scope| scope_allows(&scope, repo, &req.method));
+        let hidden = s.config.hidden_repos.iter().any(|r| r == repo);
+        let ok = !hidden
+            && req
+                .headers
+                .get("authorization")
+                .and_then(|a| a.strip_prefix("Bearer "))
+                .and_then(|t| s.tokens.lock().unwrap().get(t).cloned())
+                .is_some_and(|scope| scope_allows(&scope, repo, &req.method));
         if !ok {
             let realm = s
                 .config
@@ -459,7 +483,15 @@ fn manifest(s: &State, req: &Request, repo: &str, target: &str) -> Reply {
                 }
             };
             match d {
-                Some(d) => serve(s, &d, true),
+                Some(d) => {
+                    let mut reply = serve(s, &d, true);
+                    if req.method == "HEAD" && s.config.head_without_digest {
+                        reply
+                            .headers
+                            .retain(|(k, _)| !k.eq_ignore_ascii_case("docker-content-digest"));
+                    }
+                    reply
+                }
                 None => Reply::error(404, "MANIFEST_UNKNOWN"),
             }
         }

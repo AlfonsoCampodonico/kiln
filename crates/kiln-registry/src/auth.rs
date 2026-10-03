@@ -217,14 +217,15 @@ impl DockerConfig {
                 e.column()
             ))
         })?;
-        Ok(Some(if o.username == "<token>" {
-            Credential::IdentityToken(o.secret)
-        } else {
-            Credential::Basic {
+        // An empty username means no credentials, as in Docker.
+        Ok(match o.username.as_str() {
+            "" => None,
+            "<token>" => Some(Credential::IdentityToken(o.secret)),
+            _ => Some(Credential::Basic {
                 username: o.username,
                 password: o.secret,
-            }
-        }))
+            }),
+        })
     }
 }
 
@@ -254,6 +255,10 @@ fn entry_credential(path: &Path, e: &AuthEntry) -> Result<Option<Credential>> {
         let decoded = STANDARD.decode(auth.trim()).map_err(|_| bad())?;
         let decoded = String::from_utf8(decoded).map_err(|_| bad())?;
         let (username, password) = decoded.split_once(':').ok_or_else(bad)?;
+        // An empty username means no credentials, as in Docker.
+        if username.is_empty() {
+            return Ok(None);
+        }
         return Ok(Some(Credential::Basic {
             username: username.to_string(),
             password: password.to_string(),
@@ -364,6 +369,28 @@ mod tests {
         assert_eq!(c.credential("registry.example.com:5000").unwrap(), basic("bob", "pw"));
         assert_eq!(c.credential("empty.example.com").unwrap(), None);
         assert_eq!(c.credential("quay.io").unwrap(), None);
+    }
+
+    #[test]
+    fn an_empty_username_is_anonymous() {
+        let (empty, colon) = (STANDARD.encode(":secret"), STANDARD.encode(":"));
+        let (_d, c) = config(&format!(
+            r#"{{"auths":{{"a.example.com":{{"auth":"{empty}"}},"b.example.com":{{"auth":"{colon}"}},
+                "c.example.com":{{"username":"","password":"pw"}},
+                "d.example.com":{{"auth":"{empty}","identitytoken":"refresh"}}}}}}"#
+        ));
+        for host in ["a.example.com", "b.example.com", "c.example.com"] {
+            assert_eq!(c.credential(host).unwrap(), None, "{host}");
+        }
+        assert_eq!(
+            c.credential("d.example.com").unwrap(),
+            Some(Credential::IdentityToken("refresh".into())),
+            "an identity token needs no username"
+        );
+        let bin = tempfile::tempdir().unwrap();
+        helper(bin.path(), "blank", r#"printf '{"Username":"","Secret":"s3cret"}'"#);
+        let (_d, c) = config(r#"{"credsStore":"blank"}"#);
+        assert_eq!(c.with_helper_path(bin.path()).credential("docker.io").unwrap(), None);
     }
 
     #[test]
