@@ -24,25 +24,62 @@ pub struct RegistryRequest<'a> {
     pub tag: Option<&'a str>,
 }
 
-/// Fetches layer blobs on demand and counts what it downloads.
+/// Room above the uncompressed layer limit for compression framing (T3).
+const FRAMING_ALLOWANCE: u64 = 1 << 20;
+
+/// The most compressed bytes one layer blob may declare.
+fn max_blob_bytes(opts: &ConvertOptions) -> u64 {
+    opts.limits.max_layer_bytes.saturating_add(FRAMING_ALLOWANCE)
+}
+
+fn blob_too_large(max: u64) -> ImageError {
+    ImageError::LimitExceeded {
+        what: "compressed layer size",
+        max,
+    }
+}
+
+/// Fetches layer blobs on demand and counts what it downloads. A descriptor that
+/// declares more than the per-layer limit is refused before any request, as is
+/// one that would take the image's compressed total over its limit (T3).
 struct RegistryLayers<'a> {
     store: &'a Store,
     client: &'a Client,
     repo: &'a str,
+    max_blob: u64,
+    max_image: u64,
     blobs: AtomicUsize,
+    /// Bytes downloaded, plus those of fetches in flight.
     bytes: AtomicU64,
 }
 
 impl LayerSource for RegistryLayers<'_> {
     fn fetch(&self, layer: &Descriptor) -> Result<()> {
-        if self
-            .client
-            .fetch_blob(self.repo, &layer.digest, layer.size, self.store)?
-        {
-            self.blobs.fetch_add(1, Ordering::SeqCst);
-            self.bytes.fetch_add(layer.size, Ordering::SeqCst);
+        if layer.size > self.max_blob {
+            return Err(blob_too_large(self.max_blob));
         }
-        Ok(())
+        let before = self.bytes.fetch_add(layer.size, Ordering::SeqCst);
+        if before.saturating_add(layer.size) > self.max_image {
+            self.bytes.fetch_sub(layer.size, Ordering::SeqCst);
+            return Err(ImageError::LimitExceeded {
+                what: "compressed image size",
+                max: self.max_image,
+            });
+        }
+        match self.client.fetch_blob(self.repo, &layer.digest, layer.size, self.store) {
+            Ok(true) => {
+                self.blobs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            Ok(false) => {
+                self.bytes.fetch_sub(layer.size, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(e) => {
+                self.bytes.fetch_sub(layer.size, Ordering::SeqCst);
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -81,6 +118,8 @@ pub fn convert_registry(
         store,
         client,
         repo: reference.repository(),
+        max_blob: max_blob_bytes(opts),
+        max_image: opts.max_image_bytes,
         blobs: AtomicUsize::new(0),
         bytes: AtomicU64::new(0),
     };
@@ -132,26 +171,20 @@ pub fn pull_image(store: &Store, client: &Client, reference: &Reference, tag: &s
                 }
                 fetch_manifest(store, client, repo, d)?;
             }
+            if index.manifests.is_empty() {
+                return Err(not_kiln(reference));
+            }
             index.manifests.into_iter().map(|d| d.digest).collect()
         }
         OCI_MANIFEST => vec![top.digest.clone()],
         _ => return Err(not_kiln(reference)),
     };
-    let mut report = TransferReport {
-        digest: top.digest.clone(),
-        blobs: 0,
-        bytes: 0,
-        skipped: 0,
-    };
-    let mut fetch = |d: &Descriptor| -> Result<()> {
-        if client.fetch_blob(repo, &d.digest, d.size, store)? {
-            report.blobs += 1;
-            report.bytes += d.size;
-        } else {
-            report.skipped += 1;
-        }
-        Ok(())
-    };
+    // First pass: validate every platform before fetching anything of any of them.
+    let limits = ConvertOptions::default();
+    let max_blob = max_blob_bytes(&limits);
+    let mut validated = Vec::with_capacity(manifests.len());
+    let mut unique = HashSet::new();
+    let mut declared = 0u64;
     for digest in &manifests {
         let m: ImageManifest = json("kiln manifest", &store.read_metadata(digest)?)?;
         if m.artifact_type.as_deref() != Some(KILN_ARTIFACT) || m.config.media_type != KILN_CONFIG {
@@ -173,6 +206,39 @@ pub fn pull_image(store: &Store, client: &Client, reference: &Reference, tag: &s
         {
             return Err(OciError::UnsupportedMediaType(l.media_type.clone()).into());
         }
+        // Bound the downloads: per blob, and over the image's distinct layers.
+        for l in &m.layers {
+            if l.size > max_blob {
+                return Err(blob_too_large(max_blob));
+            }
+            if unique.insert(l.digest.clone()) {
+                declared = declared.saturating_add(l.size);
+            }
+        }
+        if declared > limits.max_image_bytes {
+            return Err(ImageError::LimitExceeded {
+                what: "compressed image size",
+                max: limits.max_image_bytes,
+            });
+        }
+        validated.push((digest, m));
+    }
+    let mut report = TransferReport {
+        digest: top.digest.clone(),
+        blobs: 0,
+        bytes: 0,
+        skipped: 0,
+    };
+    let mut fetch = |d: &Descriptor| -> Result<()> {
+        if client.fetch_blob(repo, &d.digest, d.size, store)? {
+            report.blobs += 1;
+            report.bytes += d.size;
+        } else {
+            report.skipped += 1;
+        }
+        Ok(())
+    };
+    for (digest, m) in &validated {
         fetch(&m.config)?;
         load_manifest(store, digest)?;
         for l in &m.layers {
@@ -209,20 +275,24 @@ pub fn push_image(store: &Store, client: &Client, name: &str, reference: &Refere
         skipped: 0,
     };
     let mut seen = HashSet::new();
+    let mut blobs = Vec::new();
     for (_, m) in &loaded.entries {
         for d in std::iter::once(&m.manifest.config).chain(&m.manifest.layers) {
-            if !seen.insert(d.digest.clone()) {
-                continue;
+            if seen.insert(d.digest.clone()) {
+                blobs.push(d);
             }
-            if !store.has_blob(&d.digest) {
-                return Err(StoreError::NotFound(d.digest.clone()).into());
-            }
-            if client.push_blob(repo, &d.digest, &store.blob_path(&d.digest))? {
-                report.blobs += 1;
-                report.bytes += d.size;
-            } else {
-                report.skipped += 1;
-            }
+        }
+    }
+    // Every blob must be here before the first upload.
+    if let Some(d) = blobs.iter().find(|d| !store.has_blob(&d.digest)) {
+        return Err(StoreError::NotFound(d.digest.clone()).into());
+    }
+    for d in blobs {
+        if client.push_blob(repo, &d.digest, &store.blob_path(&d.digest))? {
+            report.blobs += 1;
+            report.bytes += d.size;
+        } else {
+            report.skipped += 1;
         }
     }
     if loaded.is_index {

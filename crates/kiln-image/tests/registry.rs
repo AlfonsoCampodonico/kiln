@@ -2,11 +2,12 @@
 mod common;
 
 use common::*;
-use kiln_image::types::KILN_LAYER;
+use kiln_image::types::{KILN_ARTIFACT, KILN_LAYER};
 use kiln_image::{
     ConvertOptions, ImageError, convert_local, convert_registry, load, pull_image, push_image, resolve_name,
 };
-use kiln_oci::canonical_json;
+use kiln_oci::media::OCI_INDEX;
+use kiln_oci::{ImageIndex, ImageManifest, OciError, canonical_json};
 use kiln_registry::OCI_MANIFEST;
 use kiln_store::Store;
 
@@ -179,7 +180,10 @@ fn pull_refuses_unexpected_layer_types_before_fetching_layers() {
     let fresh = Store::open(fresh.path()).unwrap();
     let before = reg.blob_requests("GET");
     let err = pull_image(&fresh, &c, &reference(&reg.host(), "x:evil"), "evil").unwrap_err();
-    assert!(matches!(err, ImageError::Oci(_)), "{err}");
+    assert!(
+        matches!(err, ImageError::Oci(OciError::UnsupportedMediaType(_))),
+        "{err}"
+    );
     assert_eq!(reg.blob_requests("GET"), before, "nothing fetched");
     assert_eq!(fresh.get_ref("evil").unwrap(), None);
 }
@@ -210,4 +214,241 @@ fn inspect_finds_registry_images_by_their_short_name() {
     store.set_ref("docker.io/library/php:8.4-cli", &out.digest).unwrap();
     assert_eq!(resolve_name(&store, "php:8.4-cli").unwrap(), out.digest);
     assert_eq!(resolve_name(&store, "library/php:8.4-cli").unwrap(), out.digest);
+}
+
+/// The manifest tagged `app` in `reg`, re-published as `tag` after `edit`.
+fn republish(reg: &kiln_registry::testregistry::TestRegistry, tag: &str, edit: impl FnOnce(&mut ImageManifest)) {
+    let c = client(&reg.host());
+    let mut m: ImageManifest = serde_json::from_slice(&c.get_manifest("x", "app").unwrap().bytes).unwrap();
+    edit(&mut m);
+    reg.put_manifest(tag, OCI_MANIFEST, &canonical_json(&m));
+}
+
+fn layer_requests(reg: &kiln_registry::testregistry::TestRegistry, d: &kiln_store::Digest) -> usize {
+    reg.log().iter().filter(|l| l.path.ends_with(&d.to_string())).count()
+}
+
+#[test]
+fn a_layer_declaring_more_than_the_limit_is_refused_before_any_request() {
+    let src = tempfile::tempdir().unwrap();
+    let path = layout(src.path(), &[arm()], &[gz(&base(0o755))]);
+    let reg = serve(&path);
+    let mut huge = None;
+    republish(&reg, "big", |m| {
+        m.layers[0].size = 1 << 40;
+        huge = Some(m.layers[0].digest.clone());
+    });
+    let huge = huge.unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let err = convert_registry(
+        &store,
+        &client(&reg.host()),
+        &reference(&reg.host(), "x:big"),
+        &registry_req(&[arm()], "big"),
+        &ConvertOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ImageError::LimitExceeded {
+                what: "compressed layer size",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(layer_requests(&reg, &huge), 0, "the layer was never requested");
+    assert_eq!(store.get_ref("big").unwrap(), None);
+    assert_eq!(cache_entries(&store), 0);
+}
+
+#[test]
+fn compressed_layers_are_bounded_over_the_whole_image() {
+    let src = tempfile::tempdir().unwrap();
+    let path = layout(src.path(), &[arm()], &[gz(&base(0o755)), gz(&top())]);
+    let reg = serve(&path);
+    let max_image: u64 = 2 << 20;
+    let mut second = None;
+    republish(&reg, "big", |m| {
+        // Each layer fits the image limit alone; together they do not.
+        m.layers[1].size = max_image - m.layers[0].size + 1;
+        second = Some(m.layers[1].digest.clone());
+    });
+    let second = second.unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let opts = ConvertOptions {
+        max_image_bytes: max_image,
+        jobs: 1,
+        ..Default::default()
+    };
+    let err = convert_registry(
+        &store,
+        &client(&reg.host()),
+        &reference(&reg.host(), "x:big"),
+        &registry_req(&[arm()], "big"),
+        &opts,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ImageError::LimitExceeded {
+                what: "compressed image size",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(layer_requests(&reg, &second), 0, "the second layer was never requested");
+    assert_eq!(store.get_ref("big").unwrap(), None);
+}
+
+/// A two-platform kiln image pushed to a fresh registry, with the store it came from.
+fn pushed_two_platform_image() -> (
+    kiln_registry::testregistry::TestRegistry,
+    Store,
+    tempfile::TempDir,
+    kiln_store::Digest,
+) {
+    let src = tempfile::tempdir().unwrap();
+    let path = layout(src.path(), &[arm(), amd()], &[gz(&base(0o1777))]);
+    let reg = kiln_registry::testregistry::TestRegistry::start(Default::default());
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let out = convert_local(&store, &path, &req(&[arm(), amd()], "two"), &ConvertOptions::default()).unwrap();
+    push_image(
+        &store,
+        &client(&reg.host()),
+        "two",
+        &reference(&reg.host(), "kiln/two:v1"),
+    )
+    .unwrap();
+    (reg, store, home, out.digest)
+}
+
+#[test]
+fn pull_validates_every_platform_before_fetching_any_layer() {
+    let (reg, store, _home, digest) = pushed_two_platform_image();
+    let mut index: ImageIndex = serde_json::from_slice(&store.read_metadata(&digest).unwrap()).unwrap();
+    assert_eq!(index.manifests.len(), 2);
+    // The second platform's layer claims to be an OCI tar layer.
+    let mut m: ImageManifest =
+        serde_json::from_slice(&store.read_metadata(&index.manifests[1].digest).unwrap()).unwrap();
+    m.layers[0].media_type = kiln_oci::media::OCI_LAYER_GZIP.into();
+    let bytes = canonical_json(&m);
+    index.manifests[1].digest = reg.put_manifest("evil-child", OCI_MANIFEST, &bytes);
+    index.manifests[1].size = bytes.len() as u64;
+    reg.put_manifest("evil", OCI_INDEX, &canonical_json(&index));
+
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh = Store::open(fresh.path()).unwrap();
+    let before = reg.blob_requests("GET");
+    let err = pull_image(
+        &fresh,
+        &client(&reg.host()),
+        &reference(&reg.host(), "kiln/two:evil"),
+        "evil",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ImageError::Oci(OciError::UnsupportedMediaType(_))),
+        "{err}"
+    );
+    assert_eq!(
+        reg.blob_requests("GET"),
+        before,
+        "no config or layer of any platform fetched"
+    );
+    assert_eq!(fresh.get_ref("evil").unwrap(), None);
+}
+
+#[test]
+fn pull_refuses_a_declared_layer_over_the_limit_before_fetching_it() {
+    let (reg, store, _home, digest) = pushed_two_platform_image();
+    let mut index: ImageIndex = serde_json::from_slice(&store.read_metadata(&digest).unwrap()).unwrap();
+    let mut m: ImageManifest =
+        serde_json::from_slice(&store.read_metadata(&index.manifests[0].digest).unwrap()).unwrap();
+    m.layers[0].size = 1 << 40;
+    let bytes = canonical_json(&m);
+    index.manifests[0].digest = reg.put_manifest("huge-child", OCI_MANIFEST, &bytes);
+    index.manifests[0].size = bytes.len() as u64;
+    reg.put_manifest("huge", OCI_INDEX, &canonical_json(&index));
+
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh = Store::open(fresh.path()).unwrap();
+    let before = reg.blob_requests("GET");
+    let err = pull_image(
+        &fresh,
+        &client(&reg.host()),
+        &reference(&reg.host(), "kiln/two:huge"),
+        "huge",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ImageError::LimitExceeded {
+                what: "compressed layer size",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(reg.blob_requests("GET"), before, "nothing fetched");
+    assert_eq!(fresh.get_ref("huge").unwrap(), None);
+}
+
+#[test]
+fn pull_refuses_an_empty_index() {
+    let reg = kiln_registry::testregistry::TestRegistry::start(Default::default());
+    let index = ImageIndex {
+        schema_version: 2,
+        media_type: Some(OCI_INDEX.into()),
+        artifact_type: Some(KILN_ARTIFACT.into()),
+        manifests: vec![],
+        annotations: None,
+    };
+    reg.put_manifest("empty", OCI_INDEX, &canonical_json(&index));
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let err = pull_image(
+        &store,
+        &client(&reg.host()),
+        &reference(&reg.host(), "x:empty"),
+        "empty",
+    )
+    .unwrap_err();
+    assert!(matches!(err, ImageError::NotKilnRemote(_)), "{err}");
+    assert_eq!(store.get_ref("empty").unwrap(), None);
+}
+
+#[test]
+fn push_checks_every_blob_before_uploading_any() {
+    let src = tempfile::tempdir().unwrap();
+    let path = layout(src.path(), &[arm()], &[gz(&base(0o755)), gz(&top())]);
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let out = convert_local(&store, &path, &req(&[arm()], "app"), &ConvertOptions::default()).unwrap();
+    let m: ImageManifest = serde_json::from_slice(&store.read_metadata(&out.digest).unwrap()).unwrap();
+    // The last blob to be uploaded goes missing, after earlier ones would have been sent.
+    let last = m.layers.last().unwrap();
+    std::fs::remove_file(store.blob_path(&last.digest)).unwrap();
+    let reg = kiln_registry::testregistry::TestRegistry::start(Default::default());
+    let err = push_image(
+        &store,
+        &client(&reg.host()),
+        "app",
+        &reference(&reg.host(), "kiln/app:v1"),
+    )
+    .unwrap_err();
+    assert!(matches!(err, ImageError::Store(_)), "{err}");
+    assert!(!reg.has_blob(&m.config.digest), "nothing was uploaded");
+    assert!(
+        reg.log().iter().all(|l| l.method == "GET" || l.method == "HEAD"),
+        "no upload or manifest request: {:?}",
+        reg.log()
+    );
 }
