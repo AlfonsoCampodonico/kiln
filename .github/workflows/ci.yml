@@ -16,6 +16,8 @@ jobs:
       - run: cargo test --all
   registries:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     services:
       distribution:
         image: registry:3
