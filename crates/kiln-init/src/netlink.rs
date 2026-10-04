@@ -106,7 +106,11 @@ pub fn ack(buf: &[u8], seq: u32) -> Option<Result<(), i32>> {
         let msg_seq = u32::from_ne_bytes(rest[8..12].try_into().ok()?);
         if kind == NLMSG_ERROR && msg_seq == seq && len >= HEADER + 4 {
             let err = i32::from_ne_bytes(rest[HEADER..HEADER + 4].try_into().ok()?);
-            return Some(if err == 0 { Ok(()) } else { Err(-err) });
+            return Some(if err == 0 {
+                Ok(())
+            } else {
+                Err(err.checked_neg().unwrap_or(i32::MAX))
+            });
         }
         rest = &rest[len.next_multiple_of(4).min(rest.len())..];
     }
@@ -159,6 +163,7 @@ mod tests {
         let mut two = error_msg(6, 0);
         two.extend(error_msg(7, -1));
         assert_eq!(ack(&two, 7), Some(Err(1)));
+        assert_eq!(ack(&error_msg(7, i32::MIN), 7), Some(Err(i32::MAX)));
         assert_eq!(ack(&[0; 8], 1), None);
         assert_eq!(ack(&error_msg(7, 0)[..20], 7), None);
     }

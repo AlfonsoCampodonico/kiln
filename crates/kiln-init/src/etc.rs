@@ -20,7 +20,8 @@ pub fn hosts(name: &str, network: Option<&Network>) -> String {
 pub fn resolv_conf(network: Option<&Network>) -> String {
     match network {
         Some(n) if !n.dns.is_empty() => n.dns.iter().map(|d| format!("nameserver {d}\n")).collect(),
-        _ => "# kiln: this VM has no network\n".to_string(),
+        Some(_) => "# kiln: no DNS servers configured\n".to_string(),
+        None => "# kiln: this VM has no network\n".to_string(),
     }
 }
 
@@ -41,6 +42,9 @@ mod tests {
         assert!(hosts("box", None).starts_with("127.0.0.1\tlocalhost\n"));
         assert_eq!(resolv_conf(Some(&net)), "nameserver 172.30.0.1\n");
         assert!(resolv_conf(None).starts_with('#'));
+        assert!(resolv_conf(None).contains("no network"));
+        let no_dns = Network { dns: vec![], ..net };
+        assert_eq!(resolv_conf(Some(&no_dns)), "# kiln: no DNS servers configured\n");
         assert_eq!(hostname("box"), "box\n");
     }
 }
