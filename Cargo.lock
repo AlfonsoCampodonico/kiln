@@ -883,6 +883,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-init"
+version = "0.1.0"
+dependencies = [
+ "kiln-proto",
+]
+
+[[package]]
 name = "kiln-oci"
 version = "0.1.0"
 dependencies = [
