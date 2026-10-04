@@ -1,5 +1,5 @@
 //! kiln images: the OCI → kiln conversion pipeline, image format, inspect, import,
-//! and registry convert, pull and push.
+//! registry convert, pull and push, and the scratch disk.
 #![forbid(unsafe_code)]
 
 mod convert;
@@ -10,6 +10,7 @@ mod import;
 mod load;
 mod pipeline;
 mod registry;
+pub mod scratch;
 pub mod types;
 
 pub use convert::{ConvertOptions, Converted, LayerReport, LayerSource, StoredLayers, convert_image};
