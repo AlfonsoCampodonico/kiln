@@ -58,6 +58,13 @@ impl<T> Context<T> for std::io::Result<T> {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl<T> Context<T> for rustix::io::Result<T> {
+    fn context(self, what: impl fmt::Display) -> Result<T> {
+        self.map_err(|e| Failure::os(what, &e.into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
