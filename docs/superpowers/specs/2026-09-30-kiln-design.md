@@ -566,9 +566,9 @@ Inside the VM's own net namespace:
 
 **Host-side exit codes:**
 - The app's exit code, or `128 + signal`.
-- **125:** `kiln` or infrastructure error, including boot timeout or the VM ending without `Exited`.
-- **126:** entrypoint not executable.
-- **127:** entrypoint not found.
+- **125:** `kiln` or infrastructure error, including boot timeout, the VM ending without `Exited`, and any init failure other than the two below (for example an unknown user).
+- **126:** the entrypoint was found but could not be executed (`EACCES` or `EISDIR` from exec).
+- **127:** the entrypoint was not found (`ENOENT` from exec).
 
 The numbers match Docker. These codes are guest-asserted (§3).
 
