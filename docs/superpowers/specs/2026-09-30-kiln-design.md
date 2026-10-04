@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.6: 2026-10-03)
-**Status:** Draft rev 2.6, awaiting review
+**Date:** 2026-09-30 (rev 2.7: 2026-10-04)
+**Status:** Draft rev 2.7, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:** `../../../../ROADMAP.md` (projects #1 snapshot registry and #2 agent sandbox)
 
@@ -46,6 +46,9 @@
   - stop signals are limited to 1–31;
   - the ext4 template lives in the crate that embeds it;
   - Cloud Hypervisor 53 cannot grow the scratch disk online beyond about 8 GiB.
+- **rev 2.7 (2026-10-04):** `kiln build` no longer requires BuildKit (user decision):
+  - pluggable backends: BuildKit, Podman/Buildah, and a native backend for Dockerfiles without `RUN`;
+  - `RUN` executed in a kiln microVM is planned post-v1 (§6, non-goals).
 ---
 
 ## 1. Goals
@@ -68,14 +71,14 @@ It is meant to be a serious open-source tool: a stable format, real docs and a p
 5. Builds are deterministic: for the same `kiln` version, identical inputs produce byte-identical blobs and manifests on any host.
 6. Where each command runs:
    - `convert`, `pull`, `push`, `inspect`, `ls`, `gc`, `import` run natively on macOS: no root, no Linux VM.
-   - `build` needs a reachable BuildKit.
+   - `build` uses BuildKit, Podman or Buildah when available, and builds Dockerfiles without `RUN` natively. It needs none of them for those (§6).
    - `run` needs Linux, KVM and membership in the `kvm` group. It **never needs root**.
 7. Untrusted images cannot poison the cache, reach host-internal network endpoints from the build host, or swap the kernel or init. Untrusted guests cannot reach link-local, private or host addresses by default, or other VMs. A VMM compromise lands in an unprivileged sandbox (§3).
 8. `docs/format.md` documents the image format, the erofs profile and the control protocol well enough for a third party to produce or consume `kiln` images.
 
 ### Non-goals (v1)
 
-- A native Dockerfile engine (BuildKit does this).
+- A full native Dockerfile engine. v1 builds `RUN`-free Dockerfiles natively and delegates the rest to BuildKit, Podman or Buildah. Executing `RUN` steps in a kiln microVM is planned after v1.
 - Per-workload kernel tuning or local kernel builds.
 - erofs compression (LZ4 is the planned follow-up).
 - Auto-delegating `kiln run` to a Lima VM on macOS.
@@ -263,10 +266,12 @@ $KILN_HOME/
 
 `kiln convert <ref|path>` runs §6.1–§6.5.
 
-`kiln build -f Dockerfile [--platform …] [--builder NAME] <context>` first produces an OCI layout, then runs `convert` on it:
-- **Producing the layout:**
-  - If `BUILDKIT_HOST` is set, use `buildctl`.
-  - Otherwise use `docker buildx build --output type=oci,tar=false,dest=<tmp>`.
+`kiln build -f Dockerfile [--platform …] [--builder auto|buildkit|podman|buildah|native] <context>` first produces an OCI layout, then runs `convert` on it:
+- **Backend selection** (`--builder auto`, the default; the first available wins):
+  1. **BuildKit:** `buildctl` if `BUILDKIT_HOST` is set, else `docker buildx build --output type=oci,tar=false,dest=<tmp>`.
+  2. **Podman or Buildah:** `podman build` or `buildah build`, exported as an OCI layout. Rootless and daemonless.
+  3. **Native:** for Dockerfiles without `RUN`, kiln builds the image itself. It supports `FROM` (resolved through `kiln-registry`/`kiln-oci`), `COPY`/`ADD` (local context only; `ADD` URLs and archive auto-extraction are refused), `ENV`, `ARG`, `LABEL`, `WORKDIR`, `USER`, `EXPOSE`, `VOLUME`, `ENTRYPOINT`, `CMD`, `STOPSIGNAL` and `SHELL`, plus multi-stage `COPY --from`. New layers are deterministic tars (§6.6) written straight into the store, honouring `.dockerignore`. A Dockerfile with `RUN` and no other backend available fails with the list of backends to install.
+- **Post-v1:** executing `RUN` in a kiln microVM. kiln boots the stage's image, runs the step, and captures the scratch disk's upper directory as a layer. This makes kiln a self-contained builder.
 - **Docker driver check:** `kiln` checks the selected buildx driver first. The `docker` driver without the containerd image store can't export OCI. In that case `kiln` fails with the exact command to create a `docker-container` builder; it never creates one implicitly.
 - **Cross-platform builds** need binfmt/QEMU on the BuildKit host. This is documented, and `kiln` detects the failure from the `exec format error` signature.
 
