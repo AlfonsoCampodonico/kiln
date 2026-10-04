@@ -20,8 +20,8 @@ trap 'rm -f "$out.tmp"' EXIT
 docker run --rm -i "$image" sh -eu > "$out.tmp" <<SH
 rm -f /etc/apt/sources.list.d/*
 echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/$snapshot trixie main" > /etc/apt/sources.list
-apt-get update -qq >/dev/null
-apt-get install -qq -y --no-install-recommends e2fsprogs=$e2fsprogs zstd=$zstd >/dev/null 2>&1
+apt-get update -qq >&2
+apt-get install -qq -y --no-install-recommends e2fsprogs=$e2fsprogs zstd=$zstd >&2
 truncate -s 64M /tmp/scratch.img
 # meta_bg without resize_inode lets the guest grow it online far beyond 64 MiB.
 # lazy_itable_init=1 keeps the file sparse; the guest mounts with noinit_itable.
@@ -30,7 +30,9 @@ E2FSPROGS_FAKE_TIME=1 mke2fs -q -t ext4 -b 4096 -I 256 -i 65536 -O meta_bg,^resi
   /tmp/scratch.img
 # mke2fs takes the directory hash's signedness from the build host's char type
 # (signed on x86_64, unsigned on aarch64); pin it to unsigned (s_flags = 2).
-E2FSPROGS_FAKE_TIME=1 debugfs -w -R "ssv flags 2" /tmp/scratch.img >/dev/null 2>&1
+E2FSPROGS_FAKE_TIME=1 debugfs -w -R "ssv flags 2" /tmp/scratch.img >&2
+dumpe2fs -h /tmp/scratch.img 2>/dev/null | grep -q '^Filesystem flags:.*unsigned_directory_hash' \\
+  || { echo "make-ext4-template: unsigned directory hash flag not set" >&2; exit 1; }
 e2fsck -fn /tmp/scratch.img >&2
 zstd -q -19 -T1 -c /tmp/scratch.img
 SH
