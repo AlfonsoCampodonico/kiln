@@ -15,6 +15,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 flate2 = "1.1.10"
 kiln-image = { path = "../kiln-image" }
 kiln-oci = { path = "../kiln-oci" }
+kiln-proto = { path = "../kiln-proto" }
 kiln-registry = { path = "../kiln-registry" }
 kiln-store = { path = "../kiln-store" }
 rlimit = "0.11.0"

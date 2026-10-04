@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 mod bench;
-mod sanitize;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,7 +18,7 @@ use kiln_registry::{Client, DockerConfig, Reference, RegistryError};
 use kiln_store::Store;
 use serde_json::json;
 
-use crate::sanitize::clean_line;
+use kiln_proto::sanitize::clean_line;
 
 #[derive(Parser)]
 #[command(name = "kiln", version, about = "Build microVM images from OCI images")]

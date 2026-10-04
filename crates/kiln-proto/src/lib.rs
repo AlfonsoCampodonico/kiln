@@ -12,12 +12,15 @@
 
 mod config;
 mod error;
+mod exit;
 mod frame;
 mod message;
+pub mod sanitize;
 pub mod signal;
 
 pub use config::{Config, ExitMethod, MAX_LAYERS, MIN_SCRATCH_BYTES, Network, Process, Scratch};
 pub use error::{ProtoError, Result};
+pub use exit::{EXIT_CANNOT_INVOKE, EXIT_INFRA, EXIT_NOT_FOUND};
 pub use frame::{read_message, write_message};
 pub use message::{
     Exited, GuestMessage, Hello, HostMessage, InitFailed, MAX_MESSAGE_BYTES, Message, STAGES, Shutdown, Signal, Stage,
