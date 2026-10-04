@@ -11,6 +11,8 @@ use crate::error::{ProtoError, Result};
 pub const STAGES: u8 = 7;
 /// The longest `InitFailed` message, in bytes. [`InitFailed::new`] truncates to it.
 pub const MAX_MESSAGE_BYTES: usize = 4096;
+/// The longest payload error reason kept, in characters.
+const MAX_REASON_CHARS: usize = 200;
 
 /// The name of `kiln-init` stage `n` (1-based), for diagnostics.
 pub fn stage_name(n: u8) -> &'static str {
@@ -178,8 +180,14 @@ fn parse<T: DeserializeOwned>(ty: u8, payload: &[u8]) -> Result<T> {
     }
     serde_json::from_slice(payload).map_err(|e| ProtoError::Payload {
         name,
-        reason: e.to_string(),
+        reason: sanitize(&e.to_string()),
     })
+}
+
+/// serde quotes unknown field names raw, and the guest chooses them: escape
+/// control characters and cap the length before the text can reach a terminal.
+fn sanitize(text: &str) -> String {
+    text.escape_debug().take(MAX_REASON_CHARS).collect()
 }
 
 fn json<T: Serialize>(value: &T) -> Vec<u8> {
@@ -394,6 +402,24 @@ mod tests {
         assert!(HostMessage::decode(SIGNAL, br#"{"sig":0}"#).is_err());
         assert!(HostMessage::decode(SIGNAL, br#"{"sig":32}"#).is_err());
         assert!(GuestMessage::decode(HELLO, br#"{"protocol":0}"#).is_err());
+    }
+
+    #[test]
+    fn payload_errors_do_not_echo_guest_control_bytes_or_bulk() {
+        let err = GuestMessage::decode(HELLO, "{\"\\u001b]0;pwned\\u0007\":1}".as_bytes()).unwrap_err();
+        assert!(matches!(err, ProtoError::Payload { .. }), "{err}");
+        let shown = err.to_string();
+        assert!(shown.bytes().all(|b| b >= 0x20 && b != 0x7f), "{shown:?}");
+        assert!(shown.contains("pwned"), "{shown}");
+        let huge = format!("{{\"{}\":1}}", "k".repeat(60_000));
+        let ProtoError::Payload { reason, .. } = GuestMessage::decode(HELLO, huge.as_bytes()).unwrap_err() else {
+            panic!("expected a payload error");
+        };
+        assert!(
+            reason.chars().count() <= MAX_REASON_CHARS,
+            "{} chars",
+            reason.chars().count()
+        );
     }
 
     #[test]

@@ -112,6 +112,29 @@ fn framed(ty: u8, payload: &[u8]) -> Vec<u8> {
     f
 }
 
+/// One `"key":value` member, mostly with real field names and plausible values, so
+/// that decoding gets past the object check into serde and `validate`.
+fn member() -> impl Strategy<Value = String> {
+    let key = prop_oneof![
+        4 => proptest::sample::select(vec![
+            "protocol", "n", "signaled", "code", "stage", "errno", "message", "graceSecs", "sig", "rows", "cols",
+            "process", "stopSignal", "interactive", "hostname", "layers", "scratch", "exitMethod", "shutdownGraceSecs",
+        ])
+        .prop_map(String::from),
+        1 => "[a-zA-Z\\u{1b}]{1,8}",
+    ];
+    let value = prop_oneof![
+        3 => (-5i64..70).prop_map(|n| n.to_string()),
+        1 => any::<i64>().prop_map(|n| n.to_string()),
+        1 => Just("true".to_string()),
+        1 => Just("null".to_string()),
+        1 => "[a-z]{0,6}".prop_map(|s| format!("\"{s}\"")),
+        1 => Just("{}".to_string()),
+        1 => Just("[]".to_string()),
+    ];
+    (key, value).prop_map(|(k, v)| format!("\"{k}\":{v}"))
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -146,6 +169,24 @@ proptest! {
             buf[i] ^= byte | 1;
         }
         decode_all::<HostMessage>(&buf);
+    }
+
+    #[test]
+    fn corrupted_guest_frames_fail_or_stay_valid(msg in guest(), flips in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..4)) {
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        for (at, byte) in flips {
+            let i = at % buf.len();
+            buf[i] ^= byte | 1;
+        }
+        decode_all::<GuestMessage>(&buf);
+    }
+
+    #[test]
+    fn object_shaped_payloads_reach_serde_and_validate(ty in 0u8..12, members in proptest::collection::vec(member(), 0..6)) {
+        let payload = format!("{{{}}}", members.join(","));
+        decode_all::<GuestMessage>(&framed(ty, payload.as_bytes()));
+        decode_all::<HostMessage>(&framed(ty, payload.as_bytes()));
     }
 
     #[test]

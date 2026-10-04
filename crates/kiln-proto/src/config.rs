@@ -124,7 +124,9 @@ impl Config {
         }
         for e in &p.env {
             no_nul("an environment entry", e)?;
-            if e.split_once('=').is_none_or(|(k, _)| k.is_empty()) {
+            if e.split_once('=')
+                .is_none_or(|(k, _)| k.is_empty() || k.chars().any(char::is_control))
+            {
                 return Err(invalid(format!("environment entry {e:?} is not KEY=value")));
             }
         }
@@ -137,7 +139,7 @@ impl Config {
         if let Some(u) = &p.user {
             no_nul("user", u)?;
             let parts: Vec<&str> = u.split(':').collect();
-            if parts.len() > 2 || parts.iter().any(|s| s.is_empty() || s.contains('\n')) {
+            if parts.len() > 2 || parts.iter().any(|s| s.is_empty() || s.chars().any(char::is_control)) {
                 return Err(invalid(format!("user {u:?} is not user[:group]")));
             }
         }
@@ -250,6 +252,10 @@ mod tests {
             ("workdir", Box::new(|c| c.process.working_dir = Some("srv".into()))),
             ("user", Box::new(|c| c.process.user = Some("a:b:c".into()))),
             ("user empty", Box::new(|c| c.process.user = Some(":0".into()))),
+            ("user newline", Box::new(|c| c.process.user = Some("a\nb".into()))),
+            ("user escape", Box::new(|c| c.process.user = Some("a\x1bb".into()))),
+            ("env key control", Box::new(|c| c.process.env = vec!["A\x1bB=v".into()])),
+            ("env key delete", Box::new(|c| c.process.env = vec!["A\x7fB=v".into()])),
             ("stop signal", Box::new(|c| c.stop_signal = 0)),
             ("hostname", Box::new(|c| c.hostname = "-x".into())),
             ("hostname chars", Box::new(|c| c.hostname = "a b".into())),
