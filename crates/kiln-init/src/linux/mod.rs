@@ -5,16 +5,20 @@
 
 mod control;
 mod identity;
+mod process;
+mod relay;
 mod root;
 mod storage;
+mod supervise;
 pub mod sys;
 
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::channel;
 use std::sync::{Mutex, OnceLock};
 
-use kiln_proto::{ExitMethod, GuestMessage, InitFailed, Stage, stage_name, write_message};
+use kiln_proto::{ExitMethod, GuestMessage, HostMessage, InitFailed, ProtoError, Stage, stage_name, write_message};
 use rustix::system::RebootCommand;
 
 use crate::error::{Context, Failure, Result};
@@ -29,6 +33,17 @@ static EXIT: OnceLock<ExitMethod> = OnceLock::new();
 /// sending cannot deadlock.
 static CONTROL: OnceLock<Mutex<Vsock>> = OnceLock::new();
 
+/// What the supervisor waits for (spec §9.6 stage 7).
+#[derive(Debug)]
+enum Event {
+    Signal(i32),
+    Host(HostMessage),
+    /// The host closed the control connection.
+    HostClosed,
+    /// The host broke the protocol.
+    HostError(ProtoError),
+}
+
 /// Runs PID 1. Never returns: the VM ends.
 pub fn run() -> ! {
     std::panic::set_hook(Box::new(|info| fail(Failure::msg(format!("panic: {info}")))));
@@ -38,20 +53,25 @@ pub fn run() -> ! {
     end_vm()
 }
 
-/// Stages 1 to 5. Starting the main process (stage 6) and supervising it (stage 7)
-/// are not written yet, so the run ends with `InitFailed` at stage 6.
 fn boot() -> Result<()> {
     early()?;
+    let (events, rx) = channel();
     enter(2)?;
-    let config = control::connect()?;
+    let config = control::connect(events.clone())?;
     enter(3)?;
-    let _scratch = storage::mount_all(&config)?;
+    let scratch = storage::mount_all(&config)?;
     enter(4)?;
     root::pivot()?;
     enter(5)?;
     identity::configure(&config)?;
     enter(6)?;
-    Err(Failure::msg("starting the main process is not implemented yet"))
+    let started = process::start(&config, events)?;
+    send(&GuestMessage::Running)?;
+    enter(7)?;
+    let exited = supervise::run(&config, started, &rx)?;
+    send(&GuestMessage::Exited(exited))?;
+    storage::finish(&scratch);
+    Ok(())
 }
 
 /// Stage 1: `/proc`, `/sys` and `/dev` in the init root, and Ctrl-Alt-Del as SIGINT.

@@ -1,11 +1,12 @@
-//! Stage 3: layers, the scratch disk and the root overlay (spec §9.4, §9.6).
+//! Stage 3: layers, the scratch disk and the root overlay (spec §9.4, §9.6), and
+//! the scratch disk's shutdown.
 
 use std::os::fd::OwnedFd;
 
 use kiln_proto::Config;
 use rustix::fs::{Mode, OFlags, SeekFrom};
 use rustix::io::Errno;
-use rustix::mount::{MountFlags, mount};
+use rustix::mount::{FsPickFlags, MountFlags, mount};
 
 use super::{open_dir, sys};
 use crate::disks::{SCRATCH, layer_device};
@@ -22,7 +23,7 @@ fn mkdir(path: &str) -> Result<()> {
 }
 
 /// Mounts everything under `/kiln` and returns a descriptor of the scratch
-/// filesystem's root, which outlives the pivot.
+/// filesystem's root, which outlives the pivot (see [`finish`]).
 pub fn mount_all(config: &Config) -> Result<OwnedFd> {
     mount(
         "tmpfs",
@@ -63,4 +64,18 @@ fn grow(rw: &OwnedFd, size: u64) -> Result<()> {
         )));
     }
     sys::ext4_resize(rw, size / BLOCK).context(format!("grow the scratch filesystem to {size} bytes"))
+}
+
+/// After the workload: flush the scratch filesystem and, best effort, make it
+/// read-only so it is clean when the VM ends (spec §9.6 stage 7). Its mount was
+/// detached by the pivot, so it is reconfigured through its descriptor.
+pub fn finish(rw: &OwnedFd) {
+    let _ = rustix::fs::syncfs(rw);
+    if let Ok(fs) = rustix::mount::fspick(rw, "", FsPickFlags::FSPICK_EMPTY_PATH | FsPickFlags::FSPICK_CLOEXEC) {
+        let _ = rustix::mount::fsconfig_set_flag(&fs, "ro");
+        match rustix::mount::fsconfig_reconfigure(&fs) {
+            Ok(()) | Err(Errno::BUSY) => {}
+            Err(e) => eprintln!("kiln-init: remount the scratch disk read-only: {e}"),
+        }
+    }
 }
