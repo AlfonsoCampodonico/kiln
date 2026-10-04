@@ -7,12 +7,15 @@ use crate::sanitize::clean_line;
 /// `kiln` or infrastructure failed, including a boot timeout or a VM that
 /// ended without `Exited`.
 pub const EXIT_INFRA: i32 = 125;
-/// The entrypoint could not be invoked (not executable, bad user, ...).
+/// The entrypoint was found but could not be invoked (permission denied, a directory).
 pub const EXIT_CANNOT_INVOKE: i32 = 126;
 /// The entrypoint was not found.
 pub const EXIT_NOT_FOUND: i32 = 127;
 
+// Linux errno numbers (the same on every Linux architecture); kiln-proto stays libc-free.
 const ENOENT: i32 = 2;
+const EACCES: i32 = 13;
+const EISDIR: i32 = 21;
 /// The stage that starts the main process.
 const PROCESS_STAGE: u8 = 6;
 
@@ -24,12 +27,14 @@ impl Exited {
 }
 
 impl InitFailed {
-    /// 127 when exec(2) of the entrypoint found nothing, 126 for any other
-    /// failure to start it, 125 for failures before it.
+    /// As Docker reports them: 127 when exec(2) of the entrypoint found nothing
+    /// (ENOENT), 126 when it was found but not invokable (EACCES, EISDIR), 125 for
+    /// everything else, including other stage-6 failures (an unknown user, setgroups,
+    /// ENOEXEC, ENOTDIR, ...) and every earlier stage.
     pub fn exit_code(&self) -> i32 {
         match (self.stage, self.errno) {
             (PROCESS_STAGE, Some(ENOENT)) => EXIT_NOT_FOUND,
-            (PROCESS_STAGE, _) => EXIT_CANNOT_INVOKE,
+            (PROCESS_STAGE, Some(EACCES | EISDIR)) => EXIT_CANNOT_INVOKE,
             _ => EXIT_INFRA,
         }
     }
@@ -68,7 +73,10 @@ mod tests {
         );
         assert_eq!(InitFailed::new(6, Some(2), "").exit_code(), 127);
         assert_eq!(InitFailed::new(6, Some(13), "").exit_code(), 126);
-        assert_eq!(InitFailed::new(6, None, "no such user").exit_code(), 126);
+        assert_eq!(InitFailed::new(6, Some(21), "").exit_code(), 126);
+        assert_eq!(InitFailed::new(6, Some(8), "").exit_code(), 125, "ENOEXEC");
+        assert_eq!(InitFailed::new(6, Some(20), "").exit_code(), 125, "ENOTDIR");
+        assert_eq!(InitFailed::new(6, None, "no such user").exit_code(), 125);
         assert_eq!(InitFailed::new(3, Some(2), "").exit_code(), 125);
     }
 

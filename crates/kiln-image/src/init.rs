@@ -57,8 +57,20 @@ mod tests {
             .filter(|n| n != b"." && n != b"..")
             .collect();
         assert_eq!(names, [&b"dev"[..], b"kiln", b"kiln-init", b"proc", b"sys"]);
+        let mut nids = vec![root];
+        for name in ["dev", "kiln", "proc", "sys"] {
+            nids.push(img.lookup(name.as_bytes()).unwrap().unwrap());
+        }
+        for nid in nids {
+            let dir = img.inode(nid).unwrap();
+            assert!(dir.is_dir());
+            assert_eq!(dir.mode & 0o7777, 0o755);
+            assert_eq!((dir.uid, dir.gid, dir.mtime.sec), (0, 0, 0));
+        }
         let init = img.lookup(b"kiln-init").unwrap().unwrap();
-        assert_eq!(img.inode(init).unwrap().mode & 0o7777, 0o755);
+        let info = img.inode(init).unwrap();
+        assert_eq!(info.mode & 0o7777, 0o755);
+        assert_eq!((info.uid, info.gid, info.mtime.sec), (0, 0, 0));
         assert_eq!(img.read_data(init).unwrap(), bin);
     }
 }
