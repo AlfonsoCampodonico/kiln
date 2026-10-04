@@ -895,6 +895,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-proto"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "kiln-registry"
 version = "0.1.0"
 dependencies = [
