@@ -4,7 +4,7 @@
 //! EOF once every process holding them has exited.
 
 use std::fs::File;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -55,10 +55,10 @@ pub fn start(config: &Config, events: Sender<Event>) -> Result<Started> {
         .current_dir(workdir);
     let (outputs, tty) = match config.tty {
         Some(size) => {
-            let (master, outputs) = pty_stdio(&mut cmd, size)?;
+            let (master, outputs) = pty_stdio(&mut cmd, size, &identity)?;
             (outputs, Some(master))
         }
-        None => (pipe_stdio(&mut cmd, config.interactive)?, None),
+        None => (pipe_stdio(&mut cmd, config.interactive, &identity)?, None),
     };
     drop_privileges(&mut cmd, &identity, config.tty.is_some());
     let child = cmd.spawn().map_err(|e| Failure {
@@ -109,10 +109,17 @@ fn pipe() -> Result<(File, File)> {
     Ok((File::from(r), File::from(w)))
 }
 
+/// Gives the workload's user its stdio, as runc does: a non-root user could
+/// otherwise not reopen `/dev/stdout` or `/proc/self/fd/N`.
+fn give(fd: impl AsFd, id: &Identity) -> Result<()> {
+    rustix::fs::fchown(fd, Some(Uid::from_raw(id.uid)), Some(Gid::from_raw(id.gid))).context("chown the stdio")
+}
+
 /// Pipes relayed to ports 1025–1027. Without `interactive`, stdin is `/dev/null`.
-fn pipe_stdio(cmd: &mut Command, interactive: bool) -> Result<Vec<JoinHandle<()>>> {
+fn pipe_stdio(cmd: &mut Command, interactive: bool, id: &Identity) -> Result<Vec<JoinHandle<()>>> {
     if interactive {
         let (r, w) = pipe()?;
+        give(&r, id)?;
         relay::spawn("stdin", connect(port::STDIN)?, w, drop)?;
         cmd.stdin(r);
     } else {
@@ -121,6 +128,7 @@ fn pipe_stdio(cmd: &mut Command, interactive: bool) -> Result<Vec<JoinHandle<()>
     let mut outputs = Vec::new();
     for (name, port) in [("stdout", port::STDOUT), ("stderr", port::STDERR)] {
         let (r, w) = pipe()?;
+        give(&w, id)?;
         outputs.push(relay::spawn(name, r, connect(port)?, |v: Vsock| v.shutdown_write())?);
         if port == port::STDOUT {
             cmd.stdout(w);
@@ -132,13 +140,14 @@ fn pipe_stdio(cmd: &mut Command, interactive: bool) -> Result<Vec<JoinHandle<()>
 }
 
 /// A pty from the guest's devpts, relayed to port 1028; its slave is the child's stdio.
-fn pty_stdio(cmd: &mut Command, size: WindowSize) -> Result<(OwnedFd, Vec<JoinHandle<()>>)> {
+fn pty_stdio(cmd: &mut Command, size: WindowSize, id: &Identity) -> Result<(OwnedFd, Vec<JoinHandle<()>>)> {
     let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
     let master = rustix::pty::openpt(flags).context("open /dev/ptmx")?;
     rustix::pty::grantpt(&master).context("grantpt")?;
     rustix::pty::unlockpt(&master).context("unlockpt")?;
     set_window_size(&master, size)?;
     let slave = rustix::pty::ioctl_tiocgptpeer(&master, flags).context("open the pty slave")?;
+    give(&slave, id)?;
     let vsock = connect(port::TTY)?;
     let dup = |fd: &OwnedFd| rustix::io::fcntl_dupfd_cloexec(fd, 0).context("dup the pty");
     relay::spawn(
