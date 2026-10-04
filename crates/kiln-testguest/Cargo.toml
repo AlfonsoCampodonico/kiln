@@ -1,0 +1,15 @@
+[package]
+name = "kiln-testguest"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Hostile guest programs for kiln's boot tests"
+publish = false
+
+[[bin]]
+name = "hostile"
+path = "src/main.rs"
+
+[dependencies]
+kiln-init = { path = "../kiln-init" }
+kiln-proto = { path = "../kiln-proto" }
