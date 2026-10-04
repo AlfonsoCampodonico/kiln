@@ -843,6 +843,7 @@ dependencies = [
  "kiln-erofs",
  "kiln-image",
  "kiln-oci",
+ "kiln-proto",
  "kiln-registry",
  "kiln-store",
  "predicates",
