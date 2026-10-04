@@ -20,13 +20,21 @@ pub fn run(config: &Config, started: Started, events: &Receiver<Event>) -> Resul
     let mut deadline: Option<Instant> = None;
     let mut stopping = false;
     let status = loop {
+        // Checked first, so a flood of events cannot postpone the kill.
         let event = match deadline {
+            Some(at) if Instant::now() >= at => None,
             Some(at) => match events.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(event) => Some(event),
                 Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => unreachable!("init holds a sender"),
+                Err(RecvTimeoutError::Disconnected) => {
+                    unreachable!("the signal thread holds a sender for the life of the process")
+                }
             },
-            None => Some(events.recv().expect("init holds a sender")),
+            None => Some(
+                events
+                    .recv()
+                    .expect("the signal thread holds a sender for the life of the process"),
+            ),
         };
         let grace = match event {
             None => {
