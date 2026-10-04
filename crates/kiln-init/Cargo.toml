@@ -5,5 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "PID 1 of kiln microVM guests"
 
+[[bin]]
+name = "kiln-init"
+path = "src/main.rs"
+
 [dependencies]
 kiln-proto = { path = "../kiln-proto" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.5", features = ["fs", "mount", "net", "process", "system"] }
