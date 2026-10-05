@@ -87,7 +87,8 @@ pub struct Fixtures {
     pub init: PathBuf,
     /// One layer: busybox, users, `/etc` symlinks.
     pub base: Vec<PathBuf>,
-    /// `base` plus whiteout, opaque and filler layers: 24 layers.
+    /// `base` plus whiteout, opaque and filler layers: 14 layers, which with init, scratch and
+    /// vsock fill Firecracker x86_64's 17 devices.
     pub stack: Vec<PathBuf>,
     /// `base` plus 79 filler layers, for backends with room for them.
     pub deep: Vec<PathBuf>,
@@ -95,7 +96,7 @@ pub struct Fixtures {
     pub hostile: Option<Vec<PathBuf>>,
 }
 
-pub const STACK_LAYERS: usize = 24;
+pub const STACK_LAYERS: usize = 14;
 pub const DEEP_LAYERS: usize = 80;
 
 pub fn fixtures() -> &'static Fixtures {

@@ -285,7 +285,12 @@ fn layers_and_whiteouts_through_the_overlay(backend: Backend) {
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines[..3], ["b", "y", &(STACK_LAYERS - 3).to_string()], "{out}");
     assert!(lines[3].starts_with("overlay / overlay "), "{out}");
-    assert!(lines[3].contains("lowerdir=/kiln/layers/23:/kiln/layers/22:"), "{out}");
+    let top = format!(
+        "lowerdir=/kiln/layers/{}:/kiln/layers/{}:",
+        STACK_LAYERS - 1,
+        STACK_LAYERS - 2
+    );
+    assert!(lines[3].contains(&top), "{out}");
     assert!(
         lines[3].contains(",upperdir=/kiln/rw/upper,workdir=/kiln/rw/work,"),
         "{out}"
@@ -297,9 +302,10 @@ fn layers_and_whiteouts_through_the_overlay(backend: Backend) {
     }
 }
 
-/// Runs where the VMM has room for 83 devices: Firecracker. Cloud Hypervisor's
-/// machine allows 31 virtio devices (one is its RNG), so there the case is skipped
-/// with a message; `layers_and_whiteouts_through_the_overlay` covers 24 layers on both.
+/// Runs where the VMM has room for 83 devices: Firecracker on aarch64. Cloud
+/// Hypervisor allows 31 virtio devices (one is its RNG) and Firecracker on x86_64 17,
+/// so there the case is skipped with a message;
+/// `layers_and_whiteouts_through_the_overlay` covers 14 layers on every VMM and arch.
 fn many_layers_fit_one_mount_data_page(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     let deep = &fixtures().deep;
