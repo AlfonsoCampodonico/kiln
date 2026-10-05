@@ -49,15 +49,14 @@ An argument that names an existing path is a local source; anything else must be
 - `kiln bench LAYOUT` measures cold, warm and changed-top-layer conversions and prints JSON.
 - `--store DIR` (or `$KILN_HOME`) selects the store; the default is `~/.local/share/kiln`.
 
-## Docs
 ## The guest
 
 `kiln-init` is PID 1 of a kiln microVM. It stacks the image's layers with overlayfs on a scratch disk, sets the guest up as Docker sets up a container (mounts, `/etc/hosts`, users, environment), runs the image's process and relays its stdio over vsock; `docs/format.md` specifies the guest and the control protocol. It is a static musl binary, for aarch64 and x86_64:
 
 ```bash
 rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
-cargo build --release --target aarch64-unknown-linux-musl -p kiln-init
-# rust-lld links musl binaries for the other architecture without a C cross toolchain.
+# rust-lld links the musl binaries without a C cross toolchain.
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo build --release --target aarch64-unknown-linux-musl -p kiln-init
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo build --release --target x86_64-unknown-linux-musl -p kiln-init
 ```
 
@@ -69,7 +68,8 @@ vmkit=$(dirname "$(cargo metadata --format-version 1 | jq -r '.packages[] | sele
 "$vmkit/kernels/build.sh" "$(uname -m)" out       # the guest kernel
 cargo build --manifest-path "$vmkit/Cargo.toml" --bin vmkit-sandbox --target-dir target
 "$vmkit/scripts/install-apparmor.sh" "$PWD/target/debug/vmkit-sandbox"   # Ubuntu 23.10+ only; uses sudo
-sudo apt-get install busybox-static passt nftables
+sudo apt-get install busybox-static passt nftables jq python3 flex bison bc libelf-dev libssl-dev
+export PATH="$HOME/.local/bin:$PATH"
 KILN_TEST_NET=1 scripts/boot-tests.sh out/vmlinux-*-"$(uname -m)" -- --test-threads=4
 ```
 
@@ -80,7 +80,7 @@ The scratch disk starts from an ext4 template embedded in `kiln-image`. `assets/
 Known limitations:
 - Cloud Hypervisor 53 cannot grow the scratch disk online beyond about 8 GiB (the resize hangs), and under nested virtualization (Lima on Apple Silicon) growth is unreliable at any size. Firecracker grows it to 64 GiB and is the reference VMM. kiln's default disk is 4 GiB.
 - Signals are 1 to 31. An image whose `STOPSIGNAL` is a real-time signal is refused.
-- Under nested virtualization (Lima on Apple Silicon), Cloud Hypervisor 53 guests sometimes stall, more often in vsock-heavy cases (stdio streaming, protocol abuse); rerun the failed cases there. Firecracker does not.
+- Under nested virtualization (Lima on Apple Silicon), Cloud Hypervisor 53 guests sometimes stall, more often in vsock-heavy cases (stdio streaming, protocol abuse); rerun the failed cases there.
 
 ## Docs
 

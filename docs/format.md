@@ -183,7 +183,6 @@ Other header numeric fields (mode, uid, gid, mtime, device numbers) that hold on
 
 ### Determinism
 
-```markdown
 Output depends only on the tar content, the resolved inherited attributes and the format version. Any change to output bytes requires a new format version; golden digests for each version are immutable.
 
 ## Guest
@@ -209,7 +208,7 @@ The scratch disk starts as the ext4 template `crates/kiln-image/assets/ext4-temp
 
 The host decompresses the template into a sparse file (blocks of zeros stay holes) and extends it to the run's size, a multiple of 4096 of at least 64 MiB. The guest grows the filesystem to exactly that size.
 
-Growing online to 64 GiB works on Firecracker. On Cloud Hypervisor 53 the resize hangs beyond roughly 8 GiB: Cloud Hypervisor offers WRITE_ZEROES on the disk, the kernel then zeroes the new inode tables through it, and that never completes. 8 GiB works when the host is not nested, as does kiln's default of 4 GiB. Under nested virtualization (Lima on Apple Silicon) Cloud Hypervisor 53 growth is unreliable at smaller sizes too. Firecracker is the reference VMM.
+Growing online to 64 GiB works on Firecracker. On Cloud Hypervisor 53 the resize hangs beyond roughly 8 GiB: Cloud Hypervisor offers WRITE_ZEROES on the disk, the kernel then zeroes the new inode tables through it, and that never completes. 8 GiB works when the host is not nested, as does kiln's default of 4 GiB. Under nested virtualization (Lima on Apple Silicon) Cloud Hypervisor 53 growth is unreliable at smaller sizes too. Cloud Hypervisor 53 guests under nested virtualization also sometimes stall, more often in vsock-heavy cases (stdio streaming, protocol abuse). Firecracker is the reference VMM.
 
 ### Boot sequence
 
@@ -225,7 +224,7 @@ Growing online to 64 GiB works on Firecracker. On Cloud Hypervisor 53 the resize
 | 6 | process | Starts the main process (below) and sends `Running`. |
 | 7 | supervise | Reaps every process and handles host messages and signals until the main process exits (below). |
 
-`/etc/hosts` has Docker's layout: `127.0.0.1 localhost`, the IPv6 loopback and multicast names, then the guest's address (or `127.0.1.1` without a network) with the hostname. `/etc/resolv.conf` lists `Config.network.dns` as `nameserver` lines; without a network it holds only the comment `# kiln: this VM has no network`.
+`/etc/hosts` has Docker's layout: `127.0.0.1 localhost`, the IPv6 loopback and multicast names, then the guest's address (or `127.0.1.1` without a network) with the hostname. `/etc/resolv.conf` lists `Config.network.dns` as `nameserver` lines; without a network it holds only the comment `# kiln: this VM has no network`, and with a network but no DNS servers only `# kiln: no DNS servers configured`.
 
 **The main process** (stage 6):
 - **User:** `Config.process.user` is `user`, `uid`, `user:group` or `uid:gid`, resolved with runc's rules against the image's `/etc/passwd` and `/etc/group` (missing files read as empty; malformed lines are skipped). A name must exist; a number need not. A matched user gets its passwd gid and home. An explicit group (a name that must exist, or any number) replaces the gid; without one, a user matched by passwd also gets every group that lists it as a member. The process's groups are the gid followed by those, without duplicates. No user means root.
@@ -280,9 +279,9 @@ A frame is a `u32` little-endian length, then a `u8` message type, then the payl
 | Field | Type | Rules |
 |---|---|---|
 | `process.entrypoint`, `process.cmd` | lists of strings (default empty) | Together the argv; it must be non-empty, with a non-empty argv[0]. |
-| `process.env` | list of `KEY=value` (default empty) | `KEY` non-empty. The final environment: the host has already merged the image's env and overrides. |
+| `process.env` | list of `KEY=value` (default empty) | `KEY` (the text before the first `=`) non-empty and without control characters; the value may be empty. The final environment: the host has already merged the image's env and overrides. |
 | `process.workingDir` | string, optional | Absolute. |
-| `process.user` | string, optional | `user` or `user:group`, both parts non-empty, no newline. |
+| `process.user` | string, optional | `user` or `user:group`, both parts non-empty, without control characters (newline included). |
 | `stopSignal` | integer | 1–31. |
 | `tty` | `{rows, cols}`, optional | Run on a pseudo-terminal of this initial size. |
 | `interactive` | boolean | Relay stdin. |
