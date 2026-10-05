@@ -318,3 +318,40 @@ fn oversized_metadata_is_a_typed_error() {
         Err(OciError::MetadataTooLarge { .. })
     ));
 }
+
+#[test]
+fn ref_names_match_after_normalisation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut b = LayoutBuilder::new(&tmp.path().join("layout"));
+    let php = b.image(&arm(), &[TestLayer::tar(layer_tar("php"))], cfg());
+    let odd = b.image(&arm(), &[TestLayer::tar(layer_tar("odd"))], cfg());
+    let dir = b
+        .add(php.clone(), Some("docker.io/library/php:8.4-cli"))
+        .add(odd.clone(), Some("Not A Reference"))
+        .finish();
+    let store = Store::open(tmp.path().join("store")).unwrap();
+    let src = LocalSource::Layout(dir);
+    for want in ["php:8.4-cli", "library/php:8.4-cli", "docker.io/library/php:8.4-cli"] {
+        let r = resolve_local(&store, &src, Some(want), &[arm()]).unwrap();
+        assert_eq!(r[0].manifest_digest, php.digest, "{want}");
+        assert_eq!(r[0].ref_name.as_deref(), Some(want));
+    }
+    assert!(matches!(
+        resolve_local(&store, &src, Some("php:8.3-cli"), &[arm()]),
+        Err(OciError::RefNotFound { .. })
+    ));
+    // Names that are not references still match exactly.
+    let r = resolve_local(&store, &src, Some("Not A Reference"), &[arm()]).unwrap();
+    assert_eq!(r[0].manifest_digest, odd.digest);
+
+    let archive = tmp.path().join("legacy.tar");
+    docker_legacy_archive(&archive, &arm(), &[layer_tar("x")], cfg(), "php:8.4-cli");
+    let r = resolve_local(
+        &store,
+        &LocalSource::Archive(archive),
+        Some("docker.io/library/php:8.4-cli"),
+        &[arm()],
+    )
+    .unwrap();
+    assert_eq!(r.len(), 1);
+}

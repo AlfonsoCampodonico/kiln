@@ -3,6 +3,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use kiln_registry::Reference;
 use kiln_store::{Digest, MAX_METADATA_BLOB, Store, StoreError};
 use serde::Deserialize;
 
@@ -39,7 +40,9 @@ impl LocalSource {
     }
 }
 
-/// One platform's image, with its manifest, config and layers verified into the store.
+/// One platform's image. Its manifest and config are verified into the store; so
+/// are its layers for local sources, while registry layers are fetched later,
+/// only when a conversion needs them.
 #[derive(Debug, Clone)]
 pub struct ResolvedImage {
     pub platform: Platform,
@@ -106,6 +109,16 @@ fn ingest_metadata(store: &Store, src: &dyn BlobSource, d: &Descriptor) -> Resul
     Ok(store.read_metadata(&d.digest)?)
 }
 
+/// Whether a name from the source selects the wanted `--ref`: equal normalised
+/// references when both parse (`php:8.4-cli` is `docker.io/library/php:8.4-cli`),
+/// else equal strings.
+pub(crate) fn same_name(want: &str, name: &str) -> bool {
+    match (Reference::parse(want), Reference::parse(name)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => want == name,
+    }
+}
+
 fn names(d: &Descriptor) -> Vec<String> {
     [REF_NAME, CONTAINERD_NAME]
         .iter()
@@ -115,7 +128,7 @@ fn names(d: &Descriptor) -> Vec<String> {
 
 /// Attestation manifests that Docker 25+ (`docker save`) and BuildKit list beside
 /// images. They are never images, so selection skips them.
-fn is_attestation(d: &Descriptor) -> bool {
+pub(crate) fn is_attestation(d: &Descriptor) -> bool {
     d.annotation("io.containerd.manifest.subject").is_some()
         || d.annotation("vnd.docker.reference.type") == Some("attestation-manifest")
         || d.platform.as_ref().is_some_and(|p| p.os == "unknown")
@@ -132,7 +145,7 @@ fn resolve_layout(
     let top = match ref_name {
         Some(want) => *candidates
             .iter()
-            .find(|d| names(d).iter().any(|n| n == want))
+            .find(|d| names(d).iter().any(|n| same_name(want, n)))
             .ok_or_else(|| OciError::RefNotFound {
                 wanted: want.to_string(),
                 available: candidates.iter().flat_map(|d| names(d)).collect(),
@@ -159,20 +172,7 @@ fn resolve_layout(
         platforms
             .iter()
             .map(|want| {
-                let d = inner
-                    .manifests
-                    .iter()
-                    .find(|m| m.platform.as_ref().is_some_and(|p| want.matches(p)))
-                    .ok_or_else(|| OciError::MissingPlatform {
-                        wanted: want.to_string(),
-                        available: inner
-                            .manifests
-                            .iter()
-                            .filter_map(|m| m.platform.as_ref())
-                            .filter(|p| p.os != "unknown")
-                            .map(|p| p.to_string())
-                            .collect(),
-                    })?;
+                let d = pick_platform(&inner, want)?;
                 let bytes = ingest_metadata(store, src, d)?;
                 finish_manifest(store, src, d, &bytes, want, image_name.clone())
             })
@@ -187,15 +187,28 @@ fn resolve_layout(
     }
 }
 
-/// Validates a manifest, then verifies its config and layers into the store.
-fn finish_manifest(
-    store: &Store,
-    src: &dyn BlobSource,
-    d: &Descriptor,
-    bytes: &[u8],
-    want: &Platform,
-    ref_name: Option<String>,
-) -> Result<ResolvedImage> {
+/// The entry of a multi-platform index for `want` (attestations never match).
+pub(crate) fn pick_platform<'a>(index: &'a ImageIndex, want: &Platform) -> Result<&'a Descriptor> {
+    index
+        .manifests
+        .iter()
+        .filter(|m| !is_attestation(m))
+        .find(|m| m.platform.as_ref().is_some_and(|p| want.matches(p)))
+        .ok_or_else(|| OciError::MissingPlatform {
+            wanted: want.to_string(),
+            available: index
+                .manifests
+                .iter()
+                .filter(|m| !is_attestation(m))
+                .filter_map(|m| m.platform.as_ref())
+                .map(|p| p.to_string())
+                .collect(),
+        })
+}
+
+/// Parses a per-platform manifest and rejects unsupported config and layer types
+/// before anything large is fetched (spec §6.1 step 2).
+pub(crate) fn parse_manifest(d: &Descriptor, bytes: &[u8]) -> Result<ImageManifest> {
     if !media::is_manifest(&d.media_type) {
         return Err(OciError::UnsupportedMediaType(d.media_type.clone()));
     }
@@ -203,12 +216,23 @@ fn finish_manifest(
     if !media::is_config(&manifest.config.media_type) {
         return Err(OciError::UnsupportedMediaType(manifest.config.media_type.clone()));
     }
-    // Reject unsupported layers before fetching anything large.
     for l in &manifest.layers {
         media::layer_compression(&l.media_type)?;
     }
-    let config_bytes = ingest_metadata(store, src, &manifest.config)?;
-    let config: ImageConfig = json("image config", &config_bytes)?;
+    if manifest.config.size > MAX_METADATA_BLOB {
+        return Err(StoreError::TooLarge {
+            digest: manifest.config.digest.clone(),
+            size: manifest.config.size,
+            max: MAX_METADATA_BLOB,
+        }
+        .into());
+    }
+    Ok(manifest)
+}
+
+/// Parses a verified config and checks its platform and `diff_ids` against the manifest.
+pub(crate) fn parse_config(manifest: &ImageManifest, bytes: &[u8], want: &Platform) -> Result<ImageConfig> {
+    let config: ImageConfig = json("image config", bytes)?;
     let platform = config.platform();
     if !want.matches(&platform) {
         return Err(OciError::MissingPlatform {
@@ -222,11 +246,25 @@ fn finish_manifest(
             diff_ids: config.rootfs.diff_ids.len(),
         });
     }
+    Ok(config)
+}
+
+/// Validates a manifest, then verifies its config and layers into the store.
+fn finish_manifest(
+    store: &Store,
+    src: &dyn BlobSource,
+    d: &Descriptor,
+    bytes: &[u8],
+    want: &Platform,
+    ref_name: Option<String>,
+) -> Result<ResolvedImage> {
+    let manifest = parse_manifest(d, bytes)?;
+    let config = parse_config(&manifest, &ingest_metadata(store, src, &manifest.config)?, want)?;
     for l in &manifest.layers {
         ingest(store, src, l)?;
     }
     Ok(ResolvedImage {
-        platform,
+        platform: config.platform(),
         manifest_digest: d.digest.clone(),
         config_digest: manifest.config.digest.clone(),
         manifest,
@@ -256,7 +294,7 @@ fn resolve_legacy(
     let entry = match ref_name {
         Some(want) => entries
             .iter()
-            .find(|e| tags(e).iter().any(|t| t == want))
+            .find(|e| tags(e).iter().any(|t| same_name(want, t)))
             .ok_or_else(|| OciError::RefNotFound {
                 wanted: want.to_string(),
                 available: entries.iter().flat_map(tags).collect(),

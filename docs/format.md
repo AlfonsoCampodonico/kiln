@@ -1,6 +1,6 @@
 # kiln formats
 
-This document is normative. It defines the **kiln image** (schema version 1, provisional until M3 adds kernel and init layers) and the **erofs profile** (format version 1). The control protocol (§9.5 of the design spec) is added by milestone M3.
+This document is normative. It defines the **kiln image** (schema version 1, provisional until M3 adds kernel and init layers), the **erofs profile** (format version 1), the **guest** that `kiln-init` sets up (devices, init layer, scratch disk, boot sequence) and the **control protocol** (version 1) between `kiln-init` and the host.
 
 ## kiln image, schema version 1
 
@@ -184,3 +184,139 @@ Other header numeric fields (mode, uid, gid, mtime, device numbers) that hold on
 ### Determinism
 
 Output depends only on the tar content, the resolved inherited attributes and the format version. Any change to output bytes requires a new format version; golden digests for each version are immutable.
+
+## Guest
+
+### Devices
+
+The VM's block devices, in this order (Linux names them `vda`, `vdb`, …):
+1. `vda`, read-only: the init layer.
+2. `vdb`, read-write: the scratch disk.
+3. `vdc` onward, read-only: the app layers, lowest first. `vdz` is followed by `vdaa`.
+
+vsock gives the guest CID 3. The kernel command line is `root=/dev/vda ro rootfstype=erofs init=/kiln-init panic=-1 quiet loglevel=3`, followed by the VMM's console and backend parameters.
+
+### Init layer
+
+An erofs profile image of exactly these entries, each owned by 0:0 with mtime 0: the directories `/`, `/dev`, `/kiln`, `/proc` and `/sys` (mode 0755) and the static `kiln-init` binary at `/kiln-init` (mode 0755). The same binary always gives the same bytes.
+
+### Scratch disk
+
+The scratch disk starts as the ext4 template `crates/kiln-image/assets/ext4-template.img.zst` (zstd; SHA-256 `29a11ac3061b3adc119b95917100e702130eb6cc1f686981bb84f70da1370e1d`), which `assets/make-ext4-template.sh` regenerates byte for byte:
+- 64 MiB, made with `mke2fs -t ext4 -b 4096 -I 256 -i 65536 -O meta_bg,^resize_inode -U 6b696c6e-7363-7261-7463-680000000001 -E hash_seed=6b696c6e-6861-7368-7365-656400000001,lazy_itable_init=1,lazy_journal_init=0,nodiscard,root_owner=0:0` from e2fsprogs 1.47.2-3+b12, with `E2FSPROGS_FAKE_TIME=1`;
+- the superblock's `s_flags` set to 2 (unsigned directory hashes), which `mke2fs` would otherwise take from the build machine's `char` signedness.
+
+The host decompresses the template into a sparse file (blocks of zeros stay holes) and extends it to the run's size, a multiple of 4096 of at least 64 MiB. The guest grows the filesystem to exactly that size.
+
+Growing online to 64 GiB works on Firecracker. On Cloud Hypervisor 53 the resize hangs beyond roughly 8 GiB: Cloud Hypervisor offers WRITE_ZEROES on the disk, the kernel then zeroes the new inode tables through it, and that never completes. 8 GiB and kiln's default of 4 GiB are expected to work without nesting; this is unverified on bare metal. Under nested virtualization (Lima on Apple Silicon) Cloud Hypervisor 53 growth is unreliable at smaller sizes too. Cloud Hypervisor 53 guests under nested virtualization also sometimes stall, more often in vsock-heavy cases (stdio streaming, protocol abuse). Firecracker is the reference VMM.
+
+### Differences from Docker
+
+`kiln-init` sets the guest up much as Docker sets up a container, with these deliberate differences:
+- **PID 1:** init is PID 1, as with `docker run --init`; the main process is not. An app without a SIGTERM handler therefore exits on `Shutdown` at once, with 143, where under Docker it would be ignored as PID 1 and killed after the grace period with 137.
+- **`/sys` and cgroup2** are mounted read-write (`nosuid,nodev,noexec`); Docker mounts them read-only.
+- **`/dev/shm`** is a tmpfs with `nosuid,nodev` and mode 1777, without `noexec` and without Docker's `size=64m`, so its size is the tmpfs default of half the guest's RAM.
+- **`/dev`** is the kernel's full devtmpfs, not Docker's minimal tmpfs, so every device the guest kernel has is visible.
+- **`/dev/console`** is the VM's serial console; what is written to it lands in the VM's `console.log`.
+
+### Boot sequence
+
+`kiln-init` runs as PID 1 through seven stages:
+
+| Stage | Name | What it does |
+|---|---|---|
+| 1 | early | Mounts `proc` and `sysfs` (`nosuid,nodev,noexec`), and `devtmpfs` unless the kernel mounted it; `reboot(CAD_OFF)`, so Ctrl-Alt-Del becomes SIGINT to init. |
+| 2 | control | Connects vsock port 1024, sends `Hello`, receives `Config`. |
+| 3 | storage | A tmpfs at `/kiln`; app layer `n` mounted read-only (erofs) at `/kiln/layers/<n>`; the scratch disk mounted at `/kiln/rw` with `noinit_itable` and grown online with `EXT4_IOC_RESIZE_FS` (it fails if `vdb` is smaller than `Config.scratch.sizeBytes`); `upper/` and `work/` created on it; the overlay mounted at `/kiln/root` with one mount(2) call and the data `lowerdir=<top…bottom>,upperdir=/kiln/rw/upper,workdir=/kiln/rw/work,xino=on,redirect_dir=off,index=off,metacopy=off`. Without layers, the only lower directory is the empty `/kiln/empty`. |
+| 4 | root | Creates missing `/etc`, `/proc`, `/sys`, `/dev` in the overlay (they land in the upper layer); mounts `proc`, `sysfs`, `cgroup2` on `/sys/fs/cgroup` and `mqueue` on `/dev/mqueue` (each `nosuid,nodev,noexec`), `devtmpfs` (`nosuid`), `devpts` (`nosuid,noexec`, `newinstance,ptmxmode=0666,mode=0620,gid=5`) and a tmpfs on `/dev/shm` (`nosuid,nodev`, mode 1777); replaces `/dev/fd`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/ptmx` with symlinks to `/proc/self/fd`, `/proc/self/fd/0`, `/proc/self/fd/1`, `/proc/self/fd/2` and `pts/ptmx`; `pivot_root(".", ".")` and detaches the old root. Nothing is mounted on `/run` or `/tmp`. |
+| 5 | identity | Sets the hostname; writes `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf` as new regular files (mode 0644, after unlinking whatever was there, so a symlink is replaced, never followed); brings up `lo`, and with `Config.network` brings up `eth0`, adds its address and a default route over rtnetlink. |
+| 6 | process | Starts the main process (below) and sends `Running`. |
+| 7 | supervise | Reaps every process and handles host messages and signals until the main process exits (below). |
+
+`/etc/hosts` has Docker's layout: `127.0.0.1 localhost`, the IPv6 loopback and multicast names, then the guest's address (or `127.0.1.1` without a network) with the hostname. `/etc/resolv.conf` lists `Config.network.dns` as `nameserver` lines; without a network it holds only the comment `# kiln: this VM has no network`, and with a network but no DNS servers only `# kiln: no DNS servers configured`.
+
+**The main process** (stage 6):
+- **User:** `Config.process.user` is `user`, `uid`, `user:group` or `uid:gid`, resolved with runc's rules against the image's `/etc/passwd` and `/etc/group` (missing files read as empty; malformed lines are skipped). A name must exist; a number need not. A matched user gets its passwd gid and home. An explicit group (a name that must exist, or any number) replaces the gid; without one, a user matched by passwd also gets every group that lists it as a member. The process's groups are the gid followed by those, without duplicates. No user means root.
+- **Environment:** `Config.process.env` as given, later entries replacing earlier ones with the same key, then `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `HOSTNAME=<hostname>`, `HOME=<passwd home, else />` and, in tty mode, `TERM=xterm`, each only when not already set.
+- **Working directory:** `Config.process.workingDir`, default `/`, created (mode 0755, owned by root) when missing.
+- **Stdio:** without `tty`, pipes relayed to vsock ports 1025–1027 (stdin is `/dev/null` and port 1025 is not connected unless `interactive`). With `tty`, a pseudo-terminal from the guest's devpts, set to the given size and relayed to port 1028; the process gets it as its controlling terminal.
+- The process runs in a new session. Then groups, gid and uid are set (all three real, effective and saved IDs), and argv (`entrypoint` followed by `cmd`) is executed, searching the environment's `PATH` when argv[0] has no `/`.
+
+**Supervision** (stage 7):
+- `Signal { sig }` is sent to the main process. `WindowSize` resizes the pseudo-terminal (ignored without `tty`).
+- `Shutdown { graceSecs }`, or SIGINT or SIGTERM to init (with `Config.shutdownGraceSecs`): `stopSignal` is sent to the main process (once), and when the grace period ends every process but init gets SIGKILL. A later request can shorten the deadline, never extend it.
+- When the main process exits, every other process gets SIGKILL and is reaped; then stdout and stderr (or the terminal) are relayed to EOF; then `Exited` is sent. The scratch filesystem is then synced and, on a best-effort basis, made read-only (EBUSY is ignored), and init ends the VM with `Config.exitMethod`.
+
+**Failure:** a failing stage prints `kiln-init: <stage name>: <error>` on the console, sends `InitFailed` when the control connection is up, sends SIGKILL to every other process, and ends the VM with `Config.exitMethod`, or with a reboot before `Config` arrived. A panic does the same. A protocol error from the host, or the host closing the control connection, is a failure too.
+
+## Control protocol, version 1
+
+### Transport
+
+The guest connects to the host (vsock CID 2) on these ports, and only the guest connects. With vmkit, the host listens on the Unix socket `<vm.vsock_socket()>_<port>` for each port it serves, bound before the VM starts.
+
+| Port | Stream | Direction | Connected |
+|---|---|---|---|
+| 1024 | control (framed, below) | both | stage 2, once |
+| 1025 | stdin, raw bytes | host → guest | stage 6, only with `interactive` and without `tty` |
+| 1026 | stdout, raw bytes | guest → host | stage 6, without `tty` |
+| 1027 | stderr, raw bytes | guest → host | stage 6, without `tty` |
+| 1028 | terminal, raw bytes | both | stage 6, only with `tty` |
+
+On the raw streams EOF is a half-close: the host shuts down its writing side of 1025 when stdin ends, and the guest shuts down its writing side of 1026, 1027 or 1028 when the process's output ends. The bytes are not interpreted.
+
+### Framing
+
+A frame is a `u32` little-endian length, then a `u8` message type, then the payload. The length counts the type byte and the payload: at least 1 and at most 65536. The payload is exactly one JSON object: its first byte is `{` and its last `}`, with no whitespace or data around it. Unknown fields, duplicate keys, wrong types and out-of-range values are errors, as are an unknown type, a type sent in the wrong direction, a length of 0 or over 65536 (rejected before the rest is read) and EOF inside a frame. EOF before a frame's first byte closes the connection cleanly. Both sides validate a message before sending it.
+
+### Messages
+
+| Type | Name | Direction | Payload |
+|---|---|---|---|
+| 1 | `Hello` | guest → host | `{"protocol": 1}`: the protocol version, at least 1. |
+| 2 | `Config` | host → guest | The run's configuration (below). |
+| 3 | `Stage` | guest → host | `{"n": 3}`: init entered stage `n` (1–7). Sent for stages 3 to 7; stages 1 and 2 precede it. |
+| 4 | `Running` | guest → host | `{}`: the main process started. |
+| 5 | `Exited` | guest → host | `{"signaled": false, "code": 0}`: the main process ended, and its output reached EOF. `code` is the exit status (0–255), or with `signaled` the signal that killed it (1–64). |
+| 6 | `InitFailed` | guest → host | `{"stage": 6, "errno": 2, "message": "…"}`: init failed at `stage` (1–7). `errno` (1–4095) is present at stage 6 only when executing the entrypoint failed; it may be present at other stages. `message` has at most 4096 bytes and is untrusted text. |
+| 7 | `Shutdown` | host → guest | `{"graceSecs": 10}`. |
+| 8 | `Signal` | host → guest | `{"sig": 1}`: a signal number from 1 to 31. |
+| 9 | `WindowSize` | host → guest | `{"rows": 24, "cols": 80}` (each 0–65535). |
+
+`Config` (camelCase keys; optional fields are omitted when unset, and a reader also accepts `null` for them):
+
+| Field | Type | Rules |
+|---|---|---|
+| `process.entrypoint`, `process.cmd` | lists of strings (default empty) | Together the argv; it must be non-empty, with a non-empty argv[0]. |
+| `process.env` | list of `KEY=value` (default empty) | `KEY` (the text before the first `=`) non-empty and without control characters; the value may be empty. The final environment: the host has already merged the image's env and overrides. |
+| `process.workingDir` | string, optional | Absolute. |
+| `process.user` | string, optional | `user` or `user:group`, both parts non-empty, without control characters (newline included). |
+| `stopSignal` | integer | 1–31. |
+| `tty` | `{rows, cols}`, optional | Run on a pseudo-terminal of this initial size. |
+| `interactive` | boolean | Relay stdin. |
+| `hostname` | string | 1–64 characters of `[A-Za-z0-9.-]`, the first alphanumeric. |
+| `network` | object, optional | `eth0`: `address` and `gateway` (dotted IPv4) in the same `/prefixLen` (8–30), the address neither the gateway nor the subnet's first or last address; `dns`: at most 3 IPv4 addresses. |
+| `layers` | integer | The number of app layers, 0–128. |
+| `scratch.sizeBytes` | integer | A multiple of 4096, at least 67108864. |
+| `exitMethod` | `"reboot"` or `"poweroff"` | How the guest ends the VM (vmkit's `guest_exit` capability). |
+| `shutdownGraceSecs` | integer | The grace period for SIGINT or SIGTERM to init. |
+
+No string may contain a NUL byte.
+
+The whole `Config` is one frame, and a frame is at most 65536 bytes including the type byte, so the JSON payload (argv, environment, hostname and every other field, with JSON escaping) must fit in 65535 bytes. Docker allows about 2 MiB for argv and environment (ARG_MAX). A larger `Config` fails with an oversize error when the host sends it, after the VM has booted.
+
+### Session
+
+1. The guest connects port 1024 and sends `Hello`. The host answers the first `Hello` with `Config`, once per VM.
+2. The guest sends `Stage` for stages 3 to 7, `Running` once the main process has started, then `Exited`, or `InitFailed` at any point. The host sends `Shutdown`, `Signal` and `WindowSize` at any time after `Config`.
+
+The host kills the VM, and reports 125, on any violation: a second connection to port 1024, a second `Hello` (a reset guest starting over), any message before `Hello`, a protocol version it does not support, or any framing or payload error. The guest treats a framing or payload error, a second `Config`, or the host closing port 1024 as a failure (InitFailed, then the VM ends).
+
+### Exit codes
+
+The host reports, as Docker does:
+- after `Exited`: `code`, or `128 + code` when `signaled`;
+- after `InitFailed` at stage 6: 127 when `errno` is 2 (ENOENT: the entrypoint was not found), 126 when `errno` is 13 or 21 (EACCES, EISDIR: found but not invokable);
+- after any other `InitFailed` (an unknown user or group, setgroups, ENOEXEC, ENOTDIR, any earlier stage), a protocol violation, a boot timeout, or a VM that ended without either message: 125.
+
+Signals are numbered as on Linux aarch64 and x86_64 (1 SIGHUP to 31 SIGSYS). Real-time signals are not supported: an image whose `STOPSIGNAL` is one (`SIGRTMIN+3`, or 32–64) is refused with an error that says so.
