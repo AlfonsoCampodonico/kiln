@@ -88,12 +88,13 @@ fn tty_mode_with_window_size_and_ctrl_c(backend: Backend) {
     let mut s = c.start(&fixtures().base, config, Reply::Config, Vec::new());
     assert!(s.wait_running(BOOT), "console:\n{}", c.tail());
     assert!(s.wait_output("isatty", BOOT), "console:\n{}", c.tail());
-    s.send(&HostMessage::WindowSize(WindowSize { rows: 50, cols: 132 }));
+    s.send(&HostMessage::WindowSize(WindowSize { rows: 50, cols: 132 }))
+        .expect("send to the guest");
     std::thread::sleep(Duration::from_millis(300));
-    s.tty_write(b"hello\r");
+    s.tty_write(b"hello\r").expect("write to the tty");
     assert!(s.wait_output("got:hello", BOOT));
     std::thread::sleep(Duration::from_millis(300));
-    s.tty_write(b"\x03");
+    s.tty_write(b"\x03").expect("write to the tty");
     let o = s.finish(END);
     ended_cleanly(&c, &o);
     let tty = o.tty();
@@ -112,7 +113,8 @@ fn shutdown_sends_the_stop_signal_then_kills_after_the_grace(backend: Backend) {
     );
     let mut s = c.start(&fixtures().base, config, Reply::Config, Vec::new());
     assert!(s.wait_output("up", BOOT), "console:\n{}", c.tail());
-    s.send(&HostMessage::Shutdown(Shutdown { grace_secs: 30 }));
+    s.send(&HostMessage::Shutdown(Shutdown { grace_secs: 30 }))
+        .expect("send to the guest");
     let o = s.finish(END);
     ended_cleanly(&c, &o);
     assert_eq!((o.exit_code(), o.stdout()), (7, "up\nTERM\n".into()));
@@ -125,7 +127,8 @@ fn shutdown_sends_the_stop_signal_then_kills_after_the_grace(backend: Backend) {
     config.stop_signal = 10;
     let mut s = c.start(&fixtures().base, config, Reply::Config, Vec::new());
     assert!(s.wait_output("up", BOOT));
-    s.send(&HostMessage::Shutdown(Shutdown { grace_secs: 30 }));
+    s.send(&HostMessage::Shutdown(Shutdown { grace_secs: 30 }))
+        .expect("send to the guest");
     let o = s.finish(END);
     ended_cleanly(&c, &o);
     assert_eq!((o.exit_code(), o.stdout()), (8, "up\nUSR1\n".into()));
@@ -135,7 +138,8 @@ fn shutdown_sends_the_stop_signal_then_kills_after_the_grace(backend: Backend) {
     let mut s = c.start(&fixtures().base, config, Reply::Config, Vec::new());
     assert!(s.wait_output("up", BOOT));
     let sent = std::time::Instant::now();
-    s.send(&HostMessage::Shutdown(Shutdown { grace_secs: 2 }));
+    s.send(&HostMessage::Shutdown(Shutdown { grace_secs: 2 }))
+        .expect("send to the guest");
     let o = s.finish(END);
     ended_cleanly(&c, &o);
     assert_eq!(o.exit_code(), 137);
@@ -150,9 +154,11 @@ fn signals_are_forwarded(backend: Backend) {
     );
     let mut s = c.start(&fixtures().base, config, Reply::Config, Vec::new());
     assert!(s.wait_output("up", BOOT), "console:\n{}", c.tail());
-    s.send(&HostMessage::Signal(Signal { sig: 1 }));
+    s.send(&HostMessage::Signal(Signal { sig: 1 }))
+        .expect("send to the guest");
     assert!(s.wait_output("HUP", BOOT));
-    s.send(&HostMessage::Signal(Signal { sig: 12 }));
+    s.send(&HostMessage::Signal(Signal { sig: 12 }))
+        .expect("send to the guest");
     let o = s.finish(END);
     ended_cleanly(&c, &o);
     assert_eq!(o.exit_code(), 5);
@@ -249,11 +255,24 @@ fn user_groups_env_and_workdir(backend: Backend) {
     ended_cleanly(&c, &o);
     assert_eq!(o.stdout(), "uid=1234 gid=5678 groups=5678\nhome=/\n");
 
-    // An unknown user fails stage 6 before exec: 125, as Docker reports it.
+    // An unknown user fails stage 6 before exec: 125, as Docker reports it. The
+    // guest must end the run itself (a timeout would also be 125).
     let mut config = sh(&c, "true");
     config.process.user = Some("nobody".into());
     let o = c.run(&fixtures().base, config);
+    ended_cleanly(&c, &o);
+    let f = o
+        .init_failed()
+        .unwrap_or_else(|| panic!("no InitFailed: {o:?}\n{}", c.tail()));
+    assert_eq!(f.stage, 6, "{f:?}");
+    assert!(!o.running());
     assert_eq!(o.exit_code(), EXIT_INFRA, "{o:?}");
+    assert!(
+        c.console()
+            .contains("kiln-init: process: unable to find user nobody: no matching entries in passwd file"),
+        "{}",
+        c.tail()
+    );
 }
 
 fn layers_and_whiteouts_through_the_overlay(backend: Backend) {
@@ -278,12 +297,16 @@ fn layers_and_whiteouts_through_the_overlay(backend: Backend) {
     }
 }
 
+/// Runs where the VMM has room for 83 devices: Firecracker. Cloud Hypervisor's
+/// machine allows 31 virtio devices (one is its RNG), so there the case is skipped
+/// with a message; `layers_and_whiteouts_through_the_overlay` covers 24 layers on both.
 fn many_layers_fit_one_mount_data_page(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     let deep = &fixtures().deep;
     // init, scratch and vsock take three devices.
-    if c.vmm.capabilities().available_devices() < deep.len() as u32 + 3 {
-        eprintln!("{backend:?} has no room for {DEEP_LAYERS} layers");
+    let (available, needed) = (c.vmm.capabilities().available_devices(), deep.len() as u32 + 3);
+    if available < needed {
+        eprintln!("skipped: {backend:?} has room for {available} devices, {DEEP_LAYERS} layers need {needed}");
         return;
     }
     let o = c.run(
@@ -450,7 +473,7 @@ fn host_protocol_violations_end_the_guest(backend: Backend) {
     let config = sh(&c, "echo up; sleep 1000");
     let mut s = c.start(&fixtures().base, config, Reply::Config, Vec::new());
     assert!(s.wait_output("up", BOOT), "console:\n{}", c.tail());
-    s.send_raw(&[3, 0, 0, 0, 250, b'{', b'}']);
+    s.send_raw(&[3, 0, 0, 0, 250, b'{', b'}']).expect("send to the guest");
     let o = s.finish(END);
     ended_cleanly(&c, &o);
     let f = o.init_failed().expect("InitFailed");

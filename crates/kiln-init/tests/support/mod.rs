@@ -82,7 +82,8 @@ pub fn env() -> Option<&'static Env> {
 
 /// Disk images shared by every test in the process (read-only to the VMs).
 pub struct Fixtures {
-    _dir: tempfile::TempDir,
+    /// `kiln-boot-<pid>` in the target's tmp directory (see `fixtures_dir`).
+    pub dir: PathBuf,
     pub init: PathBuf,
     /// One layer: busybox, users, `/etc` symlinks.
     pub base: Vec<PathBuf>,
@@ -101,16 +102,13 @@ pub fn fixtures() -> &'static Fixtures {
     static FIXTURES: OnceLock<Fixtures> = OnceLock::new();
     FIXTURES.get_or_init(|| {
         let env = env().expect("checked by Case::new");
-        let dir = tempfile::Builder::new()
-            .prefix("kiln-boot-")
-            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-            .unwrap();
-        let init = dir.path().join("init.erofs");
+        let dir = fixtures_dir();
+        let init = dir.join("init.erofs");
         let bin = std::fs::read(&env.init).expect("read KILN_TEST_INIT");
-        std::fs::write(&init, init_layer(&bin, dir.path()).unwrap()).unwrap();
+        std::fs::write(&init, init_layer(&bin, &dir).unwrap()).unwrap();
         let busybox = std::fs::read(&env.busybox).expect("read the static busybox");
         let base = base_layer(&busybox);
-        let store = Store::open(dir.path().join("store")).unwrap();
+        let store = Store::open(dir.join("store")).unwrap();
         let mut stack = vec![base.clone(), whiteouts_lower(), whiteouts_upper()];
         stack.extend((3..STACK_LAYERS).map(filler));
         let mut deep = vec![base.clone()];
@@ -120,17 +118,44 @@ pub fn fixtures() -> &'static Fixtures {
             let top = TarBuilder::new()
                 .file("bin/hostile", &bin, &Opts::default().mode(0o755))
                 .finish();
-            convert(&store, dir.path(), "hostile", vec![base.clone(), top])
+            convert(&store, &dir, "hostile", vec![base.clone(), top])
         });
         Fixtures {
             init,
-            base: convert(&store, dir.path(), "base", vec![base]),
-            stack: convert(&store, dir.path(), "stack", stack),
-            deep: convert(&store, dir.path(), "deep", deep),
+            base: convert(&store, &dir, "base", vec![base]),
+            stack: convert(&store, &dir, "stack", stack),
+            deep: convert(&store, &dir, "deep", deep),
             hostile,
-            _dir: dir,
+            dir,
         }
     })
+}
+
+/// A fresh `kiln-boot-<pid>` directory for this process's fixtures. Statics are
+/// never dropped, so a temporary directory would outlive every run; instead each
+/// run first removes the directories of test processes that are gone, leaving at
+/// most the latest run's and those of runs still going.
+fn fixtures_dir() -> PathBuf {
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    if let Ok(entries) = std::fs::read_dir(tmp) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("kiln-boot-")) else {
+                continue;
+            };
+            // Older runs used random suffixes; a numeric one is a pid, maybe still running.
+            let alive = rest
+                .parse::<u32>()
+                .is_ok_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
+            if !alive {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    let dir = tmp.join(format!("kiln-boot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000:App:/home/app:/bin/sh\n";
