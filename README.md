@@ -51,7 +51,7 @@ An argument that names an existing path is a local source; anything else must be
 
 ## The guest
 
-`kiln-init` is PID 1 of a kiln microVM. It stacks the image's layers with overlayfs on a scratch disk, sets the guest up as Docker sets up a container (mounts, `/etc/hosts`, users, environment), runs the image's process and relays its stdio over vsock; `docs/format.md` specifies the guest and the control protocol. It is a static musl binary, for aarch64 and x86_64:
+`kiln-init` is PID 1 of a kiln microVM. It stacks the image's layers with overlayfs on a scratch disk, sets the guest up much as Docker sets up a container (differences in `docs/format.md`; mounts, `/etc/hosts`, users, environment), runs the image's process and relays its stdio over vsock; `docs/format.md` specifies the guest and the control protocol. It is a static musl binary, for aarch64 and x86_64:
 
 ```bash
 rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl

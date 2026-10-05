@@ -319,7 +319,8 @@ fn many_layers_fit_one_mount_data_page(backend: Backend) {
 
 /// Spec §14: the template grows online to 64 GiB. Cloud Hypervisor 53 cannot grow it
 /// that far (resizing hangs on its WRITE_ZEROES support for the disk), so there the
-/// scratch disk is 8 GiB, which works; kiln's default is 4 GiB.
+/// scratch disk is 8 GiB, which is expected to work without nesting (unverified on bare
+/// metal); kiln's default is 4 GiB.
 fn the_scratch_disk_grows_online(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     let size: u64 = match backend {

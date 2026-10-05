@@ -19,6 +19,8 @@ struct SockaddrVm {
     zero: [u8; 3],
 }
 
+const _: () = assert!(size_of::<SockaddrVm>() == 16);
+
 /// A vsock address (rustix has none).
 struct VsockAddr {
     cid: u32,

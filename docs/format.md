@@ -208,7 +208,16 @@ The scratch disk starts as the ext4 template `crates/kiln-image/assets/ext4-temp
 
 The host decompresses the template into a sparse file (blocks of zeros stay holes) and extends it to the run's size, a multiple of 4096 of at least 64 MiB. The guest grows the filesystem to exactly that size.
 
-Growing online to 64 GiB works on Firecracker. On Cloud Hypervisor 53 the resize hangs beyond roughly 8 GiB: Cloud Hypervisor offers WRITE_ZEROES on the disk, the kernel then zeroes the new inode tables through it, and that never completes. 8 GiB works when the host is not nested, as does kiln's default of 4 GiB. Under nested virtualization (Lima on Apple Silicon) Cloud Hypervisor 53 growth is unreliable at smaller sizes too. Cloud Hypervisor 53 guests under nested virtualization also sometimes stall, more often in vsock-heavy cases (stdio streaming, protocol abuse). Firecracker is the reference VMM.
+Growing online to 64 GiB works on Firecracker. On Cloud Hypervisor 53 the resize hangs beyond roughly 8 GiB: Cloud Hypervisor offers WRITE_ZEROES on the disk, the kernel then zeroes the new inode tables through it, and that never completes. 8 GiB and kiln's default of 4 GiB are expected to work without nesting; this is unverified on bare metal. Under nested virtualization (Lima on Apple Silicon) Cloud Hypervisor 53 growth is unreliable at smaller sizes too. Cloud Hypervisor 53 guests under nested virtualization also sometimes stall, more often in vsock-heavy cases (stdio streaming, protocol abuse). Firecracker is the reference VMM.
+
+### Differences from Docker
+
+`kiln-init` sets the guest up much as Docker sets up a container, with these deliberate differences:
+- **PID 1:** init is PID 1, as with `docker run --init`; the main process is not. An app without a SIGTERM handler therefore exits on `Shutdown` at once, with 143, where under Docker it would be ignored as PID 1 and killed after the grace period with 137.
+- **`/sys` and cgroup2** are mounted read-write (`nosuid,nodev,noexec`); Docker mounts them read-only.
+- **`/dev/shm`** is a tmpfs with `nosuid,nodev` and mode 1777, without `noexec` and without Docker's `size=64m`, so its size is the tmpfs default of half the guest's RAM.
+- **`/dev`** is the kernel's full devtmpfs, not Docker's minimal tmpfs, so every device the guest kernel has is visible.
+- **`/dev/console`** is the VM's serial console; what is written to it lands in the VM's `console.log`.
 
 ### Boot sequence
 
@@ -293,6 +302,8 @@ A frame is a `u32` little-endian length, then a `u8` message type, then the payl
 | `shutdownGraceSecs` | integer | The grace period for SIGINT or SIGTERM to init. |
 
 No string may contain a NUL byte.
+
+The whole `Config` is one frame, and a frame is at most 65536 bytes including the type byte, so the JSON payload (argv, environment, hostname and every other field, with JSON escaping) must fit in 65535 bytes. Docker allows about 2 MiB for argv and environment (ARG_MAX). A larger `Config` fails with an oversize error when the host sends it, after the VM has booted.
 
 ### Session
 
