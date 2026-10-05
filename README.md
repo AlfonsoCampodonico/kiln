@@ -2,7 +2,7 @@
 
 kiln turns OCI container images into microVM images: one deterministic erofs filesystem per layer, stacked with overlayfs inside the guest. It runs natively on macOS and Linux, without root.
 
-Status: milestone M1b. `kiln convert` works on registry images and local inputs, and `kiln pull`/`kiln push` move kiln images through registries. `kiln run` comes next (M3).
+Status: milestone M3a. `kiln convert` works on registry images and local inputs, and `kiln pull`/`kiln push` move kiln images through registries. The guest side of running an image (`kiln-init`, the control protocol and the scratch disk) boots under Firecracker and Cloud Hypervisor in kiln's boot tests; `kiln run` comes next (M3b).
 
 ## Quickstart
 
@@ -50,8 +50,41 @@ An argument that names an existing path is a local source; anything else must be
 - `--store DIR` (or `$KILN_HOME`) selects the store; the default is `~/.local/share/kiln`.
 
 ## Docs
+## The guest
 
-- `docs/format.md`: the normative image format and erofs profile.
+`kiln-init` is PID 1 of a kiln microVM. It stacks the image's layers with overlayfs on a scratch disk, sets the guest up as Docker sets up a container (mounts, `/etc/hosts`, users, environment), runs the image's process and relays its stdio over vsock; `docs/format.md` specifies the guest and the control protocol. It is a static musl binary, for aarch64 and x86_64:
+
+```bash
+rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl -p kiln-init
+# rust-lld links musl binaries for the other architecture without a C cross toolchain.
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo build --release --target x86_64-unknown-linux-musl -p kiln-init
+```
+
+The boot tests (`crates/kiln-init/tests/boot.rs`) boot real guests through vmkit on both VMMs: exit codes, stdio, `-t`, shutdown and signals, users, many layers, scratch growth, networking and protocol abuse. They need Linux with KVM and the tools vmkit's own contract suite needs, which come with the vmkit revision kiln pins:
+
+```bash
+vmkit=$(dirname "$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "vmkit") | .manifest_path')")
+"$vmkit/scripts/install-vmms.sh"                  # Firecracker and Cloud Hypervisor, into ~/.local/bin
+"$vmkit/kernels/build.sh" "$(uname -m)" out       # the guest kernel
+cargo build --manifest-path "$vmkit/Cargo.toml" --bin vmkit-sandbox --target-dir target
+"$vmkit/scripts/install-apparmor.sh" "$PWD/target/debug/vmkit-sandbox"   # Ubuntu 23.10+ only; uses sudo
+sudo apt-get install busybox-static passt nftables
+KILN_TEST_NET=1 scripts/boot-tests.sh out/vmlinux-*-"$(uname -m)" -- --test-threads=4
+```
+
+`scripts/boot-tests.sh` builds `kiln-init` and the hostile test guest for the host's musl target and runs the suite; without its environment the tests are skipped. `KILN_TEST_NET=1` adds the networking case (pasta and nft), `KILN_TEST_KEEP=1` keeps each run directory with its console log, and `KILN_TEST_VCPUS` sets the guests' vCPUs (default 1). Cargo arguments go after the kernel, for example `firecracker::` to run one VMM.
+
+The scratch disk starts from an ext4 template embedded in `kiln-image`. `assets/make-ext4-template.sh` regenerates it with Docker, byte for byte; CI checks that it does.
+
+Known limitations:
+- Cloud Hypervisor 53 cannot grow the scratch disk online beyond about 8 GiB (the resize hangs), and under nested virtualization (Lima on Apple Silicon) growth is unreliable at any size. Firecracker grows it to 64 GiB and is the reference VMM. kiln's default disk is 4 GiB.
+- Signals are 1 to 31. An image whose `STOPSIGNAL` is a real-time signal is refused.
+- Under nested virtualization (Lima on Apple Silicon), Cloud Hypervisor 53 guests sometimes stall, more often in vsock-heavy cases (stdio streaming, protocol abuse); rerun the failed cases there. Firecracker does not.
+
+## Docs
+
+- `docs/format.md`: the normative image format, erofs profile, guest and control protocol.
 - `docs/superpowers/specs/2026-09-30-kiln-design.md`: the design.
 
 kiln prints image-supplied strings (command lines, environment, error paths) with control characters removed.
