@@ -1,6 +1,7 @@
 //! A hostile guest program for kiln-init's boot tests (spec §11.5): run as the workload,
 //! it connects to the host's control port a second time and sends `Hello`, as a
 //! reset guest would. The host must kill the VM. Build it static, like `kiln-init`.
+#![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
 fn main() {

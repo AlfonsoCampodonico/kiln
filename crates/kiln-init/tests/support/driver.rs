@@ -1,9 +1,10 @@
 //! A minimal host side of the control protocol (spec §9.5), for the boot tests.
 //! It is written so that `kiln run` (M3b) can lift it: listeners for every port
 //! are bound before the guest starts; the first `Hello` on the first control
-//! connection gets `Config`, once; stdio is relayed; and any protocol violation
+//! connection gets `Config`, once; stdio is relayed; any protocol violation
 //! (a second control connection or `Hello`, a message before `Hello`, a bad
-//! frame) kills the VM (T9).
+//! frame) kills the VM (T9); and so does a guest that is not `Running` within
+//! the boot timeout (spec §9.7). Host messages go out only after `Config`.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::Shutdown;
@@ -15,8 +16,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use kiln_proto::{
-    Config, EXIT_INFRA, Exited, GuestMessage, HostMessage, InitFailed, PROTOCOL_VERSION, port, read_message,
-    write_message,
+    Config, EXIT_INFRA, Exited, GuestMessage, HostMessage, InitFailed, PROTOCOL_VERSION, ProtoError, port,
+    read_message, write_message,
 };
 use vmkit::{Vm, VmEnd};
 
@@ -36,10 +37,36 @@ pub enum Event {
     Closed,
 }
 
+/// Why a host message was not sent.
+#[derive(Debug)]
+pub enum SendError {
+    /// The guest has not been answered with `Config` yet (or never connected):
+    /// nothing may precede it on the control connection.
+    NotConfigured,
+    /// The message could not be encoded, or the connection is gone (the VM ended).
+    Proto(ProtoError),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendError::NotConfigured => f.write_str("the guest has not been sent Config yet"),
+            SendError::Proto(e) => write!(f, "send to the guest: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SendError {}
+
+/// The control connection's writer for host messages, filled once `Config` is sent.
+pub type Slot = Arc<Mutex<Option<UnixStream>>>;
+
 /// Handles one control connection: answers the first `Hello`, forwards every
 /// message, and reports the first violation. Returns when the guest closes the
-/// connection or breaks the protocol.
-pub fn serve_control(stream: UnixStream, config: &Config, reply: &Reply, events: &Sender<Event>) {
+/// connection or breaks the protocol. Once the reply to `Hello` has been
+/// written, a clone of the connection goes into `writer`, so later host
+/// messages can neither precede nor interleave with `Config`.
+pub fn serve_control(stream: UnixStream, config: &Config, reply: &Reply, events: &Sender<Event>, writer: &Slot) {
     let mut reader = match stream.try_clone() {
         Ok(r) => r,
         Err(e) => {
@@ -47,7 +74,7 @@ pub fn serve_control(stream: UnixStream, config: &Config, reply: &Reply, events:
             return;
         }
     };
-    let mut writer = stream;
+    let mut writer_half = stream;
     let mut configured = false;
     loop {
         let event = match read_message::<_, GuestMessage>(&mut reader) {
@@ -58,12 +85,15 @@ pub fn serve_control(stream: UnixStream, config: &Config, reply: &Reply, events:
             Ok(Some(msg @ GuestMessage::Hello(_))) => {
                 configured = true;
                 let sent = match reply {
-                    Reply::Config => write_message(&mut writer, &HostMessage::Config(Box::new(config.clone())))
+                    Reply::Config => write_message(&mut writer_half, &HostMessage::Config(Box::new(config.clone())))
                         .map_err(|e| e.to_string()),
-                    Reply::Raw(bytes) => writer.write_all(bytes).map_err(|e| e.to_string()),
+                    Reply::Raw(bytes) => writer_half.write_all(bytes).map_err(|e| e.to_string()),
                 };
-                match sent {
-                    Ok(()) => Event::Guest(msg),
+                match sent.and_then(|()| writer_half.try_clone().map_err(|e| e.to_string())) {
+                    Ok(clone) => {
+                        *writer.lock().unwrap() = Some(clone);
+                        Event::Guest(msg)
+                    }
                     Err(e) => Event::Violation(format!("send Config: {e}")),
                 }
             }
@@ -263,23 +293,40 @@ impl Session {
                 return done(self);
             }
             match self.events.recv_timeout(left.min(Duration::from_millis(50))) {
-                Ok(Event::Guest(msg)) => self.messages.push(msg),
-                Ok(Event::Violation(why)) => {
-                    if self.violation.is_none() {
-                        self.violation = Some(why);
-                        self.vm.kill().expect("kill the VM");
-                    }
-                }
-                Ok(Event::Closed) | Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
+                Ok(event) => self.handle(event),
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
             }
         }
     }
 
-    /// Waits for `Running`; false if the VM ended or failed first.
+    fn handle(&mut self, event: Event) {
+        match event {
+            Event::Guest(msg) => self.messages.push(msg),
+            Event::Violation(why) => self.violate(why),
+            Event::Closed => {}
+        }
+    }
+
+    /// Records the first violation and kills the VM, if it still runs.
+    fn violate(&mut self, why: String) {
+        if self.violation.is_none() {
+            self.violation = Some(why);
+            if self.end.is_none() {
+                self.vm.kill().expect("kill the VM");
+            }
+        }
+    }
+
+    /// Waits for `Running`; false if the VM ended or failed first. A guest still
+    /// booting after `timeout` is killed: the boot timeout is a violation (spec §9.7, 125).
     pub fn wait_running(&mut self, timeout: Duration) -> bool {
-        self.pump(timeout, |s| {
+        let settled = self.pump(timeout, |s| {
             s.messages.contains(&GuestMessage::Running) || s.end.is_some() || s.violation.is_some()
-        }) && self.messages.contains(&GuestMessage::Running)
+        });
+        if !settled {
+            self.violate(format!("boot timeout: not running after {timeout:?}"));
+        }
+        self.messages.contains(&GuestMessage::Running)
     }
 
     /// Waits until the captured stdout (or tty output) contains `needle`.
@@ -290,25 +337,27 @@ impl Session {
         self.stdout.text().contains(needle) || self.tty.text().contains(needle)
     }
 
-    pub fn send(&self, msg: &HostMessage) {
+    /// Sends a host message; only after `Config`, never interleaved with it.
+    pub fn send(&self, msg: &HostMessage) -> Result<(), SendError> {
         let mut slot = self.control.lock().unwrap();
-        write_message(slot.as_mut().expect("the guest connected"), msg).expect("send to the guest");
+        let stream = slot.as_mut().ok_or(SendError::NotConfigured)?;
+        write_message(stream, msg).map_err(SendError::Proto)
     }
 
-    pub fn send_raw(&self, bytes: &[u8]) {
+    /// Sends raw bytes on the control connection (to test the guest's side of T9); only after `Config`.
+    pub fn send_raw(&self, bytes: &[u8]) -> Result<(), SendError> {
         let mut slot = self.control.lock().unwrap();
-        slot.as_mut()
-            .expect("the guest connected")
-            .write_all(bytes)
-            .expect("send to the guest");
+        let stream = slot.as_mut().ok_or(SendError::NotConfigured)?;
+        stream.write_all(bytes).map_err(|e| SendError::Proto(e.into()))
     }
 
-    pub fn tty_write(&self, bytes: &[u8]) {
+    /// Writes to the guest's terminal (`tty` mode), once the guest has connected it.
+    pub fn tty_write(&self, bytes: &[u8]) -> std::io::Result<()> {
         let mut slot = self.tty_in.lock().unwrap();
-        slot.as_mut()
-            .expect("the guest connected the tty")
-            .write_all(bytes)
-            .expect("write to the tty");
+        let stream = slot
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(ErrorKind::NotConnected, "the guest has not connected the tty"))?;
+        stream.write_all(bytes)
     }
 
     /// Runs until the VM ends (killing it after `timeout`), then collects the output.
@@ -324,6 +373,11 @@ impl Session {
         self.stop.store(true, Ordering::SeqCst);
         for t in self.threads.drain(..) {
             let _ = t.join();
+        }
+        // The control thread may have read the last messages (a late `Exited`)
+        // after the drain above; it has finished now, so take them too.
+        while let Ok(event) = self.events.try_recv() {
+            self.handle(event);
         }
         Outcome {
             messages: std::mem::take(&mut self.messages),
@@ -346,8 +400,6 @@ fn copy_into(mut stream: UnixStream, into: &Captured) {
     }
 }
 
-type Slot = Arc<Mutex<Option<UnixStream>>>;
-
 /// Serves the first control connection; a second one is a violation.
 fn spawn_control(
     listener: UnixListener,
@@ -360,14 +412,13 @@ fn spawn_control(
     let (stop, slot) = (stop.clone(), slot.clone());
     std::thread::spawn(move || {
         let Some(stream) = accept(&listener, &stop) else { return };
-        *slot.lock().unwrap() = Some(stream.try_clone().expect("clone the control socket"));
         let (watch_events, watch_stop) = (events.clone(), stop.clone());
         std::thread::spawn(move || {
             if accept(&listener, &watch_stop).is_some() {
                 let _ = watch_events.send(Event::Violation("a second control connection".into()));
             }
         });
-        serve_control(stream, &config, &reply, &events);
+        serve_control(stream, &config, &reply, &events, &slot);
     })
 }
 
