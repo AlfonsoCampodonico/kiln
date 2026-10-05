@@ -2,6 +2,7 @@
 
 use kiln_oci::media::OCI_INDEX;
 use kiln_oci::{ImageIndex, ImageManifest, Platform};
+use kiln_registry::Reference;
 use kiln_store::{Digest, Store};
 
 use crate::error::{ImageError, Result, json};
@@ -23,16 +24,23 @@ pub struct Loaded {
     pub entries: Vec<(Platform, KilnManifest)>,
 }
 
-/// A ref name, or a digest of a blob in the store.
+/// A digest of a blob in the store, or a ref name: as given, else normalised as
+/// an image reference (`php:8.4-cli` finds `docker.io/library/php:8.4-cli`).
 pub fn resolve_name(store: &Store, name: &str) -> Result<Digest> {
     if let Ok(d) = Digest::parse(name)
         && store.has_blob(&d)
     {
         return Ok(d);
     }
-    store
-        .get_ref(name)?
-        .ok_or_else(|| ImageError::RefNotFound(name.to_string()))
+    if let Some(d) = store.get_ref(name)? {
+        return Ok(d);
+    }
+    if let Ok(r) = Reference::parse(name)
+        && let Some(d) = store.get_ref(&r.to_string())?
+    {
+        return Ok(d);
+    }
+    Err(ImageError::RefNotFound(name.to_string()))
 }
 
 pub fn load_manifest(store: &Store, digest: &Digest) -> Result<KilnManifest> {

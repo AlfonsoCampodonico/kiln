@@ -6,6 +6,7 @@ license.workspace = true
 description = "OCI types and verified local image inputs (layouts, docker archives) for kiln"
 
 [dependencies]
+kiln-registry = { path = "../kiln-registry" }
 kiln-store = { path = "../kiln-store" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

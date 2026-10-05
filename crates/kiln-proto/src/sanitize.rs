@@ -1,4 +1,5 @@
-//! Sanitising untrusted text before printing it (spec §13, threat T8).
+//! Sanitising untrusted text before printing it (spec §13, threat T8): strings from
+//! images and from guests (`InitFailed`, console excerpts).
 
 /// Longest sanitised string, in characters.
 pub const MAX_CHARS: usize = 4096;

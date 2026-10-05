@@ -2,19 +2,23 @@
 #![forbid(unsafe_code)]
 
 mod bench;
-mod sanitize;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use kiln_image::{ConvertOptions, LocalRequest, Output, convert_local, import_image, load, resolve_name};
-use kiln_oci::Platform;
+use kiln_image::ImageError;
+use kiln_image::{
+    ConvertOptions, LocalRequest, Output, RegistryRequest, convert_local, convert_registry, import_image, load,
+    pull_image, push_image, resolve_name,
+};
+use kiln_oci::{OciError, Platform};
+use kiln_registry::{Client, DockerConfig, Reference, RegistryError};
 use kiln_store::Store;
 use serde_json::json;
 
-use crate::sanitize::clean_line;
+use kiln_proto::sanitize::clean_line;
 
 #[derive(Parser)]
 #[command(name = "kiln", version, about = "Build microVM images from OCI images")]
@@ -63,18 +67,44 @@ impl ConvertArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Convert a local OCI layout directory or `docker save` archive.
+    /// Convert an image: a local OCI layout directory or `docker save` archive,
+    /// or else a registry reference such as `php:8.4-cli`.
+    ///
+    /// An existing local path always wins over a reference of the same name;
+    /// write the full reference (`docker.io/library/php`) to force the registry.
+    /// A source that starts with `./`, `../`, `/` or `~`, or ends in `.tar`,
+    /// `.tar.gz` or `.tgz`, is always a path and is never looked up in a registry.
     Convert {
-        path: PathBuf,
-        /// Image to pick when the source holds several (its ref name).
+        #[arg(value_name = "PATH|REF")]
+        source: String,
+        /// Image to pick when a local source holds several (its ref name).
         #[arg(long = "ref", value_name = "NAME")]
         source_ref: Option<String>,
-        /// Name for the result (default: <file name>:latest).
+        /// Name for the result (default: <file name>:latest for a path, the
+        /// normalised reference for a registry image).
         #[arg(long)]
         tag: Option<String>,
         #[command(flatten)]
         args: ConvertArgs,
         /// Print a JSON summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pull a kiln image from a registry, verifying every blob.
+    Pull {
+        #[arg(value_name = "REF")]
+        reference: String,
+        /// Local name (default: the normalised reference).
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Push a kiln image to a registry.
+    Push {
+        name: String,
+        #[arg(value_name = "REF")]
+        reference: String,
         #[arg(long)]
         json: bool,
     },
@@ -119,6 +149,99 @@ fn open_store(cli: &Cli) -> Result<Store> {
     Store::open(&root).with_context(|| format!("opening store {}", root.display()))
 }
 
+/// A registry reference, and a client for its registry with the Docker config's credentials.
+fn registry(reference: &str) -> Result<(Reference, Client)> {
+    let r = Reference::parse(reference)?;
+    let c = client_for(&r)?;
+    Ok((r, c))
+}
+
+fn client_for(r: &Reference) -> Result<Client> {
+    Ok(Client::new(r.registry(), DockerConfig::from_env())?)
+}
+
+/// The tag for a registry image: `--tag`, else the normalised reference.
+fn reference_tag(tag: Option<&str>, r: &Reference) -> Result<String> {
+    match tag {
+        Some(t) => {
+            kiln_store::check_ref_name(t).context("invalid --tag")?;
+            Ok(t.to_string())
+        }
+        None => {
+            let t = r.to_string();
+            kiln_store::check_ref_name(&t).context("cannot use the reference as a local name; pass --tag")?;
+            Ok(t)
+        }
+    }
+}
+
+/// Whether a source is spelled like a path, so that it is never taken for a registry reference.
+fn looks_like_path(source: &str) -> bool {
+    ["./", "../", "/", "~"].iter().any(|p| source.starts_with(p))
+        || [".tar", ".tar.gz", ".tgz"].iter().any(|s| source.ends_with(s))
+}
+
+/// What `kiln convert` was asked to convert, decided before anything is created.
+enum Source<'a> {
+    Local(&'a Path),
+    Registry(Reference, Box<Client>),
+}
+
+fn classify_source<'a>(source: &'a str, source_ref: Option<&str>) -> Result<Source<'a>> {
+    let path = Path::new(source);
+    if path
+        .try_exists()
+        .with_context(|| format!("cannot access {}", clean_line(source)))?
+    {
+        return Ok(Source::Local(path));
+    }
+    if looks_like_path(source) {
+        bail!("{}: no such file or directory", clean_line(source));
+    }
+    if source_ref.is_some() {
+        bail!("--ref selects an image inside a local source; it does not apply to registry references");
+    }
+    let r = Reference::parse(source).with_context(|| {
+        format!(
+            "{} is not an existing path or a valid image reference",
+            clean_line(source)
+        )
+    })?;
+    let c = client_for(&r).map_err(|e| {
+        let hint = e.downcast_ref::<RegistryError>().is_some_and(suggests_a_mistyped_path);
+        e.context(no_local_path(&r, hint))
+    })?;
+    Ok(Source::Registry(r, Box::new(c)))
+}
+
+/// The registry error inside a convert error, if that is what it is.
+fn registry_error(e: &ImageError) -> Option<&RegistryError> {
+    match e {
+        ImageError::Registry(r) | ImageError::Oci(OciError::Registry(r)) => Some(r),
+        _ => None,
+    }
+}
+
+/// Whether a registry error may just mean the source was meant as a local path
+/// that does not exist: the image or its registry was not found, or was refused.
+fn suggests_a_mistyped_path(e: &RegistryError) -> bool {
+    matches!(
+        e,
+        RegistryError::NotFound { .. } | RegistryError::Unauthorized { .. } | RegistryError::Resolve { .. }
+    )
+}
+
+/// The context of a failed registry convert: the reference, and that no local
+/// path of that name exists either when the error suggests one was meant.
+fn no_local_path(r: &Reference, hint: bool) -> String {
+    let r = clean_line(&r.to_string());
+    if hint {
+        format!("{r} (no such local path either)")
+    } else {
+        r
+    }
+}
+
 fn default_tag(path: &Path) -> Result<String> {
     let stem = path
         .file_stem()
@@ -131,6 +254,11 @@ fn default_tag(path: &Path) -> Result<String> {
             clean_line(&path.display().to_string())
         ),
     }
+}
+
+/// The plural suffix for a count of `n`.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 fn human_size(n: u64) -> String {
@@ -153,6 +281,8 @@ fn convert_summary(out: &Output, tag: &str) -> serde_json::Value {
         "tag": tag,
         "digest": out.digest.to_string(),
         "mediaType": out.media_type,
+        "layersDownloaded": out.layers_downloaded,
+        "bytesDownloaded": out.bytes_downloaded,
         "images": out.images.iter().map(|c| json!({
             "platform": c.platform.to_string(),
             "manifest": c.manifest_digest.to_string(),
@@ -172,25 +302,50 @@ fn convert_summary(out: &Output, tag: &str) -> serde_json::Value {
 fn run(cli: Cli) -> Result<()> {
     match &cli.cmd {
         Cmd::Convert {
-            path,
+            source,
             source_ref,
             tag,
             args,
             json,
         } => {
-            let store = open_store(&cli)?;
-            let tag = match tag {
-                Some(t) => t.clone(),
-                None => default_tag(path)?,
-            };
-            kiln_store::check_ref_name(&tag).with_context(|| format!("invalid --tag {}", clean_line(&tag)))?;
             let platforms = args.platforms()?;
-            let req = LocalRequest {
-                source_ref: source_ref.as_deref(),
-                platforms: &platforms,
-                tag: Some(&tag),
+            let source = classify_source(source, source_ref.as_deref())?;
+            let tag = match &source {
+                Source::Local(path) => {
+                    let tag = match tag {
+                        Some(t) => t.clone(),
+                        None => default_tag(path)?,
+                    };
+                    kiln_store::check_ref_name(&tag).with_context(|| format!("invalid --tag {}", clean_line(&tag)))?;
+                    tag
+                }
+                Source::Registry(r, _) => reference_tag(tag.as_deref(), r)?,
             };
-            let out = convert_local(&store, path, &req, &args.options())?;
+            let store = open_store(&cli)?;
+            let out = match &source {
+                Source::Local(path) => {
+                    let req = LocalRequest {
+                        source_ref: source_ref.as_deref(),
+                        platforms: &platforms,
+                        tag: Some(&tag),
+                    };
+                    convert_local(&store, path, &req, &args.options())?
+                }
+                Source::Registry(r, client) => {
+                    let req = RegistryRequest {
+                        platforms: &platforms,
+                        tag: Some(&tag),
+                    };
+                    convert_registry(&store, client, r, &req, &args.options()).map_err(|e| {
+                        if matches!(e, ImageError::KilnRemote(_)) {
+                            // Already names the reference and says what to do.
+                            return anyhow::Error::from(e);
+                        }
+                        let hint = registry_error(&e).is_some_and(suggests_a_mistyped_path);
+                        anyhow::Error::from(e).context(no_local_path(r, hint))
+                    })?
+                }
+            };
             if *json {
                 println!("{}", serde_json::to_string_pretty(&convert_summary(&out, &tag))?);
                 return Ok(());
@@ -198,10 +353,11 @@ fn run(cli: Cli) -> Result<()> {
             for c in &out.images {
                 let cached = c.layers.iter().filter(|l| l.cached).count();
                 print!(
-                    "{}  {}  {} layers ({cached} cached)",
+                    "{}  {}  {} layer{} ({cached} cached)",
                     clean_line(&c.platform.to_string()),
                     c.manifest_digest,
-                    c.layers.len()
+                    c.layers.len(),
+                    plural(c.layers.len())
                 );
                 if c.squashed > 0 {
                     print!(", bottom {} squashed", c.squashed);
@@ -211,7 +367,51 @@ fn run(cli: Cli) -> Result<()> {
                     eprintln!("warning: {}", clean_line(w));
                 }
             }
-            println!("{tag} → {}", out.digest);
+            if out.layers_downloaded > 0 {
+                println!(
+                    "downloaded {} layer{} ({})",
+                    out.layers_downloaded,
+                    plural(out.layers_downloaded),
+                    human_size(out.bytes_downloaded)
+                );
+            }
+            println!("{} → {}", clean_line(&tag), out.digest);
+        }
+        Cmd::Pull { reference, tag, json } => {
+            let store = open_store(&cli)?;
+            let (r, client) = registry(reference)?;
+            let tag = reference_tag(tag.as_deref(), &r)?;
+            let rep = pull_image(&store, &client, &r, &tag)?;
+            if *json {
+                let v = json!({"tag": tag, "digest": rep.digest.to_string(), "blobs": rep.blobs, "bytes": rep.bytes, "skipped": rep.skipped});
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            println!(
+                "{} → {} ({} blobs, {} downloaded)",
+                clean_line(&tag),
+                rep.digest,
+                rep.blobs,
+                human_size(rep.bytes)
+            );
+        }
+        Cmd::Push { name, reference, json } => {
+            let store = open_store(&cli)?;
+            let (r, client) = registry(reference)?;
+            let rep = push_image(&store, &client, name, &r)?;
+            if *json {
+                let v = json!({"reference": r.to_string(), "digest": rep.digest.to_string(), "blobs": rep.blobs, "bytes": rep.bytes, "skipped": rep.skipped});
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            println!(
+                "{} → {} ({} blobs, {} uploaded, {} already present)",
+                rep.digest,
+                clean_line(&r.to_string()),
+                rep.blobs,
+                human_size(rep.bytes),
+                rep.skipped
+            );
         }
         Cmd::Import {
             from_store,
@@ -373,6 +573,37 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_missing_or_refused_images_suggest_a_mistyped_path() {
+        let not_found = RegistryError::NotFound {
+            what: "manifest",
+            url: "u".into(),
+            detail: String::new(),
+        };
+        let unauthorized = RegistryError::Unauthorized {
+            url: "u".into(),
+            status: 401,
+            detail: String::new(),
+        };
+        let resolve = RegistryError::Resolve {
+            host: "h".into(),
+            source: std::io::Error::other("no such host"),
+        };
+        for e in [not_found, unauthorized, resolve] {
+            assert!(suggests_a_mistyped_path(&e), "{e}");
+            let e = ImageError::Oci(OciError::Registry(e));
+            assert!(registry_error(&e).is_some_and(suggests_a_mistyped_path), "{e}");
+        }
+        assert!(!suggests_a_mistyped_path(&RegistryError::Schema1));
+        assert!(registry_error(&ImageError::UnsupportedPlatform("linux/s390x".into())).is_none());
+        let r = Reference::parse("php:8.4-cli").unwrap();
+        assert_eq!(
+            no_local_path(&r, true),
+            "docker.io/library/php:8.4-cli (no such local path either)"
+        );
+        assert_eq!(no_local_path(&r, false), "docker.io/library/php:8.4-cli");
+    }
 
     #[test]
     fn render_error_is_one_sanitised_line() {
