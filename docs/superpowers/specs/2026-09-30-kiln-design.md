@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.2: 2026-10-02)
-**Status:** Draft rev 2.2, awaiting review
+**Date:** 2026-09-30 (rev 2.4: 2026-10-02)
+**Status:** Draft rev 2.4, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:** `../../../../ROADMAP.md` (projects #1 snapshot registry and #2 agent sandbox)
 
@@ -21,6 +21,14 @@
 
   §7.4 also records three deliberate divergences, and §12 splits M1 into M1a and M1b.
 - **rev 2.2 (2026-10-02):** §5.2 and §6.2 layer cache keys include the verified `diff_id`, found by the M1b-1 task review: a key on the compressed digest alone let a warm store skip the `diff_id` check. §7.6 states that cached layers do not count toward the per-image limit.
+- **rev 2.3 (2026-10-02):** §4.1 aligned with vmkit M2a: version checks at discovery, Cloud Hypervisor serial on stdout, Landlock rules in vm.create.
+- **rev 2.4 (2026-10-02):** §4.1, §9.2 and §9.3 aligned with the validated M2b plan:
+  - the sandbox is a helper binary with an AppArmor profile;
+  - the VMM's directory is `<run_dir>/sock`;
+  - cgroups come from a systemd user scope;
+  - DNS and port forwards are DNAT'd, and pasta handles loopback resolver stubs;
+  - `deny-all` honours `allow`;
+  - pasta's version floor is documented rather than checked.
 
 ---
 
@@ -142,7 +150,7 @@ VMM-neutral VM lifecycle, sandboxing, networking and kernel profiles.
   - Optional network (§9.3), vsock (always present for `kiln`), and a console log path.
   - Sandbox options (§9.2).
 - **Drivers: `firecracker` and `cloud-hypervisor`.** Each spawns the VMM inside the sandbox and drives its REST API over a Unix socket. Backend-specific details the drivers hide:
-  - **Console:** `ttyS0` on Firecracker on both arches and on Cloud Hypervisor x86_64 (with `--serial file=… --console off`); `ttyAMA0` on Cloud Hypervisor aarch64.
+  - **Console:** `ttyS0` on Firecracker on both arches and on Cloud Hypervisor x86_64 (guest serial in `tty` mode on the VMM's stdout, which `vmkit` appends to the console log because a `file=` serial is truncated when the guest resets; `--console off`); `ttyAMA0` on Cloud Hypervisor aarch64.
   - **Exit method** passed to the guest: `reboot` on Firecracker (x86_64 exits only on reboot with `reboot=k`; aarch64 exits on both), `poweroff` on Cloud Hypervisor (guest power-off exits the VMM; guest reset rebuilds the VM).
   - **Backstop:** on Cloud Hypervisor, `vmkit` subscribes to `--event-monitor` and kills the VMM on any reboot event. Combined with the one-shot config rule (§9.5), a guest reset can never run the workload twice.
   - **Firecracker defaults:** a custom `boot_args` replaces Firecracker's default cmdline, so the driver re-adds every Firecracker parameter it needs, e.g. `reboot=k` and the i8042 options on x86_64.
@@ -152,7 +160,7 @@ VMM-neutral VM lifecycle, sandboxing, networking and kernel profiles.
   - Callers budget devices against `max_virtio_devices` and never match on backend type.
 - **`net` module:** the per-VM net namespace, tap, nftables policy and `pasta` attachment (§9.3).
 - **`sandbox` module:** user, mount, PID and net namespaces; the fixed in-sandbox file layout; cgroups; rlimits; seccomp and Landlock flags (§9.2).
-- **Binary discovery:** `$VMKIT_FIRECRACKER`, `$VMKIT_CLOUD_HYPERVISOR` and `$VMKIT_PASTA`, else `PATH`. Minimum versions are pinned and checked at `create`. No component runs with elevated privileges, so environment-selected binaries confer nothing beyond what the user already has.
+- **Binary discovery:** `$VMKIT_FIRECRACKER`, `$VMKIT_CLOUD_HYPERVISOR` and `$VMKIT_PASTA`, else `PATH`; the sandbox helper from `$VMKIT_SANDBOX`, else next to the running program, else `PATH`. VMM minimum versions are pinned and checked when a backend is discovered. pasta's floor (2024-02-20) is documented, not checked: distribution builds print no usable version. No component runs with elevated privileges, so environment-selected binaries confer nothing beyond what the user already has.
 - **`kernels/`:** per-arch config fragments, a pinned LTS version, and the CI build, boot-test and publish pipeline (§8.2).
 
 ### 4.2 `kiln` (this repo, Cargo workspace)
@@ -460,21 +468,21 @@ root=/dev/vda ro rootfstype=erofs init=/kiln-init panic=-1 quiet loglevel=3 cons
 
 ### 9.2 Sandbox (`vmkit::sandbox`, T6)
 
-Each VMM runs as the invoking user, inside:
+Each VMM runs as the invoking user, started by the `vmkit-sandbox` helper. Ubuntu 23.10 and later let only AppArmor-profiled binaries create user namespaces, so vmkit ships an installer for the helper's profile (the bubblewrap model). Inside:
 - **A user namespace** that identity-maps the invoking uid and gid.
 - **A mount namespace** whose root is a minimal tmpfs containing only:
   - `/dev/kvm`, `/dev/null`, `/dev/urandom`, and `/dev/net/tun` when there's a network
   - the VMM binary, bind-mounted read-only
-  - `/vm/kernel`, `/vm/disk/<n>` and `/vm/sock/`
+  - `/vm/kernel`, `/vm/disk/<n>` and `/vm/sock/` (`<run_dir>/sock` on the host; the rest of the run dir stays out of the VMM's reach)
 - **A PID namespace.**
 - **A net namespace:** empty, or with networking per §9.3.
 
 Further constraints:
 - **File handling:** `vmkit` opens every file with `O_NOFOLLOW` and attaches it by file descriptor (`open_tree`/`move_mount`), so path swaps between check and use are impossible.
 - **In-sandbox paths are fixed** (`/vm/disk/<n>`), so snapshots can be restored from any host-side location (#2).
-- **Seccomp and Landlock:** Firecracker's built-in seccomp stays at its default. Cloud Hypervisor runs with `--seccomp true --landlock` and Landlock rules limited to `/vm`.
+- **Seccomp and Landlock:** Firecracker's built-in seccomp stays at its default. Cloud Hypervisor runs with `--seccomp true --landlock` and Landlock rules limited to `/vm` and `/dev/net/tun`, which are set in its `vm.create` configuration. The sandbox has no `/proc` or `/sys`.
 - **Hardening:** `no_new_privs`, all inherited file descriptors closed except those needed, rlimits on file descriptors and processes.
-- **cgroups:** if cgroup v2 delegation is available (the systemd user session), the VMM goes into a cgroup with memory, CPU and pids limits from `--memory` and `--cpus`. Otherwise `kiln run` warns once.
+- **cgroups:** if the systemd user session can create a scope (`systemd-run --user --scope`), the VMM goes into one with memory, CPU and tasks limits from `--memory` and `--cpus`. Otherwise `kiln run` warns once (`vmkit::cgroups_available()`).
 - **API socket:** lives in the 0700 run dir (§5.3). The driver keeps it open for #2, but only the invoking user can reach it.
 
 ### 9.3 Networking (`--net`, T5)
@@ -485,18 +493,18 @@ Inside the VM's own net namespace:
 - `ip_forward=1` is set **in that namespace only**.
 - An nftables table in that namespace:
   - **forward:** accept `iif tap0 ip saddr 172.30.0.2` to the egress interface, subject to the egress policy; drop everything else, including IPv6 and spoofed sources.
-  - **input:** allow only DNS (UDP/TCP 53) from the guest to `.1`; drop everything else. ARP is unaffected, since it isn't IP traffic.
+  - **input:** drop every new connection from the guest; DNS to `.1:53` never reaches input, because it is DNAT'd to pasta's DNS forward address. ARP is unaffected, since it isn't IP traffic.
   - masquerade on egress.
 - `pasta` attaches to the namespace and provides unprivileged egress through host sockets:
   - `--no-map-gw`: host loopback services are unreachable.
-  - DNS from the guest to `.1:53` is forwarded to the host's upstream resolvers. Loopback stubs such as `127.0.0.53` are resolved via `/run/systemd/resolve/resolv.conf`, falling back to `--dns`.
+  - DNS from the guest to `.1:53` is DNAT'd to pasta's `--dns-forward` address. pasta queries the host's resolver from the host namespace, so loopback stubs such as `127.0.0.53` work.
 - **Egress policy** (`--egress`):
   - **Default `restricted`:** deny `169.254.0.0/16`, `100.64.0.0/10`, RFC 1918, `0.0.0.0/8`, `127.0.0.0/8`, multicast, and the host's own addresses; allow the rest.
   - `--egress allow=<cidr>`: adds exceptions.
-  - `--egress deny-all`: blocks everything except DNS.
+  - `--egress deny-all`: blocks everything except DNS and `allow=` exceptions.
   - `--egress open`: removes the default denies, with a warning.
   - The guest cannot modify the policy; it lives outside the guest.
-- **Port forwarding:** `-p HOST:GUEST[/tcp|udp]` via `pasta` port forwarding plus DNAT to `.2`.
+- **Port forwarding:** `-p HOST:GUEST[/tcp|udp]` via `pasta` port forwarding plus DNAT to `.2`, on both of pasta's paths: through its interface (prerouting), and spliced from host loopback as a local connection to the namespace's own address (nat output, with `route_localnet` on `tap0`).
 - **Guest addressing** is delivered in the config message (§9.5). The guest configures `eth0` over netlink.
 
 ### 9.4 Scratch disk and `--persist`
