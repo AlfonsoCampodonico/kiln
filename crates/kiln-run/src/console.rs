@@ -36,12 +36,18 @@ impl Ring {
         })
     }
 
+    /// Appends `bytes`. A write of more than half the cap keeps only its own last
+    /// half-cap bytes, dropping the old content; a smaller one that would not fit
+    /// drops the oldest bytes down to half the cap. Either way the file stays within
+    /// its cap.
     pub fn write(&mut self, mut bytes: &[u8]) -> io::Result<()> {
-        if bytes.len() as u64 >= self.cap {
-            bytes = &bytes[bytes.len() - (self.cap / 2) as usize..];
+        let half = self.cap / 2;
+        if bytes.len() as u64 > half {
+            let skip = bytes.len().saturating_sub(usize::try_from(half).unwrap_or(usize::MAX));
+            bytes = bytes.get(skip..).unwrap_or_default();
             self.keep_tail(0)?;
         } else if self.len + bytes.len() as u64 > self.cap {
-            self.keep_tail(self.cap / 2)?;
+            self.keep_tail(half)?;
         }
         self.file.write_all(bytes)?;
         self.len += bytes.len() as u64;
@@ -122,6 +128,15 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), &big[950..]);
         r.write(b"x").unwrap();
         assert_eq!(std::fs::read(&path).unwrap().len(), 51);
+        // Writes between half the cap and the cap, onto a log near its cap.
+        for n in [51usize, 75, 99, 100] {
+            r.write(&[b'.'; 45]).unwrap();
+            let w: Vec<u8> = (0..n).map(|i| b'A' + (i % 26) as u8).collect();
+            r.write(&w).unwrap();
+            let log = std::fs::read(&path).unwrap();
+            assert!(log.len() <= 100, "{n}: {} bytes", log.len());
+            assert_eq!(log, &w[n - 50..], "{n}");
+        }
         assert!(Ring::create(&path, 100).is_err(), "an existing log is never reused");
     }
 
