@@ -15,11 +15,11 @@ serde_json = "1.0.151"
 thiserror = "2.0.21"
 
 # The VMMs run on Linux only; elsewhere `kiln run` explains how to use a Lima VM.
-# Pinned to the commit that declares Cloud Hypervisor disks raw.
+# Pinned to the commit where the VMM leads its own process group (vmkit PR #5).
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.5", features = ["event", "net", "pipe", "stdio", "termios"] }
 signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
-vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "b6958ffa70bda43d332bbf888fbcd3da93f3cfd6" }
+vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "4aa091361798dd6fa4e99d6494efb235bd727d20" }
 
 [dev-dependencies]
 kiln-erofs = { path = "../kiln-erofs" }
