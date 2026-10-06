@@ -1108,9 +1108,11 @@ fn a_huge_boot_timeout_is_no_deadline() {
     let mut o = opts();
     o.boot_timeout = Duration::from_secs(u64::MAX);
     let mut s = Session::start(vm, config(), st, o).unwrap();
-    assert!(s.pump(Duration::MAX, |s| s.running()));
+    // No bound either (the VM's end may come before Running is handled).
+    s.pump(Duration::MAX, |s| s.running());
     let out = s.finish_within(LIMIT);
     assert_eq!((out.exit_code, out.violation.as_deref()), (0, None), "{out:?}");
+    assert!(out.running);
 }
 
 /// Output connected just as the VM ends is still drained: the listener accepts
