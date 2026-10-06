@@ -326,6 +326,69 @@ fn sigint_to_kilns_process_group_stops_the_guest_gracefully() {
     out.wait_for("TERM\n", Duration::from_secs(5));
 }
 
+/// Whether `pid` has a handler for SIGINT (`/proc/<pid>/status`, `SigCgt`).
+fn catches_sigint(pid: u32) -> bool {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigCgt:"))
+        .and_then(|m| u64::from_str_radix(m.trim(), 16).ok())
+        .is_some_and(|m| m & (1 << (2 - 1)) != 0)
+}
+
+/// SIGINT during setup (here while kiln waits to read `--init`, a FIFO) is
+/// handled, not fatal: setup stops, cleans up and exits 137, as a user kill
+/// before the guest ran.
+#[test]
+fn sigint_during_setup_aborts_with_137() {
+    let Some(f) = fixture() else { return };
+    let fifo = f._dirs[0].path().join("init.fifo");
+    rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::from_raw_mode(0o600)).unwrap();
+    let mut child = f
+        .kiln()
+        .args(["run", "--vmm", &f.env.vmm, "--kernel"])
+        .arg(&f.env.kernel)
+        .args(["--allow-custom-kernel", "--init"])
+        .arg(&fifo)
+        .args(["--allow-custom-init", "busybox", "--", "true"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(30);
+    while !catches_sigint(child.id()) {
+        assert!(
+            Instant::now() < until,
+            "kiln never installed its SIGINT handler during setup"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    signal(&child, rustix::process::Signal::INT);
+    // Let setup go on: it reads the init binary and then sees the interrupt. (The
+    // FIFO is opened without blocking, so a kiln that never reads it cannot hang the test.)
+    let writer = loop {
+        use rustix::fs::{Mode, OFlags, open};
+        match open(
+            &fifo,
+            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => break fd,
+            Err(e) => {
+                assert!(Instant::now() < until, "kiln never opened --init: {e}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    };
+    rustix::fs::fcntl_setfl(&writer, rustix::fs::OFlags::empty()).unwrap();
+    std::fs::File::from(writer)
+        .write_all(&std::fs::read(&f.env.init).unwrap())
+        .unwrap();
+    let err = Captured::spawn(child.stderr.take().unwrap());
+    assert_eq!(wait(&mut child, Duration::from_secs(60)), 137, "{}", err.text());
+    err.wait_for("interrupted before the guest started", Duration::from_secs(5));
+}
+
 /// `-t -i` under a pseudo-terminal: raw mode, the guest's window size and its
 /// changes, Ctrl-] q, and the terminal restored afterwards.
 #[test]

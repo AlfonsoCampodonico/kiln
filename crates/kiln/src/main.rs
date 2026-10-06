@@ -4,6 +4,7 @@
 mod bench;
 mod run_cmd;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -562,11 +563,82 @@ fn render_error(e: &anyhow::Error) -> String {
     format!("kiln: error: {}", clean_line(&error_message(e)))
 }
 
+/// Where `kiln run`'s IMAGE is in `args` (argv, program name first), and whether
+/// a `--` follows it; `None` when the subcommand is not `run`. Options are skipped
+/// with their values, as `kiln`'s own definition says which take one.
+fn find_run_image(args: &[OsString]) -> Option<(Option<usize>, bool)> {
+    use clap::CommandFactory;
+    let root = Cli::command();
+    let run = root.find_subcommand("run")?.clone();
+    let takes_value = |long: Option<&str>, short: Option<char>| {
+        root.get_arguments().chain(run.get_arguments()).any(|a| {
+            ((long.is_some() && a.get_long() == long) || (short.is_some() && a.get_short() == short))
+                && a.get_action().takes_values()
+        })
+    };
+    let mut in_run = false;
+    let mut i = 1;
+    while let Some(arg) = args.get(i) {
+        let a = arg.to_string_lossy();
+        if a == "--" {
+            // `kiln run -- IMAGE ...`: clap takes the rest as positionals already.
+            return in_run.then_some((None, true));
+        } else if let Some(long) = a.strip_prefix("--") {
+            if !long.contains('=') && takes_value(Some(long), None) {
+                i += 1;
+            }
+        } else if a.len() > 1 && a.starts_with('-') {
+            // A cluster of short flags; one that takes a value ends it.
+            let flags: Vec<char> = a.chars().skip(1).collect();
+            for (j, &c) in flags.iter().enumerate() {
+                if takes_value(None, Some(c)) {
+                    if j + 1 == flags.len() {
+                        i += 1;
+                    }
+                    break;
+                }
+            }
+        } else if !in_run {
+            if a != "run" {
+                return None;
+            }
+            in_run = true;
+        } else {
+            let separated = args.get(i + 1).is_some_and(|n| n == "--");
+            return Some((Some(i), separated));
+        }
+        i += 1;
+    }
+    in_run.then_some((None, false))
+}
+
+/// As `docker run`: every argument after IMAGE is the command's, flags included
+/// (clap would take kiln's own flags until the command's first word). A `--` is
+/// inserted after IMAGE unless one is there.
+fn separate_the_command(mut args: Vec<OsString>) -> Vec<OsString> {
+    if let Some((Some(image), false)) = find_run_image(&args)
+        && image + 1 < args.len()
+    {
+        args.insert(image + 1, "--".into());
+    }
+    args
+}
+
 fn main() -> ExitCode {
     // Many-layer images keep a few files open per layer; macOS defaults to 256.
     // Best effort: the hard limit may already be the soft one.
     let _ = rlimit::increase_nofile_limit(u64::MAX);
-    let cli = Cli::parse();
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(separate_the_command(args.clone())) {
+        Ok(cli) => cli,
+        // Help and version exit 0; usage errors of `kiln run` exit 125, as
+        // `docker run`'s do; other subcommands keep clap's 2.
+        Err(e) if e.exit_code() != 0 && find_run_image(&args).is_some() => {
+            let _ = e.print();
+            return ExitCode::from(run_cmd::EXIT_ERROR);
+        }
+        Err(e) => e.exit(),
+    };
     if let Cmd::Run(args) = &cli.cmd {
         return match run_cmd::run(|| open_store(&cli), args) {
             Ok(code) => ExitCode::from(code),
@@ -618,6 +690,57 @@ mod tests {
             "docker.io/library/php:8.4-cli (no such local path either)"
         );
         assert_eq!(no_local_path(&r, false), "docker.io/library/php:8.4-cli");
+    }
+
+    fn argv(args: &[&str]) -> Vec<OsString> {
+        ["kiln"].iter().chain(args).map(OsString::from).collect()
+    }
+
+    fn run_cmd_of(args: &[&str]) -> Vec<String> {
+        let all: Vec<&str> = ["run"].iter().chain(args).copied().collect();
+        let cli = Cli::try_parse_from(separate_the_command(argv(&all))).unwrap();
+        match cli.cmd {
+            Cmd::Run(r) => r.options().unwrap().cmd,
+            _ => unreachable!(),
+        }
+    }
+
+    /// As `docker run`: everything after IMAGE is the command, a `--` right after
+    /// IMAGE only separates it, and a later `--` is the command's own.
+    #[test]
+    fn the_command_after_the_image() {
+        assert_eq!(run_cmd_of(&["img", "a", "--", "b"]), ["a", "--", "b"]);
+        assert_eq!(run_cmd_of(&["img", "--", "a", "--", "b"]), ["a", "--", "b"]);
+        assert_eq!(run_cmd_of(&["img", "--", "-x"]), ["-x"]);
+        assert_eq!(run_cmd_of(&["img", "sh", "-c", "x"]), ["sh", "-c", "x"]);
+        // Flags after IMAGE belong to the command, kiln's own included.
+        assert_eq!(run_cmd_of(&["img", "-i", "--persist"]), ["-i", "--persist"]);
+        assert_eq!(
+            run_cmd_of(&["-e", "A=1", "img", "-t", "--net", "-p", "80"]),
+            ["-t", "--net", "-p", "80"]
+        );
+        assert!(run_cmd_of(&["img"]).is_empty());
+        assert!(run_cmd_of(&["img", "--"]).is_empty());
+    }
+
+    #[test]
+    fn the_image_is_found_past_options_and_their_values() {
+        let at = |args: &[&str]| find_run_image(&argv(args));
+        assert_eq!(at(&["run", "img"]), Some((Some(2), false)));
+        assert_eq!(at(&["--store", "/s", "run", "-it", "img", "x"]), Some((Some(5), false)));
+        assert_eq!(
+            at(&["run", "--vmm", "ch", "-e", "K", "-eK=v", "--cpus=2", "img", "--", "x"]),
+            Some((Some(8), true))
+        );
+        assert_eq!(
+            at(&["run", "-ie", "K", "--kernel", "/k", "img"]),
+            Some((Some(6), false))
+        );
+        assert_eq!(at(&["run", "--interactive"]), Some((None, false)));
+        assert_eq!(at(&["--store", "run", "ls"]), None);
+        assert_eq!(at(&["ls", "run"]), None);
+        assert_eq!(at(&["--version"]), None);
+        assert_eq!(at(&["run", "--", "img", "-i"]), Some((None, true)));
     }
 
     #[test]

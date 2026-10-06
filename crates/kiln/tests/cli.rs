@@ -577,6 +577,34 @@ fn run_refuses_bad_flags_with_125() {
         .stderr(predicate::str::contains("multiple of 4096"));
 }
 
+/// Usage errors of `kiln run` exit 125, as `docker run`'s do; help and version
+/// exit 0, and other subcommands keep clap's 2.
+#[test]
+fn run_usage_errors_exit_125() {
+    let home = tempfile::tempdir().unwrap();
+    for (args, needle) in [
+        (&["run", "--disk", "abc", "img"][..], "--disk"),
+        (&["run", "--vmm", "qemu", "img"], "unknown VMM"),
+        (&["run", "--cpus", "300", "img"], "--cpus"),
+        (&["run"], "IMAGE"),
+        (&["run", "--bogus", "img"], "--bogus"),
+        (&["run", "-e"], "-e"),
+    ] {
+        kiln(home.path())
+            .args(args)
+            .assert()
+            .code(125)
+            .stderr(predicate::str::contains(needle));
+    }
+    kiln(home.path())
+        .args(["run", "--help"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("--allow-custom-kernel"));
+    kiln(home.path()).arg("--version").assert().code(0);
+    kiln(home.path()).args(["ls", "--bogus"]).assert().code(2);
+}
+
 /// Where VMs cannot run, `kiln run` says how to use a Lima VM (spec §9.7).
 #[cfg(not(target_os = "linux"))]
 #[test]

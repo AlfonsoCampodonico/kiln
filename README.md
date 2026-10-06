@@ -62,7 +62,8 @@ kiln run $K -t -i alpine:3                      # a terminal: Ctrl-] q stops the
 
 - The first SIGINT or SIGTERM asks the guest to stop (`STOPSIGNAL`, then SIGKILL after `--stop-timeout`, default 10 s); a second SIGINT kills the VM. SIGHUP, SIGQUIT, SIGUSR1 and SIGUSR2 are forwarded to the command.
 - Exit codes: the command's, or `128 + signal`; 127 and 126 when the entrypoint is missing or not executable; 137 when you killed the VM, as with `docker kill`; 125 when kiln, the VM or the guest's init failed, including the `--boot-timeout` (default 30 s), with the end of the guest's console.
-- Other flags: `--vmm firecracker|cloud-hypervisor` (default Firecracker), `--cpus N`, `--memory MiB`, `--disk SIZE` (the scratch disk, default 4G), `-e KEY[=VALUE]`.
+- Other flags: `--vmm firecracker|cloud-hypervisor` (default Firecracker), `--cpus N`, `--memory MiB`, `--disk SIZE` (the scratch disk, default 4G), `-e KEY[=VALUE]`. kiln's flags go before IMAGE: as with `docker run`, everything after IMAGE is the command, flags included (`kiln run img -i` runs `-i`), and a `--` right after IMAGE is optional. `--persist`, `--net` and `-p` arrive with milestone M3b-2; until then they are not kiln flags.
+- Usage errors of `kiln run` exit 125, as `docker run`'s do. An interrupt (SIGINT or SIGTERM) while kiln is still setting the VM up stops the setup, removes what it made and exits 137.
 - The kernel and kiln-init that boot are pinned by digest in kiln once they are released; until then `--kernel PATH --allow-custom-kernel --init PATH --allow-custom-init` name them (vmkit builds the kernel; `kiln-init` is built as below). Both are warned about and recorded in the run's `run.json`. An image's own init layer never boots.
 - Per-run state lives in `$XDG_RUNTIME_DIR/kiln/<id>/` (or `/tmp/kiln-<uid>/`), mode 0700; `KILN_KEEP_RUN_DIR=1` keeps it and `KILN_TIMINGS=1` prints how long booting took.
 - On macOS, `kiln run` explains how to use a Lima VM.

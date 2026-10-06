@@ -909,3 +909,24 @@ fn an_entrypoint_not_found_is_127_and_bounded() {
         out.warnings
     );
 }
+
+/// A session dropped before its end (a failure in kiln after the start) kills its VM.
+#[test]
+fn dropping_an_unfinished_session_kills_its_vm() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let vm = fake(move |sock, killed| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        boot(&mut c);
+        let until = Instant::now() + Duration::from_secs(20);
+        while !killed.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = tx.send(killed.load(Ordering::SeqCst));
+    });
+    let (st, _) = streams(None);
+    let mut s = Session::start(vm, config(), st, opts()).unwrap();
+    assert!(s.wait_running());
+    drop(s);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+}

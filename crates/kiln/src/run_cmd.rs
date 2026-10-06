@@ -85,10 +85,12 @@ impl RunArgs {
 #[cfg(target_os = "linux")]
 pub fn run(open_store: impl FnOnce() -> Result<kiln_store::Store>, args: &RunArgs) -> Result<u8> {
     use kiln_proto::sanitize::clean_line;
-    use kiln_run::{Run, Streams, forward_signals, tty};
+    use kiln_run::{EXIT_KILLED, Run, Streams, install_signals, tty};
 
     let t0 = std::time::Instant::now();
     let opts = args.options()?;
+    // Before anything slow: an interrupt during setup aborts it cleanly (137).
+    let signals = install_signals(opts.tty)?;
     let store = open_store()?;
     let store = &store;
     let raw_tty = opts.tty && opts.interactive;
@@ -102,15 +104,29 @@ pub fn run(open_store: impl FnOnce() -> Result<kiln_store::Store>, args: &RunArg
         stdout: Box::new(std::io::stdout()),
         stderr: Box::new(std::io::stderr()),
     };
-    let run = Run::start(store, &opts, streams, &mut |line| {
-        eprintln!("kiln: {}", clean_line(line))
-    })?;
+    let started = Run::start(
+        store,
+        &opts,
+        streams,
+        &mut |line| eprintln!("kiln: {}", clean_line(line)),
+        &|| signals.interrupted(),
+    );
+    let run = match started {
+        Ok(run) => run,
+        // A user's kill before the guest ran, as an interrupt before Hello is.
+        Err(kiln_run::Error::Interrupted) => {
+            eprintln!("kiln: interrupted before the guest started");
+            return Ok(u8::try_from(EXIT_KILLED).unwrap_or(EXIT_ERROR));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let booting = t0.elapsed();
-    let forwarder = forward_signals(run.handle(), opts.tty)?;
+    signals.attach(run.handle());
+    // A failure from here drops the run, and the session kills its VM.
     let raw = if raw_tty { Some(tty::RawMode::enter()?) } else { None };
     let report = run.wait();
     drop(raw);
-    drop(forwarder);
+    drop(signals);
     let o = &report.outcome;
     for w in &o.warnings {
         eprintln!("kiln: warning: {}", clean_line(w));
