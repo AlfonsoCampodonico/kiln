@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.8: 2026-10-05)
-**Status:** Draft rev 2.8, awaiting review
+**Date:** 2026-09-30 (rev 2.9: 2026-10-06)
+**Status:** Draft rev 2.9, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:**
 - `../../../../ROADMAP.md`: the three-repo roadmap (`vmkit`, `kiln`, `potter`).
@@ -58,6 +58,15 @@
   - kiln-proto is extended, never replaced. The planned extensions (services, build mode, exec, guest stats, OOM reports, file updates) and the versioning rule for them are in §9.8.
   - Milestones (§12): M3 is split into M3a (done), M3b and M3c, with new M3d (`services`), M3e (build mode) and M4 (`kiln-shim`). sagger and sherd follow, each with its own spec.
   - The kiln-shim draft spec moved here from the potter repo.
+- **rev 2.9 (2026-10-06):** §8.1, §9.5 and §9.7 aligned with the M3b-1 plan (`kiln run`, runtime and CLI; validated prototype `m3b-proto` and the controller's rulings). M3b is planned in two parts: M3b-1, the runtime and CLI, and M3b-2, pinned artifacts, `--persist`, `--net` and the Lima template (§12).
+  - `--init <path>` boots a static kiln-init of the user's, only with `--allow-custom-init`, as `--kernel` needs `--allow-custom-kernel`; both are warned about and recorded in `run.json`. Until kiln pins released kernels and kiln-init, every run names both; an image's kernel layer is used only with `profile: custom` and `--allow-custom-kernel` (§8.1).
+  - A run the user kills (a second SIGINT, `Ctrl-]` `k`, or a stop request before the guest's `Hello`) exits 137, as `docker kill`. Kills `kiln` decides (protocol violations, the boot timeout, the stop and end bounds below) stay 125 (§9.5).
+  - After `Exited`, `InitFailed` or the control connection closing, the guest has 10 s to end the VM, then it is killed; after `Exited` the app's exit code is kept, with a warning. After `Shutdown`, `kiln` kills the VM itself once the grace period plus 5 s has passed (125, with a warning). A stop request before `Hello` kills at once (§9.7).
+  - SIGHUP, SIGQUIT, SIGUSR1 and SIGUSR2 are forwarded to the main process as `Signal`, as Docker's sig-proxy does. A second SIGTERM re-sends `Shutdown`, whose deadline can only shrink; only a second SIGINT kills. SIGWINCH is forwarded with `-t` only (§9.7).
+  - `-t` without `-i` gives the guest a terminal without raw mode or stdin relay; `-t -i` needs a terminal on stdin. Both as Docker (§9.7).
+  - Errors before the guest runs exit 125. Defaults: `--vmm firecracker`, `--cpus 1`, `--memory 512`; the guest's hostname is the run id's first 12 hex digits; `-e`/`--env KEY[=VALUE]` as Docker's (§9.7).
+  - `console.log` drops its oldest half when it would pass 1 MiB; the VMM writes the console to a FIFO that `kiln` copies (§5.3).
+  - Stale run directories from other boots or hosts are left alone but not yet reported; directories kept for debugging (`KILN_KEEP_RUN_DIR=1`) are never cleaned (§5.3).
 ---
 
 ## 1. Goals
@@ -477,7 +486,7 @@ The per-image limit counts the bytes one conversion decompresses. Layers served 
 - **At build:** artifacts are fetched and verified against the table.
 - **At run:**
   - The image's kernel layer digest must equal the pinned digest for the `(profile, version, arch)` in its config.
-  - `--kernel <path>` and `profile: custom` images are refused unless `--allow-custom-kernel` is given.
+  - `--kernel <path>` and `profile: custom` images are refused unless `--allow-custom-kernel` is given; `--init <path>` (a static kiln-init) is refused unless `--allow-custom-init` is given.
   - The image's init layer is **replaced** with the init layer for the pinned `kiln-init` of the running `kiln`. A warning is printed when the image's init layer differs.
   - `inspect` labels `source` as unverified provenance.
 
@@ -604,6 +613,7 @@ This is protocol version 1. Later versions add to it under the rules in §9.8.
 **Host-side exit codes:**
 - The app's exit code, or `128 + signal`.
 - **125:** `kiln` or infrastructure error, including boot timeout, the VM ending without `Exited`, and any init failure other than the two below (for example an unknown user).
+- **137:** the user killed the VM (a second SIGINT, `Ctrl-]` `k`) before the app exited, as `docker kill`.
 - **126:** the entrypoint was found but could not be executed (`EACCES` or `EISDIR` from exec).
 - **127:** the entrypoint was not found (`ENOENT` from exec).
 
@@ -648,7 +658,7 @@ kiln run <ref> [--vmm firecracker|cloud-hypervisor] [--cpus N] [--memory MiB]
                [-i] [-t] [--disk SIZE] [--persist PATH [--persist-reset|--persist-force]]
                [--net [--egress POLICY]... [-p HOST:GUEST[/proto]]...]
                [--env K=V]... [--stop-timeout SECS] [--boot-timeout SECS]
-               [--allow-custom-kernel] [-- CMD ARGS...]
+               [--kernel PATH] [--allow-custom-kernel] [--init PATH] [--allow-custom-init] [-- CMD ARGS...]
 ```
 
 - **stdio:** without `-i`, guest stdin gets EOF immediately. Pipes are binary-safe, and EOF propagates, so `echo hi | kiln run -i img -- cat` exits.
@@ -814,7 +824,7 @@ One parametrised suite runs against both backends, using a test guest (the kerne
 | **M1: convert** (planned as **M1a**, `kiln-erofs`, and **M1b**, store, registry, OCI inputs, pipeline and CLI) | `kiln` | `kiln-store`, `kiln-registry`, `kiln-oci`, `kiln-erofs` (writer, reader, profile, semantics, limits), §6.1–6.4 and §6.6, the oracle tests, the hostile-registry tests, and the CLI `convert`/`pull`/`push`/`import`/`inspect`/`ls`/`gc`/`bench`. Output is the app-layer set plus a provisional manifest without kernel and init layers. | No | Done |
 | **M2: vmkit** | `vmkit` | `Vmm` trait (snapshot/restore shapes only), Firecracker and Cloud Hypervisor drivers, `sandbox`, `net` (tap, nftables, `pasta`), `Capabilities`, the kernel profiles pipeline, the contract suite, and the hostile-guest network tests (with the busybox guest). | Yes | Done |
 | **M3a: guest** | `kiln` | `kiln-proto` (protocol version 1), `kiln-init`, the ext4 template, the init layer (§6.5), the guest side of §9, the boot suite on both VMMs, and the control protocol in `docs/format.md`. | Yes | Done (PR #5) |
-| **M3b: run** | `kiln` | `kiln run` (§9.7): the host runtime, its CLI flags, host signal handling and console tails; kernel and init layers in images with their pins and run-time verification (§6.5, §8.1); the Lima template (§10). | Yes | Planned |
+| **M3b: run** (planned as **M3b-1**, the runtime and CLI, and **M3b-2**, pinned artifacts, `--persist`, `--net` and Lima) | `kiln` | `kiln run` (§9.7): the host runtime, its CLI flags, host signal handling and console tails; kernel and init layers in images with their pins and run-time verification (§6.5, §8.1); the Lima template (§10). | Yes | Planned (M3b-1: `docs/superpowers/plans/2026-10-06-m3b1-run.md`) |
 | **M3d: services** | `kiln` | kiln-proto and `kiln-init` `services` (§9.8), as a protocol version bump. Needed by potter P2 (PHP web images). | Yes | Planned |
 | **M3c: build** | `kiln` | `kiln build` backend dispatch: potter, BuildKit, Podman or Buildah (§6). The end-to-end matrix (§11.4), the kernel and init swap tests (§11.5), the release pipeline and the docs (§15). | Yes | Planned |
 | **M3e: build mode** | `kiln` | kiln-proto `Config.mode = Build`, the build-mode messages and `kiln-init` build mode (§9.8), as a protocol version bump. Lands with potter P4 (the VM executor). | Yes | Planned |
