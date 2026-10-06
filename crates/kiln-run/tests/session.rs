@@ -1061,6 +1061,58 @@ fn output_after_giving_up_on_the_vmm_has_a_fixed_bound() {
     );
 }
 
+/// A user's kill after `InitFailed` keeps init's code (127 here), as one after
+/// `Exited` keeps the app's.
+#[test]
+fn a_user_kill_after_init_failed_keeps_its_code() {
+    let (told, failed_sent) = std::sync::mpsc::channel::<()>();
+    let vm = fake(move |sock, killed| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        for n in 3..=6 {
+            send(&mut c, GuestMessage::Stage(Stage { n }));
+        }
+        send(
+            &mut c,
+            GuestMessage::InitFailed(InitFailed::new(6, Some(2), "exec /nope: No such file or directory")),
+        );
+        told.send(()).unwrap();
+        wait_killed(&killed);
+    });
+    let (st, _) = streams(None);
+    let mut s = Session::start(vm, config(), st, opts()).unwrap();
+    failed_sent.recv_timeout(Duration::from_secs(10)).unwrap();
+    s.pump(Duration::from_millis(300), |_| false);
+    s.handle().interrupt();
+    s.handle().interrupt();
+    let out = s.finish_within(LIMIT);
+    assert_eq!(
+        (out.exit_code, out.killed, out.violation.as_deref()),
+        (127, true, None),
+        "{out:?}"
+    );
+}
+
+/// `--boot-timeout 18446744073709551615`: a deadline too far to represent is none,
+/// not a panic.
+#[test]
+fn a_huge_boot_timeout_is_no_deadline() {
+    let vm = fake(|sock, _| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        boot(&mut c);
+        drop((connect(&sock, port::STDOUT), connect(&sock, port::STDERR)));
+        exited(&mut c, 0);
+    });
+    let (st, _) = streams(None);
+    let mut o = opts();
+    o.boot_timeout = Duration::from_secs(u64::MAX);
+    let mut s = Session::start(vm, config(), st, o).unwrap();
+    assert!(s.pump(Duration::MAX, |s| s.running()));
+    let out = s.finish_within(LIMIT);
+    assert_eq!((out.exit_code, out.violation.as_deref()), (0, None), "{out:?}");
+}
+
 /// Output connected just as the VM ends is still drained: the listener accepts
 /// its backlog once after the end, before the drain can count as done.
 #[test]

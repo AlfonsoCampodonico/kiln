@@ -411,7 +411,8 @@ impl Session {
         };
         s.vm.start()?;
         s.started = Instant::now();
-        s.boot_deadline = Some(s.started + s.opts.boot_timeout);
+        // Too far to represent (a huge --boot-timeout): no deadline.
+        s.boot_deadline = s.started.checked_add(s.opts.boot_timeout);
         Ok(s)
     }
 
@@ -432,15 +433,15 @@ impl Session {
     /// Runs the session until `done()` holds, the VM ends, or `timeout` passes;
     /// returns `done()`.
     pub fn pump(&mut self, timeout: Duration, mut done: impl FnMut(&Self) -> bool) -> bool {
-        let until = Instant::now() + timeout;
+        let until = Instant::now().checked_add(timeout);
         loop {
             if done(self) {
                 return true;
             }
-            if self.end.is_some() || Instant::now() >= until {
+            if self.end.is_some() || until.is_some_and(|u| Instant::now() >= u) {
                 return done(self);
             }
-            self.step(Some(until));
+            self.step(until);
         }
     }
 
@@ -457,7 +458,7 @@ impl Session {
 
     /// Like [`Session::finish`], killing the VM after `limit` (a test's overall bound).
     pub fn finish_within(mut self, limit: Option<Duration>) -> Outcome {
-        let limit = limit.map(|l| Instant::now() + l);
+        let limit = limit.and_then(|l| Instant::now().checked_add(l));
         loop {
             self.note_moved();
             if self.done() {
@@ -673,7 +674,7 @@ impl Session {
     fn expect_end(&mut self, now: Instant, after: &'static str) {
         self.boot_deadline = None;
         if self.end_deadline.is_none() {
-            self.end_deadline = Some(now + self.opts.end_timeout);
+            self.end_deadline = now.checked_add(self.opts.end_timeout);
             self.end_after = after;
         }
     }
@@ -721,9 +722,11 @@ impl Session {
     }
 
     fn outcome(&mut self) -> Outcome {
+        // A user's kill after the guest's final message keeps what it reported
+        // (the app's code, or init's 127, 126 or 125).
         let exit_code = if self.violation.is_some() {
             EXIT_INFRA
-        } else if self.killed && self.proto.exited().is_none() {
+        } else if self.killed && !self.proto.terminal() {
             EXIT_KILLED
         } else {
             self.proto.exit_code()
@@ -1106,7 +1109,7 @@ fn copy_in(mut from: Box<dyn Read + Send>, mut to: UnixStream) {
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if to.write_all(&buf[..n]).is_err() {
+                if to.write_all(buf.get(..n).unwrap_or_default()).is_err() {
                     return;
                 }
             }
