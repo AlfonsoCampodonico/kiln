@@ -12,8 +12,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use kiln_proto::{
-    Config, EXIT_INFRA, ExitMethod, Exited, GuestMessage, Hello, HostMessage, Process, Scratch, Shutdown, Stage,
-    WindowSize, port, read_message, write_message,
+    Config, EXIT_INFRA, ExitMethod, Exited, GuestMessage, Hello, HostMessage, InitFailed, Process, Scratch, Shutdown,
+    Stage, WindowSize, port, read_message, write_message,
 };
 use kiln_run::{EXIT_KILLED, Session, SessionOptions, Streams};
 use vmkit::{Capabilities, EndReason, SnapshotBundle, Vm, VmEnd};
@@ -90,11 +90,17 @@ struct FakeVm {
     guest: Option<Guest>,
     thread: Option<JoinHandle<()>>,
     killed: Arc<AtomicBool>,
+    /// A VMM that survives its kill (stuck in the kernel, say).
+    unkillable: bool,
 }
 
 type Guest = Box<dyn FnOnce(PathBuf, Arc<AtomicBool>) + Send>;
 
 fn fake(guest: impl FnOnce(PathBuf, Arc<AtomicBool>) + Send + 'static) -> Box<dyn Vm> {
+    fake_vm(guest, false)
+}
+
+fn fake_vm(guest: impl FnOnce(PathBuf, Arc<AtomicBool>) + Send + 'static, unkillable: bool) -> Box<dyn Vm> {
     let dir = tempfile::tempdir().unwrap();
     Box::new(FakeVm {
         socket: dir.path().join("vsock.sock"),
@@ -102,6 +108,7 @@ fn fake(guest: impl FnOnce(PathBuf, Arc<AtomicBool>) + Send + 'static) -> Box<dy
         guest: Some(Box::new(guest)),
         thread: None,
         killed: Arc::new(AtomicBool::new(false)),
+        unkillable,
     })
 }
 
@@ -121,7 +128,9 @@ impl Vm for FakeVm {
     }
 
     fn kill(&mut self) -> vmkit::Result<()> {
-        self.killed.store(true, Ordering::SeqCst);
+        if !self.unkillable {
+            self.killed.store(true, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -399,7 +408,8 @@ fn a_vm_that_lingers_after_its_final_message_is_killed() {
     assert_eq!(out.end.reason, EndReason::Killed);
     assert!(out.warnings[0].contains("did not end"), "{:?}", out.warnings);
 
-    // The control connection closing without a final message: 125, bounded.
+    // The control connection closing without a final message: 125, bounded by the
+    // end timeout, not the boot timeout (10 s here), and not a violation.
     let vm = fake(|sock, killed| {
         let mut c = connect(&sock, port::CONTROL);
         handshake(&mut c);
@@ -409,9 +419,77 @@ fn a_vm_that_lingers_after_its_final_message_is_killed() {
     let (st, _) = streams(None);
     let mut o = opts();
     o.end_timeout = Duration::from_millis(300);
+    let started = Instant::now();
     let out = Session::start(vm, config(), st, o).unwrap().finish_within(LIMIT);
-    assert_eq!(out.exit_code, EXIT_INFRA);
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_eq!((out.exit_code, out.violation.as_deref()), (EXIT_INFRA, None), "{out:?}");
     assert_eq!(out.end.reason, EndReason::Killed);
+    assert_eq!(
+        out.warnings,
+        ["the control connection closed, and the VM did not end within 0.3s; it was killed"]
+    );
+}
+
+/// D-3: `Exited` itself never kills the VM: a guest that powers off within the
+/// end bound ends on its own.
+#[test]
+fn a_guest_ending_its_vm_within_the_bound_is_not_killed() {
+    let vm = fake(|sock, _| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        boot(&mut c);
+        drop((connect(&sock, port::STDOUT), connect(&sock, port::STDERR)));
+        exited(&mut c, 5);
+        // Syncing the scratch disk.
+        std::thread::sleep(Duration::from_millis(500));
+    });
+    let (st, _) = streams(None);
+    let out = Session::start(vm, config(), st, opts()).unwrap().finish_within(LIMIT);
+    assert_eq!((out.exit_code, out.violation.as_deref()), (5, None), "{out:?}");
+    assert_eq!(out.end.reason, EndReason::Exited, "{out:?}");
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+}
+
+/// A stop request ends with the guest's final message: init's grace kill makes
+/// the app exit, the guest reports it and then syncs for longer than the host's
+/// margin. The host does not kill it at grace + margin or warn that it did not
+/// stop; only the end bound applies.
+#[test]
+fn a_stop_request_ends_at_the_guests_final_message() {
+    let vm = fake(|sock, killed| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        boot(&mut c);
+        drop((connect(&sock, port::STDOUT), connect(&sock, port::STDERR)));
+        let shutdown = read_message::<_, HostMessage>(&mut c).unwrap();
+        assert!(matches!(shutdown, Some(HostMessage::Shutdown(_))), "{shutdown:?}");
+        // The app ignores its stop signal; init kills it when the grace ends.
+        std::thread::sleep(Duration::from_secs(1));
+        send(
+            &mut c,
+            GuestMessage::Exited(Exited {
+                signaled: true,
+                code: 9,
+            }),
+        );
+        wait_killed(&killed);
+    });
+    let (st, _) = streams(None);
+    let mut o = opts();
+    (o.stop_timeout, o.stop_margin) = (1, Duration::from_secs(1));
+    o.end_timeout = Duration::from_secs(3);
+    let mut s = Session::start(vm, config(), st, o).unwrap();
+    assert!(s.wait_running());
+    s.handle().terminate();
+    let started = Instant::now();
+    let out = s.finish_within(LIMIT);
+    assert!(started.elapsed() >= Duration::from_secs(3), "{:?}", started.elapsed());
+    assert_eq!((out.exit_code, out.violation.as_deref()), (137, None), "{out:?}");
+    assert_eq!(out.end.reason, EndReason::Killed);
+    assert_eq!(
+        out.warnings,
+        ["the VM did not end within 3.0s of the guest's final message; it was killed"]
+    );
 }
 
 #[test]
@@ -448,11 +526,13 @@ fn interrupts_ask_then_kill() {
     let mut s = Session::start(vm, config(), st, o).unwrap();
     assert!(s.wait_running());
     s.handle().interrupt();
+    let until = Instant::now() + Duration::from_secs(10);
     let got = loop {
         s.pump(Duration::from_millis(50), |_| false);
         if let Ok(m) = rx.try_recv() {
             break m;
         }
+        assert!(Instant::now() < until, "no Shutdown reached the guest");
     };
     assert_eq!(got, Some(HostMessage::Shutdown(Shutdown { grace_secs: 7 })));
     s.handle().interrupt();
@@ -624,4 +704,208 @@ fn bad_frames_are_violations() {
     let (st, _) = streams(None);
     let o = Session::start(vm, config(), st, opts()).unwrap().finish_within(LIMIT);
     assert_eq!(o.violation.as_deref(), Some("unsupported guest protocol 2"));
+}
+
+/// D-6: output still flowing when the VM ends reaches a slow sink in full: the
+/// drain bound restarts whenever bytes move.
+#[test]
+fn a_slow_sink_gets_all_of_the_output() {
+    /// Takes 64 KiB a second.
+    #[derive(Clone, Default)]
+    struct Slow(Shared);
+    impl Write for Slow {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let n = b.len().min(4096);
+            std::thread::sleep(Duration::from_millis(62));
+            self.0.write(&b[..n])
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let data: Vec<u8> = (0..512u32 << 10).map(|i| (i % 251) as u8).collect();
+    let want = data.clone();
+    let sink = Slow::default();
+    let arrived = sink.0.clone();
+    let vm = fake(move |sock, _| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        let (mut out, err) = (connect(&sock, port::STDOUT), connect(&sock, port::STDERR));
+        boot(&mut c);
+        // The output is still in flight when the VM ends.
+        std::thread::spawn(move || {
+            let _ = out.write_all(&data);
+        });
+        drop(err);
+        // Once the host is streaming it (as kiln-init's stdout is, long before its exit).
+        let until = Instant::now() + Duration::from_secs(10);
+        while arrived.bytes().is_empty() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        exited(&mut c, 0);
+    });
+    let (mut st, _) = streams(None);
+    st.stdout = Box::new(sink.clone());
+    let mut o = opts();
+    o.drain_timeout = Duration::from_secs(1);
+    let out = Session::start(vm, config(), st, o).unwrap().finish_within(LIMIT);
+    assert_eq!((out.exit_code, out.violation.as_deref()), (0, None), "{out:?}");
+    let got = sink.0.bytes();
+    assert!(got == want, "{} of {} bytes arrived", got.len(), want.len());
+}
+
+/// `Ctrl-]` `k` works while the guest is not reading its terminal: the keys act
+/// before the bytes are written, and a stalled write gives up after the send
+/// timeout instead of holding up the input.
+#[test]
+fn escape_keys_work_while_the_guest_does_not_read_its_terminal() {
+    let vm = fake(|sock, killed| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        boot(&mut c);
+        let tty = connect(&sock, port::TTY);
+        wait_killed(&killed);
+        drop((tty, c));
+    });
+    let mut cfg = config();
+    cfg.tty = Some(WindowSize { rows: 24, cols: 80 });
+    cfg.interactive = true;
+    let mut input = vec![b'a'; 4 << 20];
+    input.extend_from_slice(b"\x1dk");
+    let input: &'static [u8] = input.leak();
+    let (st, _) = streams(Some(input));
+    let mut o = opts();
+    o.escape_keys = true;
+    let out = Session::start(vm, cfg, st, o).unwrap().finish_within(LIMIT);
+    assert_eq!(
+        (out.exit_code, out.killed, out.violation.as_deref()),
+        (EXIT_KILLED, true, None),
+        "{out:?}"
+    );
+}
+
+/// D-6: a VMM that survives its kill does not hold kiln forever: after the kill
+/// bound the run ends, with a warning.
+#[test]
+fn a_kill_that_does_not_take_is_bounded() {
+    let vm = fake_vm(
+        |sock, _| {
+            let mut c = connect(&sock, port::CONTROL);
+            handshake(&mut c);
+            boot(&mut c);
+            std::thread::sleep(Duration::from_secs(20));
+        },
+        true,
+    );
+    let (st, _) = streams(None);
+    let mut o = opts();
+    o.kill_wait = Duration::from_millis(300);
+    let mut s = Session::start(vm, config(), st, o).unwrap();
+    assert!(s.wait_running());
+    s.handle().kill();
+    let started = Instant::now();
+    let out = s.finish_within(LIMIT);
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert_eq!(
+        (out.exit_code, out.killed, out.violation.as_deref()),
+        (EXIT_KILLED, true, None)
+    );
+    assert_eq!(out.end.reason, EndReason::Killed);
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.contains("did not exit within 0.3s of being killed")),
+        "{:?}",
+        out.warnings
+    );
+}
+
+/// D-2: resizes are dropped, never a violation, when the queue is full.
+#[test]
+fn window_sizes_are_dropped_when_the_queue_is_full() {
+    let (go, wait_go) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let vm = fake(move |sock, _| {
+        let mut c = connect(&sock, port::CONTROL);
+        wait_go.recv().unwrap();
+        handshake(&mut c);
+        // What was queued, read until the host has nothing more to send.
+        c.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut sizes = 0;
+        while let Ok(Some(HostMessage::WindowSize(_))) = read_message::<_, HostMessage>(&mut c) {
+            sizes += 1;
+        }
+        tx.send(sizes).unwrap();
+        boot(&mut c);
+        drop((connect(&sock, port::STDOUT), connect(&sock, port::STDERR)));
+        exited(&mut c, 0);
+    });
+    let (st, _) = streams(None);
+    let s = Session::start(vm, config(), st, opts()).unwrap();
+    // Before Config nothing is sent: the queue fills.
+    for i in 0..10_000u16 {
+        s.handle().window_size(WindowSize { rows: i, cols: 80 });
+    }
+    go.send(()).unwrap();
+    let out = s.finish_within(LIMIT);
+    assert_eq!((out.exit_code, out.violation.as_deref()), (0, None), "{out:?}");
+    let sizes = rx.recv().unwrap();
+    assert!((1..=64).contains(&sizes), "{sizes} resizes arrived");
+}
+
+/// A user's kill after the app exited keeps the app's exit code (spec §9.5).
+#[test]
+fn a_user_kill_after_exited_keeps_the_apps_code() {
+    let (told, exited_sent) = std::sync::mpsc::channel::<()>();
+    let vm = fake(move |sock, killed| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        boot(&mut c);
+        drop((connect(&sock, port::STDOUT), connect(&sock, port::STDERR)));
+        exited(&mut c, 3);
+        told.send(()).unwrap();
+        wait_killed(&killed);
+    });
+    let (st, _) = streams(None);
+    let mut s = Session::start(vm, config(), st, opts()).unwrap();
+    exited_sent.recv_timeout(Duration::from_secs(10)).unwrap();
+    s.pump(Duration::from_millis(300), |_| false);
+    s.handle().kill();
+    let out = s.finish_within(LIMIT);
+    assert_eq!(
+        (out.exit_code, out.killed, out.violation.as_deref()),
+        (3, true, None),
+        "{out:?}"
+    );
+    assert_eq!(out.end.reason, EndReason::Killed);
+}
+
+/// An exec failure at stage 6 (ENOENT) is 127, and the end bound follows it.
+#[test]
+fn an_entrypoint_not_found_is_127_and_bounded() {
+    let vm = fake(|sock, killed| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        for n in 3..=6 {
+            send(&mut c, GuestMessage::Stage(Stage { n }));
+        }
+        send(
+            &mut c,
+            GuestMessage::InitFailed(InitFailed::new(6, Some(2), "exec /nope: No such file or directory")),
+        );
+        wait_killed(&killed);
+    });
+    let (st, _) = streams(None);
+    let mut o = opts();
+    o.end_timeout = Duration::from_millis(300);
+    let out = Session::start(vm, config(), st, o).unwrap().finish_within(LIMIT);
+    assert_eq!((out.exit_code, out.violation.as_deref()), (127, None), "{out:?}");
+    assert!(!out.running);
+    assert_eq!(out.end.reason, EndReason::Killed);
+    assert!(
+        out.warnings.iter().any(|w| w.contains("did not end within")),
+        "{:?}",
+        out.warnings
+    );
 }
