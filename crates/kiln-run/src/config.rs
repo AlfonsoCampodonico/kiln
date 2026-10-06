@@ -117,6 +117,15 @@ pub fn check_devices(layers: usize, net: bool, available: u32, vmm: &str) -> Res
     Ok(())
 }
 
+/// kiln's environment for [`Runtime::host_env`], from `std::env::vars_os()`:
+/// entries whose name or value is not UTF-8 are skipped (`--env KEY` then passes
+/// nothing for them, as for an unset variable).
+pub fn host_env(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Vec<(String, String)> {
+    vars.into_iter()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect()
+}
+
 /// A hostname for the guest from the run id, as Docker uses the container id.
 pub fn hostname(run_id: &str) -> String {
     run_id.chars().take(12).collect()
@@ -185,6 +194,24 @@ mod tests {
         assert!(err.contains("environment") && err.contains("21 variables"), "{err}");
         o.env.truncate(10);
         build(&image(), &o, &rt()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_host_variables_are_skipped() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let vars = [
+            (OsString::from("GOOD"), OsString::from("yes")),
+            (OsString::from("BADVALUE"), OsString::from_vec(b"\xff".to_vec())),
+            (OsString::from_vec(b"BAD\xfeNAME".to_vec()), OsString::from("v")),
+        ];
+        let env = host_env(vars);
+        assert_eq!(env, [("GOOD".to_string(), "yes".to_string())]);
+        let mut o = RunOptions::new("img");
+        o.env = vec!["GOOD".into(), "BADVALUE".into()];
+        let r = Runtime { host_env: env, ..rt() };
+        assert_eq!(build(&image(), &o, &r).unwrap().process.env, ["A=1", "GOOD=yes"]);
     }
 
     #[test]

@@ -10,7 +10,8 @@ use signal_hook::iterator::Signals;
 
 use super::session::Handle;
 
-/// Forwards signals while alive; the default actions return when it is dropped.
+/// Forwards signals while alive. Dropping it ends kiln's handling of them, but the
+/// signals' dispositions are not restored to their defaults: kiln is about to exit.
 pub struct Forwarder {
     handle: signal_hook::iterator::Handle,
     thread: Option<JoinHandle<()>>,

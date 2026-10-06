@@ -4,15 +4,19 @@
 use std::path::PathBuf;
 
 use kiln_erofs::testtar::{Opts, TarBuilder};
-use kiln_image::types::{InitRef, KILN_CONFIG, KILN_INIT, KILN_KERNEL, KernelRef};
+use kiln_image::types::{
+    InitRef, KILN_ARTIFACT, KILN_CONFIG, KILN_INIT, KILN_KERNEL, KILN_LAYER, KernelRef, KilnConfig,
+};
 use kiln_image::{ConvertOptions, LocalRequest, convert_local, load, resolve_name};
 use kiln_oci::testlayout::{LayoutBuilder, TestLayer};
-use kiln_oci::{Descriptor, Platform};
+use kiln_oci::{Descriptor, ImageIndex, Platform};
 use kiln_run::RunOptions;
 use kiln_run::prepare::prepare;
 use kiln_store::Store;
 
 const ARCH: &str = "arm64";
+const INDEX: &str = "application/vnd.oci.image.index.v1+json";
+const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 
 struct Setup {
     _dirs: Vec<tempfile::TempDir>,
@@ -87,6 +91,47 @@ impl Setup {
         );
         let manifest = self.store.put_bytes(&serde_json::to_vec(&manifest).unwrap()).unwrap();
         self.store.set_ref(tag, &manifest).unwrap();
+    }
+
+    /// `app` with its config and layers edited, tagged `tag`; returns the manifest's
+    /// descriptor.
+    fn edited(&self, tag: &str, edit: impl FnOnce(&mut KilnConfig, &mut Vec<Descriptor>)) -> Descriptor {
+        let loaded = load(&self.store, &resolve_name(&self.store, "app").unwrap()).unwrap();
+        let image = &loaded.entries[0].1;
+        let (mut config, mut manifest) = (image.config.clone(), image.manifest.clone());
+        edit(&mut config, &mut manifest.layers);
+        let config = serde_json::to_vec(&config).unwrap();
+        manifest.config = Descriptor::new(KILN_CONFIG, self.store.put_bytes(&config).unwrap(), config.len() as u64);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let digest = self.store.put_bytes(&bytes).unwrap();
+        self.store.set_ref(tag, &digest).unwrap();
+        let mut d = Descriptor::new(MANIFEST, digest, bytes.len() as u64);
+        d.artifact_type = Some(KILN_ARTIFACT.into());
+        d
+    }
+
+    /// A kiln index tagged `tag` listing `entries`.
+    fn index(&self, tag: &str, entries: &[(&str, &Descriptor)]) {
+        let index = ImageIndex {
+            schema_version: 2,
+            media_type: Some(INDEX.into()),
+            artifact_type: Some(KILN_ARTIFACT.into()),
+            manifests: entries
+                .iter()
+                .map(|(platform, d)| {
+                    let mut d = (*d).clone();
+                    d.platform = Some(Platform::parse(platform).unwrap());
+                    d
+                })
+                .collect(),
+            annotations: None,
+        };
+        let digest = self.store.put_bytes(&serde_json::to_vec(&index).unwrap()).unwrap();
+        self.store.set_ref(tag, &digest).unwrap();
+    }
+
+    fn blob(&self, media_type: &str, bytes: &[u8]) -> Descriptor {
+        Descriptor::new(media_type, self.store.put_bytes(bytes).unwrap(), bytes.len() as u64)
     }
 
     fn custom(&self, o: &mut RunOptions) {
@@ -199,4 +244,98 @@ fn the_init_layer_is_always_replaced_with_a_warning_when_it_differs() {
     o.image = "same".into();
     let p = prepare(&s.store, &o, ARCH).unwrap();
     assert!(!p.warnings.iter().any(|w| w.contains("replaced")), "{:?}", p.warnings);
+}
+
+/// `prepare` enforces the custom kernel and init flags itself, not only `kiln run`.
+#[test]
+fn prepare_checks_the_custom_flags_itself() {
+    let s = setup();
+    let mut o = RunOptions::new("app");
+    s.custom(&mut o);
+    o.allow_custom_kernel = false;
+    assert!(err(prepare(&s.store, &o, ARCH)).contains("--allow-custom-kernel"));
+    s.custom(&mut o);
+    o.allow_custom_init = false;
+    assert!(err(prepare(&s.store, &o, ARCH)).contains("--allow-custom-init"));
+}
+
+/// The index entry, the image's config and the host must agree; one entry per
+/// architecture.
+#[test]
+fn inconsistent_platforms_are_refused() {
+    let s = setup();
+    let mut o = RunOptions::new("x");
+    s.custom(&mut o);
+    let arm = s.edited("arm", |_, _| {});
+    let amd = s.edited("amd", |c, _| c.architecture = "amd64".into());
+    // The index says arm64, the config amd64.
+    s.index("lying", &[("linux/arm64", &amd)]);
+    o.image = "lying".into();
+    let e = err(prepare(&s.store, &o, ARCH));
+    assert!(e.contains("config says amd64"), "{e}");
+    // Not linux.
+    s.index("freebsd", &[("freebsd/arm64", &arm)]);
+    o.image = "freebsd".into();
+    let e = err(prepare(&s.store, &o, ARCH));
+    assert!(e.contains("is for freebsd, not linux"), "{e}");
+    // Two arm64 entries.
+    s.index(
+        "twice",
+        &[("linux/arm64", &arm), ("linux/arm64", &arm), ("linux/amd64", &amd)],
+    );
+    o.image = "twice".into();
+    let e = err(prepare(&s.store, &o, ARCH));
+    assert!(e.contains("has 2 arm64 images"), "{e}");
+    // A consistent index runs.
+    s.index("good", &[("linux/arm64", &arm), ("linux/amd64", &amd)]);
+    o.image = "good".into();
+    prepare(&s.store, &o, ARCH).unwrap();
+    assert!(err(prepare(&s.store, &o, "riscv64")).contains("has no riscv64 image"));
+}
+
+/// Layers: an optional kernel first, an optional init next, then app layers.
+#[test]
+fn misplaced_or_unknown_layers_are_refused() {
+    let s = setup();
+    let mut o = RunOptions::new("x");
+    s.custom(&mut o);
+    let kernel = s.blob(KILN_KERNEL, b"kernel");
+    let init = s.blob(KILN_INIT, b"init layer");
+    type Edit<'a> = Box<dyn Fn(&mut KilnConfig, &mut Vec<Descriptor>) + 'a>;
+    let cases: [(&str, Edit<'_>, &str); 4] = [
+        (
+            "kernel-second",
+            Box::new(|_, l| l.push(kernel.clone())),
+            "unexpected layer 1 of type application/vnd.kiln.kernel.v1",
+        ),
+        (
+            "init-after-app",
+            Box::new(|_, l| l.push(init.clone())),
+            "unexpected layer 1 of type application/vnd.kiln.init.v1.erofs",
+        ),
+        (
+            "unknown",
+            Box::new(|_, l| l.push(Descriptor::new("application/x-evil\n", l[0].digest.clone(), 1))),
+            "unexpected layer 1 of type application/x-evil",
+        ),
+        (
+            "kernel-without-config",
+            Box::new(|c, l| {
+                c.kernel = None;
+                l.insert(0, kernel.clone());
+            }),
+            "has a kernel layer but no kernel in its config",
+        ),
+    ];
+    for (tag, edit, want) in cases {
+        s.edited(tag, |c, l| edit(c, l));
+        o.image = tag.into();
+        // The image's own kernel is what the last case is about.
+        o.kernel = (tag != "kernel-without-config").then(|| s.files.join("kernel"));
+        let e = err(prepare(&s.store, &o, ARCH));
+        assert!(e.contains(want), "{tag}: {e}");
+        assert!(!e.contains('\n'), "{tag}: {e:?}");
+    }
+    // App layers are only of the layer type.
+    s.edited("ok", |_, l| assert!(l.iter().all(|d| d.media_type == KILN_LAYER)));
 }

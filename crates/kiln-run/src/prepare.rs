@@ -57,19 +57,44 @@ pub fn host_arch() -> &'static str {
 
 /// Resolves `opts.image` for `arch` and decides the kernel and init (spec §8.1).
 pub fn prepare(store: &Store, opts: &RunOptions, arch: &str) -> Result<Prepared> {
+    // The custom kernel and init flags are this function's to enforce, whoever calls it.
+    opts.check()?;
     let loaded = load(store, &resolve_name(store, &opts.image)?)?;
     let shown = clean_line(&opts.image);
-    let Some((_, image)) = loaded.entries.iter().find(|(p, _)| p.architecture == arch) else {
-        let have: Vec<String> = loaded
-            .entries
-            .iter()
-            .map(|(p, _)| clean_line(&p.architecture))
-            .collect();
-        return Err(Error::refused(format!(
-            "{shown} has no {arch} image (it has {})",
-            have.join(", ")
-        )));
+    let found: Vec<_> = loaded.entries.iter().filter(|(p, _)| p.architecture == arch).collect();
+    let (platform, image) = match found.as_slice() {
+        [one] => *one,
+        [] => {
+            let have: Vec<String> = loaded
+                .entries
+                .iter()
+                .map(|(p, _)| clean_line(&p.architecture))
+                .collect();
+            return Err(Error::refused(format!(
+                "{shown} has no {arch} image (it has {})",
+                have.join(", ")
+            )));
+        }
+        more => {
+            return Err(Error::refused(format!(
+                "{shown} has {} {arch} images in its index; kiln cannot tell which to run",
+                more.len()
+            )));
+        }
     };
+    // The index entry, the image's own config and the host must agree.
+    if platform.os != "linux" {
+        return Err(Error::refused(format!(
+            "{shown}'s {arch} image is for {}, not linux",
+            clean_line(&platform.os)
+        )));
+    }
+    if image.config.architecture != arch {
+        return Err(Error::refused(format!(
+            "{shown}'s index lists a {arch} image whose config says {}; the image is inconsistent",
+            clean_line(&image.config.architecture)
+        )));
+    }
     let mut warnings = Vec::new();
     let (mut kernel_layer, mut init_layer, mut layers) = (None, None, Vec::new());
     for (i, l) in image.manifest.layers.iter().enumerate() {
