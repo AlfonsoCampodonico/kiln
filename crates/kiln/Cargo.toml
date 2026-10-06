@@ -17,6 +17,7 @@ kiln-image = { path = "../kiln-image" }
 kiln-oci = { path = "../kiln-oci" }
 kiln-proto = { path = "../kiln-proto" }
 kiln-registry = { path = "../kiln-registry" }
+kiln-run = { path = "../kiln-run" }
 kiln-store = { path = "../kiln-store" }
 rlimit = "0.11.0"
 serde_json = "1.0.151"

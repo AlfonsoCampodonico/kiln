@@ -845,6 +845,7 @@ dependencies = [
  "kiln-oci",
  "kiln-proto",
  "kiln-registry",
+ "kiln-run",
  "kiln-store",
  "predicates",
  "rlimit",

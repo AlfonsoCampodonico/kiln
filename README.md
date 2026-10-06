@@ -2,7 +2,7 @@
 
 kiln turns OCI container images into microVM images: one deterministic erofs filesystem per layer, stacked with overlayfs inside the guest. It runs natively on macOS and Linux, without root.
 
-Status: milestone M3a. `kiln convert` works on registry images and local inputs, and `kiln pull`/`kiln push` move kiln images through registries. The guest side of running an image (`kiln-init`, the control protocol and the scratch disk) boots under Firecracker and Cloud Hypervisor in kiln's boot tests; `kiln run` comes next (M3b).
+Status: milestone M3b (runtime and CLI). `kiln convert` works on registry images and local inputs, `kiln pull`/`kiln push` move kiln images through registries, and `kiln run` boots an image under Firecracker or Cloud Hypervisor on Linux with KVM. No kernel or kiln-init release is pinned yet, so `kiln run` needs `--kernel` and `--init` (below).
 
 ## Quickstart
 
@@ -48,6 +48,24 @@ An argument that names an existing path is a local source; anything else must be
 - `kiln import --from-store DIR NAME [--as NAME]` copies an image from another store (for example the macOS store mounted read-only into a Lima VM), verifying every blob.
 - `kiln bench LAYOUT` measures cold, warm and changed-top-layer conversions and prints JSON.
 - `--store DIR` (or `$KILN_HOME`) selects the store; the default is `~/.local/share/kiln`.
+
+## Running images
+
+`kiln run IMAGE [CMD...]` boots the image in a microVM on Linux with KVM and runs its command (or `CMD`, which replaces the image's cmd), as `docker run` would. Until kiln pins released kernels and kiln-init, every run names both:
+
+```bash
+K="--kernel vmlinux --allow-custom-kernel --init kiln-init --allow-custom-init"
+kiln run $K alpine:3 -- sh -c 'echo hello'      # exit code, stdout and stderr as with docker run
+echo hi | kiln run $K -i alpine:3 -- cat        # -i relays stdin; without it stdin is at EOF
+kiln run $K -t -i alpine:3                      # a terminal: Ctrl-] q stops the guest, Ctrl-] k kills it
+```
+
+- The first SIGINT or SIGTERM asks the guest to stop (`STOPSIGNAL`, then SIGKILL after `--stop-timeout`, default 10 s); a second SIGINT kills the VM. SIGHUP, SIGQUIT, SIGUSR1 and SIGUSR2 are forwarded to the command.
+- Exit codes: the command's, or `128 + signal`; 127 and 126 when the entrypoint is missing or not executable; 137 when you killed the VM, as with `docker kill`; 125 when kiln, the VM or the guest's init failed, including the `--boot-timeout` (default 30 s), with the end of the guest's console.
+- Other flags: `--vmm firecracker|cloud-hypervisor` (default Firecracker), `--cpus N`, `--memory MiB`, `--disk SIZE` (the scratch disk, default 4G), `-e KEY[=VALUE]`.
+- The kernel and kiln-init that boot are pinned by digest in kiln once they are released; until then `--kernel PATH --allow-custom-kernel --init PATH --allow-custom-init` name them (vmkit builds the kernel; `kiln-init` is built as below). Both are warned about and recorded in the run's `run.json`. An image's own init layer never boots.
+- Per-run state lives in `$XDG_RUNTIME_DIR/kiln/<id>/` (or `/tmp/kiln-<uid>/`), mode 0700; `KILN_KEEP_RUN_DIR=1` keeps it and `KILN_TIMINGS=1` prints how long booting took.
+- On macOS, `kiln run` explains how to use a Lima VM.
 
 ## The guest
 

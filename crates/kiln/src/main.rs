@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod bench;
+mod run_cmd;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -130,6 +131,9 @@ enum Cmd {
     },
     /// Remove blobs and cache entries no tag reaches.
     Gc,
+    /// Boot an image in a microVM and run its command (Linux with KVM; on macOS,
+    /// in a Lima VM).
+    Run(Box<run_cmd::RunArgs>),
     /// Measure convert performance on a local OCI layout (JSON on stdout).
     Bench {
         path: PathBuf,
@@ -525,6 +529,7 @@ fn run(cli: Cli) -> Result<()> {
                 r.cache_entries_removed
             );
         }
+        Cmd::Run(_) => unreachable!("handled in main"),
         Cmd::Bench {
             path,
             args,
@@ -561,7 +566,17 @@ fn main() -> ExitCode {
     // Many-layer images keep a few files open per layer; macOS defaults to 256.
     // Best effort: the hard limit may already be the soft one.
     let _ = rlimit::increase_nofile_limit(u64::MAX);
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    if let Cmd::Run(args) = &cli.cmd {
+        return match run_cmd::run(|| open_store(&cli), args) {
+            Ok(code) => ExitCode::from(code),
+            Err(e) => {
+                eprintln!("{}", render_error(&e));
+                ExitCode::from(run_cmd::EXIT_ERROR)
+            }
+        };
+    }
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{}", render_error(&e));
