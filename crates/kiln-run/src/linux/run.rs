@@ -109,6 +109,8 @@ pub struct Run {
     session: Session,
     console: ConsoleRelay,
     run_dir: RunDir,
+    /// `KILN_KEEP_RUN_DIR=1` at the start.
+    keep: bool,
 }
 
 /// How a run ended, for the CLI.
@@ -140,7 +142,10 @@ impl Run {
 
         let base = rundir::base_dir()?;
         let (boot_id, hostname) = (rundir::boot_id(), rundir::hostname());
-        rundir::clean_stale(&base, &boot_id, &hostname, rundir::alive);
+        let cleanup = rundir::clean_stale(&base, &boot_id, &hostname, rundir::alive);
+        if let Some(note) = cleanup.notice(&base) {
+            notice(&note);
+        }
         let mut run_dir = RunDir::create(&base)?;
         let keep = std::env::var_os("KILN_KEEP_RUN_DIR").is_some_and(|v| v == "1");
         if keep {
@@ -176,7 +181,7 @@ impl Run {
                 scratch_bytes,
                 exit_method: exit_method(vmm.as_ref()),
                 window,
-                host_env: std::env::vars().collect(),
+                host_env: config::host_env(std::env::vars_os()),
             },
         )?;
         let console = ConsoleRelay::start(&run_dir.path)?;
@@ -193,6 +198,12 @@ impl Run {
         );
         let vm = vmm.create(&spec)?;
         info.vmm = vmm_identity(&run_dir.path);
+        if info.vmm.is_none() {
+            notice(
+                "warning: could not read the VMM's identity for run.json; if kiln is killed, its run directory \
+                 may be cleaned up while the VMM is still exiting",
+            );
+        }
         run_dir.write_info(&info)?;
         drop(lock);
         let session = Session::start(
@@ -211,6 +222,7 @@ impl Run {
             session,
             console,
             run_dir,
+            keep,
         })
     }
 
@@ -228,6 +240,7 @@ impl Run {
             session,
             console,
             run_dir,
+            keep,
         } = self;
         let outcome = session.finish();
         let log = console.log.clone();
@@ -236,9 +249,7 @@ impl Run {
             || outcome.init_failed.is_some()
             || (outcome.exited.is_none() && !outcome.killed);
         let console_tail = if failed { tail(&log, TAIL_LINES) } else { Vec::new() };
-        let kept = std::env::var_os("KILN_KEEP_RUN_DIR")
-            .is_some_and(|v| v == "1")
-            .then(|| run_dir.path.clone());
+        let kept = keep.then(|| run_dir.path.clone());
         drop(run_dir);
         Report {
             outcome,

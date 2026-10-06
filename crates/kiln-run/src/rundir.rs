@@ -218,6 +218,26 @@ pub struct Cleanup {
     pub foreign: Vec<String>,
 }
 
+impl Cleanup {
+    /// The note for the user about directories left alone (spec §5.3), if any.
+    pub fn notice(&self, base: &Path) -> Option<String> {
+        if self.foreign.is_empty() {
+            return None;
+        }
+        let mut names = self.foreign.clone();
+        names.sort();
+        Some(format!(
+            "note: {} run director{} in {} belong{} to another boot or host and {} left alone: {}",
+            names.len(),
+            if names.len() == 1 { "y" } else { "ies" },
+            base.display(),
+            if names.len() == 1 { "s" } else { "" },
+            if names.len() == 1 { "was" } else { "were" },
+            names.join(", ")
+        ))
+    }
+}
+
 /// Removes run directories under `base` that this host's current boot made and
 /// whose processes are all gone. Only real directories are considered; those
 /// without a readable `run.json` of this version (a run may be starting, or a
@@ -329,6 +349,14 @@ mod tests {
         }
         // Without a boot id nothing counts as this boot's.
         assert!(clean_stale(base.path(), "", "h", |_| false).removed.is_empty());
+        // The foreign ones are reported.
+        let note = r.notice(Path::new("/b")).unwrap();
+        assert_eq!(
+            note,
+            "note: 2 run directories in /b belong to another boot or host and were left alone: \
+             other-boot, other-host"
+        );
+        assert_eq!(Cleanup::default().notice(Path::new("/b")), None);
     }
 
     /// Only real directories with a regular `run.json` of this version are runs:

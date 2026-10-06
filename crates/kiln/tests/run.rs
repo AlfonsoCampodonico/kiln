@@ -211,6 +211,16 @@ fn exit_codes_as_docker_reports_them() {
     );
     let o = f.output(&["busybox", "--", "sh", "-c", "kill -9 $$"]);
     assert_eq!(code(&o), 137);
+    // kiln's own environment need not be UTF-8.
+    let o = {
+        use std::os::unix::ffi::OsStrExt;
+        f.run(&["busybox", "--", "true"])
+            .env("KILN_TEST_NOT_UTF8", std::ffi::OsStr::from_bytes(b"\xff"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
     let o = f.output(&["busybox", "--", "/nonexistent"]);
     assert_eq!(code(&o), 127);
     assert!(
