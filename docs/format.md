@@ -310,7 +310,9 @@ The whole `Config` is one frame, and a frame is at most 65536 bytes including th
 1. The guest connects port 1024 and sends `Hello`. The host answers the first `Hello` with `Config`, once per VM.
 2. The guest sends `Stage` for stages 3 to 7, `Running` once the main process has started, then `Exited`, or `InitFailed` at any point. The host sends `Shutdown`, `Signal` and `WindowSize` at any time after `Config`.
 
-The host kills the VM, and reports 125, on any violation: a second connection to port 1024, a second `Hello` (a reset guest starting over), any message before `Hello`, a protocol version it does not support, or any framing or payload error. The guest treats a framing or payload error, a second `Config`, or the host closing port 1024 as a failure (InitFailed, then the VM ends).
+The host checks the order of the guest's messages: `Stage` numbers strictly increase (gaps allowed) and only stages 3 to 6 come before `Running`; `Running` comes once, at stage 6; `Stage 7` comes only after `Running`; `Exited` only at stage 7; `InitFailed` once, anywhere after `Hello`, naming a stage no earlier than the last one reported (`Running` counts as stage 7). Nothing may follow `Exited`; anything after `InitFailed` is ignored, so the failure is what is reported.
+
+The host kills the VM, and reports 125, on any violation: a message out of that order, a second connection to port 1024 (or to any port it serves), a second `Hello` (a reset guest starting over), any message before `Hello`, a protocol version it does not support, or any framing or payload error. The guest treats a framing or payload error, a second `Config`, or the host closing port 1024 as a failure (InitFailed, then the VM ends).
 
 ### Exit codes
 

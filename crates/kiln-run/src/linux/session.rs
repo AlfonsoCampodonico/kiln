@@ -39,7 +39,7 @@ use vmkit::{EndReason, Vm, VmEnd};
 
 use crate::error::{Error, Result};
 use crate::escape::{Escape, Key};
-use crate::protocol::Protocol;
+use crate::protocol::{Accepted, Protocol};
 
 /// How many host messages may wait for the guest to read them.
 const QUEUE: usize = 64;
@@ -451,10 +451,14 @@ impl Session {
         let now = Instant::now();
         match e {
             Event::Guest(msg) => {
-                if let Err(v) = self.proto.accept(&msg) {
-                    // The reader checked it already; this cannot differ.
-                    self.violate(v.0);
-                    return;
+                match self.proto.accept(&msg) {
+                    Ok(Accepted::Hello | Accepted::Recorded) => {}
+                    Ok(Accepted::Ignored) => return,
+                    Err(v) => {
+                        // The reader checked it already; this cannot differ.
+                        self.violate(v.0);
+                        return;
+                    }
                 }
                 match msg {
                     GuestMessage::Hello(_) => self.hello_at = Some(now),
@@ -730,7 +734,9 @@ fn read_control(
             Err(e) => return violation(format!("guest protocol error: {e}")),
         };
         match proto.accept(&msg) {
-            Ok(true) => {
+            // After InitFailed: not the main loop's concern.
+            Ok(Accepted::Ignored) => continue,
+            Ok(Accepted::Hello) => {
                 let sent = match &reply {
                     None => {
                         write_message(&mut w, &HostMessage::Config(Box::new(config.clone()))).map_err(|e| e.to_string())
@@ -747,7 +753,7 @@ fn read_control(
                     Err(e) => return violation(format!("control socket: {e}")),
                 }
             }
-            Ok(false) => {}
+            Ok(Accepted::Recorded) => {}
             Err(v) => return violation(v.0),
         }
         if events.send(Event::Guest(msg)).is_err() {
