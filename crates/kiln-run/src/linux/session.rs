@@ -856,6 +856,12 @@ fn read_control(
             // After InitFailed: not the main loop's concern.
             Ok(Accepted::Ignored) => continue,
             Ok(Accepted::Hello) => {
+                // The main loop learns of Hello before the guest gets Config, so
+                // nothing the guest does next (a terminal's Ctrl-] q, say) can
+                // reach it first and count as before Hello.
+                if events.send(Event::Guest(msg)).is_err() {
+                    return;
+                }
                 let sent = match &reply {
                     None => {
                         write_message(&mut w, &HostMessage::Config(Box::new(config.clone()))).map_err(|e| e.to_string())
@@ -872,11 +878,12 @@ fn read_control(
                     Err(e) => return violation(format!("control socket: {e}")),
                 }
             }
-            Ok(Accepted::Recorded) => {}
+            Ok(Accepted::Recorded) => {
+                if events.send(Event::Guest(msg)).is_err() {
+                    return;
+                }
+            }
             Err(v) => return violation(v.0),
-        }
-        if events.send(Event::Guest(msg)).is_err() {
-            return;
         }
     }
 }
