@@ -97,8 +97,9 @@ pub fn check_size(config: &Config) -> Result<()> {
 /// and the NIC (spec §9.1). Checked against the VMM's budget before boot.
 pub fn check_devices(layers: usize, net: bool, available: u32, vmm: &str) -> Result<()> {
     let fixed = 3 + u32::from(net);
-    let needed = layers as u32 + fixed;
-    if needed > available {
+    let needed = u32::try_from(layers).ok().and_then(|n| n.checked_add(fixed));
+    if needed.is_none_or(|n| n > available) {
+        let needed = needed.map_or_else(|| format!("more than {}", u32::MAX), |n| n.to_string());
         return Err(Error::refused(format!(
             "the image has {layers} layers, which with the init and scratch disks, vsock{} need \
              {needed} virtio devices; {vmm} has room for {available}. Convert the image again with \
@@ -107,7 +108,7 @@ pub fn check_devices(layers: usize, net: bool, available: u32, vmm: &str) -> Res
             available.saturating_sub(fixed)
         )));
     }
-    if layers as u32 > kiln_proto::MAX_LAYERS {
+    if u32::try_from(layers).is_ok_and(|n| n > kiln_proto::MAX_LAYERS) {
         return Err(Error::refused(format!(
             "the image has {layers} layers; kiln-init mounts at most {}",
             kiln_proto::MAX_LAYERS
@@ -197,5 +198,14 @@ mod tests {
         );
         check_devices(27, false, 30, "cloud-hypervisor").unwrap();
         assert!(check_devices(129, false, 300, "x").is_err());
+        // Counts that do not fit a u32 are refused, never wrapped into the budget.
+        if let Ok(huge) = usize::try_from(u64::from(u32::MAX) - 1) {
+            let err = check_devices(huge, true, 30, "x").unwrap_err().to_string();
+            assert!(err.contains("need more than"), "{err}");
+            let err = check_devices(huge.saturating_mul(2), false, 30, "x")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("need more than"), "{err}");
+        }
     }
 }

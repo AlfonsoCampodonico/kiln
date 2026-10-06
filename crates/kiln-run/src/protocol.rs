@@ -5,9 +5,13 @@
 //! `Hello`, `Stage` 3, 4, 5, 6 (strictly increasing, gaps allowed), `Running`,
 //! `Stage` 7, `Exited`
 //!
-//! with `InitFailed` allowed once at any point after `Hello`. Nothing may follow
-//! `Exited` or `InitFailed`. So a guest gets at most nine messages accepted, and
-//! the host's memory for a session stays bounded whatever the guest sends.
+//! with `InitFailed` allowed once at any point after `Hello`, naming a stage no
+//! earlier than the one the host has seen (kiln-init records a stage before
+//! reporting it; `Running` counts as stage 7, so a guest cannot claim an exec
+//! failure, 127 or 126, after its process ran). Nothing may follow `Exited`;
+//! whatever follows `InitFailed` is ignored, so the init failure is what is
+//! reported. So a guest gets at most nine messages accepted, and the host's
+//! memory for a session stays bounded whatever the guest sends.
 
 use kiln_proto::{EXIT_INFRA, Exited, GuestMessage, InitFailed, PROTOCOL_VERSION};
 
@@ -19,6 +23,17 @@ impl std::fmt::Display for Violation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// What [`Protocol::accept`] did with a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accepted {
+    /// The first `Hello`: the host answers it with `Config`.
+    Hello,
+    /// Recorded.
+    Recorded,
+    /// Arrived after `InitFailed`, and dropped.
+    Ignored,
 }
 
 /// What the guest has reported so far.
@@ -33,10 +48,13 @@ pub struct Protocol {
 }
 
 impl Protocol {
-    /// Checks `msg` against the sequence and records it. `Ok(true)` means it was
-    /// `Hello`, which the host answers with `Config`.
-    pub fn accept(&mut self, msg: &GuestMessage) -> Result<bool, Violation> {
+    /// Checks `msg` against the sequence and records it.
+    pub fn accept(&mut self, msg: &GuestMessage) -> Result<Accepted, Violation> {
         let v = |s: String| Err(Violation(s));
+        if self.failed.is_some() {
+            // Init has failed and is ending the VM; its report stands.
+            return Ok(Accepted::Ignored);
+        }
         if self.terminal() {
             return v(format!("{} after the guest's final message", name(msg)));
         }
@@ -50,7 +68,7 @@ impl Protocol {
                 }
                 self.hello = true;
                 self.stage = 2;
-                return Ok(true);
+                return Ok(Accepted::Hello);
             }
             _ if !self.hello => return v(format!("{} before Hello", name(msg))),
             GuestMessage::Stage(s) => {
@@ -78,9 +96,15 @@ impl Protocol {
                 }
                 self.exited = Some(*e);
             }
-            GuestMessage::InitFailed(f) => self.failed = Some(f.clone()),
+            GuestMessage::InitFailed(f) => {
+                let seen = if self.running { 7 } else { self.stage };
+                if f.stage < seen {
+                    return v(format!("InitFailed at stage {} after stage {seen}", f.stage));
+                }
+                self.failed = Some(f.clone());
+            }
         }
-        Ok(false)
+        Ok(Accepted::Recorded)
     }
 
     /// `Exited` or `InitFailed` arrived: the guest has nothing more to say.
@@ -174,32 +198,69 @@ mod tests {
         assert!(p.terminal() && p.running());
         assert_eq!(p.exit_code(), 3);
         let mut q = Protocol::default();
-        assert_eq!(q.accept(&hello()), Ok(true));
-        assert_eq!(q.accept(&stage(3)), Ok(false));
+        assert_eq!(q.accept(&hello()), Ok(Accepted::Hello));
+        assert_eq!(q.accept(&stage(3)), Ok(Accepted::Recorded));
         // Gaps are allowed (the guest reports stages, they need not all be seen).
         run(&[hello(), stage(6), GuestMessage::Running, stage(7), exited(0)]).unwrap();
     }
 
     #[test]
     fn init_failures_end_the_sequence_anywhere_after_hello() {
+        let all = [
+            hello(),
+            stage(3),
+            stage(4),
+            stage(5),
+            stage(6),
+            GuestMessage::Running,
+            stage(7),
+        ];
         for prefix in 1..=7 {
-            let mut msgs = vec![
-                hello(),
-                stage(3),
-                stage(4),
-                stage(5),
-                stage(6),
-                GuestMessage::Running,
-                stage(7),
-            ];
-            msgs.truncate(prefix);
-            msgs.push(failed(6, Some(2)));
-            let p = run(&msgs).unwrap();
-            assert_eq!(p.exit_code(), 127);
-            msgs.push(stage(7));
-            assert!(run(&msgs).is_err(), "{msgs:?}");
+            let mut msgs = all[..prefix].to_vec();
+            msgs.push(failed(7, None));
+            assert_eq!(run(&msgs).unwrap().exit_code(), EXIT_INFRA);
+            if prefix <= 5 {
+                // Before Running, an exec failure at stage 6 is 127.
+                msgs.pop();
+                msgs.push(failed(6, Some(2)));
+                assert_eq!(run(&msgs).unwrap().exit_code(), 127);
+            }
+            // Whatever follows InitFailed is ignored: the failure is reported.
+            let mut p = run(&msgs).unwrap();
+            let code = p.exit_code();
+            for late in [stage(7), GuestMessage::Running, exited(0), failed(7, None), hello()] {
+                assert_eq!(p.accept(&late), Ok(Accepted::Ignored), "{msgs:?} {late:?}");
+            }
+            assert_eq!(
+                (p.exit_code(), p.init_failed()),
+                (code, run(&msgs).unwrap().init_failed())
+            );
         }
         assert_eq!(run(&[hello(), failed(3, None)]).unwrap().exit_code(), EXIT_INFRA);
+    }
+
+    /// kiln-init records a stage before reporting it, so its failure never names an
+    /// earlier stage than the host saw; a guest claiming one is lying (for instance
+    /// an exec failure, 127, after its process ran).
+    #[test]
+    fn init_failures_cannot_name_a_stage_already_passed() {
+        let bad: [&[GuestMessage]; 4] = [
+            &[hello(), stage(4), failed(3, None)],
+            &[hello(), stage(6), GuestMessage::Running, failed(6, Some(2))],
+            &[hello(), stage(6), GuestMessage::Running, stage(7), failed(6, Some(2))],
+            &[hello(), failed(1, None)],
+        ];
+        for msgs in bad {
+            let (at, why) = run(msgs).unwrap_err();
+            assert_eq!(at, msgs.len() - 1, "{msgs:?}: {why}");
+            assert!(why.0.starts_with("InitFailed at stage"), "{why}");
+        }
+        // The stage being entered, before it was reported, is fine.
+        assert_eq!(
+            run(&[hello(), stage(4), failed(5, None)]).unwrap().exit_code(),
+            EXIT_INFRA
+        );
+        assert_eq!(run(&[hello(), stage(5), failed(6, Some(13))]).unwrap().exit_code(), 126);
     }
 
     #[test]
