@@ -137,10 +137,7 @@ pub fn run(open_store: impl FnOnce() -> Result<kiln_store::Store>, args: &RunArg
         // describe() is sanitised already; cleaned here too so this file is obviously safe.
         eprintln!("kiln: {}", clean_line(&f.describe()));
     } else if o.exited.is_none() && !o.killed {
-        eprintln!(
-            "kiln: the VM ended without reporting the command's exit ({:?})",
-            o.end.reason
-        );
+        eprintln!("kiln: {}", report.no_final_message());
     }
     if !report.console_tail.is_empty() {
         eprintln!("kiln: the end of the guest's console:");
@@ -162,8 +159,9 @@ pub fn run(open_store: impl FnOnce() -> Result<kiln_store::Store>, args: &RunArg
             t0.elapsed().as_millis()
         );
     }
-    if let Some(dir) = &report.kept {
+    if let Some((dir, scratch)) = &report.kept {
         eprintln!("kiln: run directory kept: {}", dir.display());
+        eprintln!("kiln: scratch directory kept: {}", scratch.display());
     }
     Ok(u8::try_from(o.exit_code).unwrap_or(EXIT_ERROR))
 }

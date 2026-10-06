@@ -1,13 +1,18 @@
 //! Per-run state (spec §5.3, T7): `$XDG_RUNTIME_DIR/kiln/<run-id>/`, mode 0700, or
 //! `/tmp/kiln-<uid>/<run-id>/` without `XDG_RUNTIME_DIR`. Each directory holds
-//! `run.json`, the VMM's sockets (`sock/`), its logs, the scratch disk (unless
-//! persisted) and `console.log`.
+//! `run.json`, the VMM's sockets (`sock/`), its logs and `console.log`.
 //!
-//! A directory is cleaned up by the run that made it. One left behind (kiln was
-//! killed) is removed by a later run only when its `run.json` names this host's
-//! boot and hostname and neither kiln nor the VMM it names is alive: entries from
-//! other boots or hosts (a shared `/tmp`) are never touched ([`Cleanup::foreign`]
-//! lists them).
+//! The scratch disk (unless persisted) is not there: `XDG_RUNTIME_DIR` is usually
+//! a tmpfs, whose pages would be the guest's disk held in host memory (and charged
+//! to the VMM's memory limit). It lives in the run's scratch directory,
+//! `$KILN_HOME/scratch/<run-id>/`, mode 0700, on the store's filesystem
+//! ([`ScratchDir`]); `run.json` records it.
+//!
+//! A run's directories are cleaned up by the run that made them. Those left
+//! behind (kiln was killed) are removed by a later run only when the `run.json`
+//! names this host's boot and hostname and neither kiln nor the VMM it names is
+//! alive: entries from other boots or hosts (a shared `/tmp`) are never touched
+//! ([`Cleanup::foreign`] lists them). `kiln gc` never touches scratch directories.
 
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::{Read, Write};
@@ -51,6 +56,9 @@ pub struct RunInfo {
     /// Kept for debugging (`KILN_KEEP_RUN_DIR=1`): never cleaned up by later runs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep: bool,
+    /// The run's scratch directory ([`ScratchDir`]), removed with the run directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_dir: Option<String>,
 }
 
 pub const RUN_INFO_VERSION: u32 = 1;
@@ -100,6 +108,48 @@ impl Drop for RunDir {
     }
 }
 
+/// The name of the store's directory of scratch directories: `$KILN_HOME/scratch`.
+pub const SCRATCH: &str = "scratch";
+
+/// One run's scratch directory, `$KILN_HOME/scratch/<run-id>/` (spec §5.3, rev
+/// 2.9): it holds the scratch disk, on the store's filesystem rather than in the
+/// run directory's tmpfs. Removed when dropped unless kept.
+#[derive(Debug)]
+pub struct ScratchDir {
+    pub path: PathBuf,
+    keep: bool,
+}
+
+impl ScratchDir {
+    /// A fresh directory `<base>/<id>` (see [`scratch_base`]), mode 0700.
+    pub fn create(base: &Path, id: &str) -> Result<Self> {
+        let path = base.join(id);
+        dir_builder().create(&path)?;
+        Ok(Self { path, keep: false })
+    }
+
+    /// Leaves the directory in place (`KILN_KEEP_RUN_DIR=1`).
+    pub fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// `<store root>/scratch`: created 0700 if missing, and refused unless it is a real
+/// directory owned by this user and closed to everyone else (as [`base_dir`]).
+pub fn scratch_base(store_root: &Path) -> Result<PathBuf> {
+    let base = store_root.join(SCRATCH);
+    secure(&base, rustix::process::getuid().as_raw(), "scratch directory")?;
+    Ok(base)
+}
+
 fn dir_builder() -> DirBuilder {
     let mut b = DirBuilder::new();
     #[cfg(unix)]
@@ -131,6 +181,10 @@ fn base_path(xdg_runtime_dir: Option<std::ffi::OsString>, uid: u32) -> PathBuf {
 
 /// Creates `dir` 0700 if missing; then checks it without following a symlink.
 pub fn secure_dir(dir: &Path, uid: u32) -> Result<()> {
+    secure(dir, uid, "run directory")
+}
+
+fn secure(dir: &Path, uid: u32, what: &str) -> Result<()> {
     match dir_builder().create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -144,7 +198,7 @@ pub fn secure_dir(dir: &Path, uid: u32) -> Result<()> {
     )
     .map_err(|e| {
         Error::refused(format!(
-            "run directory {}: {} (it must be a directory, not a symlink)",
+            "{what} {}: {} (it must be a directory, not a symlink)",
             dir.display(),
             std::io::Error::from(e)
         ))
@@ -153,7 +207,7 @@ pub fn secure_dir(dir: &Path, uid: u32) -> Result<()> {
     let mode = st.st_mode as u32;
     if FileType::from_raw_mode(st.st_mode as _) != FileType::Directory || st.st_uid != uid || mode & 0o077 != 0 {
         return Err(Error::refused(format!(
-            "run directory {} must be a directory owned by uid {uid} with mode 0700 (it is owned by {} with mode {:o})",
+            "{what} {} must be a directory owned by uid {uid} with mode 0700 (it is owned by {} with mode {:o})",
             dir.display(),
             st.st_uid,
             mode & 0o7777
@@ -239,11 +293,13 @@ impl Cleanup {
 }
 
 /// Removes run directories under `base` that this host's current boot made and
-/// whose processes are all gone. Only real directories are considered; those
-/// without a readable `run.json` of this version (a run may be starting, or a
-/// newer kiln made it) are left alone, and `run.json` is never read through a
-/// symlink.
+/// whose processes are all gone, each with the scratch directory its `run.json`
+/// records. Only real directories are considered; those without a readable
+/// `run.json` of this version (a run may be starting, or a newer kiln made it) are
+/// left alone, and `run.json` is never read through a symlink. A run directory
+/// stays while its scratch directory could not be removed, so a later run retries.
 pub fn clean_stale(base: &Path, boot_id: &str, hostname: &str, alive: impl Fn(&Identity) -> bool) -> Cleanup {
+    let uid = rustix::process::getuid().as_raw();
     let mut report = Cleanup::default();
     let Ok(entries) = std::fs::read_dir(base) else {
         return report;
@@ -270,11 +326,39 @@ pub fn clean_stale(base: &Path, boot_id: &str, hostname: &str, alive: impl Fn(&I
         if info.keep || alive(&info.kiln) || info.vmm.as_ref().is_some_and(&alive) {
             continue;
         }
+        if !info
+            .scratch_dir
+            .as_deref()
+            .is_none_or(|s| remove_scratch(Path::new(s), &info.id, uid))
+        {
+            continue;
+        }
         if std::fs::remove_dir_all(entry.path()).is_ok() {
             report.removed.push(name);
         }
     }
     report
+}
+
+/// Removes a stale run's scratch directory; false when it is still there. Only a
+/// path of the shape kiln makes, `/…/scratch/<id>` naming a real directory of this
+/// user's, is removed, so `run.json` cannot point the cleanup at anything else;
+/// any other path counts as gone.
+fn remove_scratch(path: &Path, id: &str, uid: u32) -> bool {
+    use std::ffi::OsStr;
+    use std::os::unix::fs::MetadataExt;
+    let shaped = path.is_absolute()
+        && path.components().all(|c| !matches!(c, std::path::Component::ParentDir))
+        && path.file_name() == Some(OsStr::new(id))
+        && path.parent().and_then(Path::file_name) == Some(OsStr::new(SCRATCH));
+    if !shaped {
+        return true;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() && m.uid() == uid => std::fs::remove_dir_all(path).is_ok(),
+        Ok(_) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// The most of `run.json` read: it is a few hundred bytes.
@@ -315,6 +399,7 @@ mod tests {
             custom_kernel: None,
             custom_init: None,
             keep: false,
+            scratch_dir: None,
         }
     }
 
@@ -399,6 +484,72 @@ mod tests {
             assert!(base.path().join(kept).symlink_metadata().is_ok(), "{kept}");
         }
         assert!(elsewhere.path().join("real/run.json").exists());
+    }
+
+    /// A stale run's scratch directory goes with it; a live or kept run's stays, and
+    /// a run.json naming anything but `/…/scratch/<id>` removes nothing else.
+    #[test]
+    fn stale_runs_take_their_scratch_directories_with_them() {
+        let base = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let scratch = scratch_base(store.path()).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mk = |i: &RunInfo| {
+            std::fs::create_dir(base.path().join(&i.id)).unwrap();
+            std::fs::write(base.path().join(&i.id).join("run.json"), serde_json::to_vec(i).unwrap()).unwrap();
+        };
+        let with_scratch = |i: RunInfo| {
+            let s = ScratchDir::create(&scratch, &i.id).unwrap();
+            std::fs::write(s.path.join("scratch.img"), b"disk").unwrap();
+            let mut s = s;
+            s.keep();
+            RunInfo {
+                scratch_dir: Some(s.path.display().to_string()),
+                ..i
+            }
+        };
+        mk(&with_scratch(info("dead", "b", "h", 1)));
+        mk(&with_scratch(info("live", "b", "h", 2)));
+        mk(&with_scratch(RunInfo {
+            keep: true,
+            ..info("kept", "b", "h", 1)
+        }));
+        // Recorded but never made (kiln died in between).
+        mk(&RunInfo {
+            scratch_dir: Some(scratch.join("unmade").display().to_string()),
+            ..info("unmade", "b", "h", 1)
+        });
+        // Not of kiln's shape: another directory, and a scratch path of another id.
+        std::fs::write(other.path().join("precious"), b"x").unwrap();
+        mk(&RunInfo {
+            scratch_dir: Some(other.path().display().to_string()),
+            ..info("odd", "b", "h", 1)
+        });
+        std::fs::create_dir(scratch.join("someone")).unwrap();
+        mk(&RunInfo {
+            scratch_dir: Some(scratch.join("someone").display().to_string()),
+            ..info("wrong-id", "b", "h", 1)
+        });
+        let mut r = clean_stale(base.path(), "b", "h", |id| id.pid == 2);
+        r.removed.sort();
+        assert_eq!(r.removed, ["dead", "odd", "unmade", "wrong-id"]);
+        assert!(!scratch.join("dead").exists());
+        for kept in ["live", "kept", "someone"] {
+            assert!(scratch.join(kept).exists(), "{kept}");
+        }
+        assert!(other.path().join("precious").exists());
+        // The scratch base is private, and refused when it is not.
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&scratch).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(scratch_base(store.path()).is_err());
+        // A scratch directory is removed when dropped.
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let s = ScratchDir::create(&scratch, "x").unwrap();
+        let path = s.path.clone();
+        assert!(ScratchDir::create(&scratch, "x").is_err(), "a run id is never reused");
+        drop(s);
+        assert!(!path.exists());
     }
 
     #[test]

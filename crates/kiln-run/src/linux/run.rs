@@ -15,7 +15,7 @@ use crate::console::{TAIL_LINES, tail};
 use crate::error::{Error, Result};
 use crate::options::{DEFAULT_DISK, RunOptions, VmmKind};
 use crate::prepare;
-use crate::rundir::{self, Identity, RUN_INFO_VERSION, RunDir, RunInfo};
+use crate::rundir::{self, Identity, RUN_INFO_VERSION, RunDir, RunInfo, ScratchDir};
 
 /// The kernel command line (spec §8.3); vmkit appends the console and its backend's parameters.
 pub const CMDLINE: [&str; 7] = [
@@ -108,9 +108,16 @@ pub fn vmm_identity(run_dir: &Path) -> Option<Identity> {
 pub struct Run {
     session: Session,
     console: ConsoleRelay,
+    /// Dropped before `run_dir`, whose run.json records it.
+    scratch_dir: ScratchDir,
     run_dir: RunDir,
     /// `KILN_KEEP_RUN_DIR=1` at the start.
     keep: bool,
+    /// For the message when the VM ends without the guest's final message.
+    vmm: VmmKind,
+    memory_mib: u32,
+    /// The VMM runs in a cgroup with a memory limit.
+    limited: bool,
 }
 
 /// How a run ended, for the CLI.
@@ -119,8 +126,65 @@ pub struct Report {
     pub outcome: Outcome,
     /// The sanitised end of the console when the run failed (T8).
     pub console_tail: Vec<String>,
-    /// The run directory, when kept (`KILN_KEEP_RUN_DIR=1`).
-    pub kept: Option<PathBuf>,
+    /// The run directory and the scratch directory, when kept (`KILN_KEEP_RUN_DIR=1`).
+    pub kept: Option<(PathBuf, PathBuf)>,
+    /// The VMM's own logs, in the run directory.
+    pub vmm_logs: Vec<PathBuf>,
+    /// Guest memory, and whether the VMM's memory was limited to it plus 256 MiB.
+    pub memory_mib: u32,
+    pub limited: bool,
+}
+
+impl Report {
+    /// What to say when the VM ended without the guest's final message (no
+    /// `Exited` or `InitFailed`): vmkit's end reason cannot tell why (a VMM killed
+    /// for its memory use looks `Exited`), so the likely causes are named, with
+    /// where to look.
+    pub fn no_final_message(&self) -> String {
+        let names = |full: bool| {
+            self.vmm_logs
+                .iter()
+                .map(|p| {
+                    if full {
+                        p.display().to_string()
+                    } else {
+                        p.file_name().unwrap_or_default().to_string_lossy().into_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let memory = if self.limited {
+            format!(
+                "the VMM ran out of memory (it may use --memory plus 256 MiB, {} MiB here; the kernel log shows an \
+                 out-of-memory kill)",
+                u64::from(self.memory_mib) + 256
+            )
+        } else {
+            "the host ran out of memory (the kernel log shows an out-of-memory kill)".to_string()
+        };
+        let logs = if self.kept.is_some() {
+            format!("the VMM's log is in {}", names(true))
+        } else {
+            format!(
+                "KILN_KEEP_RUN_DIR=1 keeps the run directory, with the VMM's log ({}) and console.log",
+                names(false)
+            )
+        };
+        format!(
+            "the VM ended without reporting the command's exit (the VMM: {:?}). Likely causes: the VMM failed, or {memory}; \
+             {logs}",
+            self.outcome.end.reason
+        )
+    }
+}
+
+/// The VMM's own log files in a run directory (vmkit writes them there).
+pub fn vmm_logs(kind: VmmKind, run_dir: &Path) -> Vec<PathBuf> {
+    match kind {
+        VmmKind::Firecracker => vec![run_dir.join("sock/firecracker.log"), run_dir.join("firecracker.stderr")],
+        VmmKind::CloudHypervisor => vec![run_dir.join("cloud-hypervisor.log")],
+    }
 }
 
 impl Run {
@@ -146,7 +210,8 @@ impl Run {
         let vmm = backend(opts.vmm).discover()?;
         let caps = vmm.capabilities();
         config::check_devices(prepared.layers.len(), false, caps.available_devices(), vmm.name())?;
-        if !vmkit::cgroups_available() {
+        let limited = vmkit::cgroups_available();
+        if !limited {
             notice("warning: no systemd user session for a cgroup: the VM's memory and CPU use are not limited");
         }
 
@@ -161,6 +226,9 @@ impl Run {
         if keep {
             run_dir.keep();
         }
+        // On the store's filesystem, not the run directory's tmpfs (spec §5.3, rev 2.9).
+        let scratch_base = rundir::scratch_base(store.root())?;
+        let scratch_path = scratch_base.join(&run_dir.id);
         let mut info = RunInfo {
             version: RUN_INFO_VERSION,
             id: run_dir.id.clone(),
@@ -173,12 +241,18 @@ impl Run {
             custom_kernel: prepared.custom_kernel.as_ref().map(|p| p.display().to_string()),
             custom_init: prepared.custom_init.as_ref().map(|p| p.display().to_string()),
             keep,
+            scratch_dir: Some(scratch_path.display().to_string()),
         };
+        // Recorded before it exists, so a stale cleanup always knows of it.
         run_dir.write_info(&info)?;
+        let mut scratch_dir = ScratchDir::create(&scratch_base, &run_dir.id)?;
+        if keep {
+            scratch_dir.keep();
+        }
 
         let init_layer = run_dir.path.join("init.erofs");
         std::fs::write(&init_layer, &prepared.init_layer)?;
-        let scratch = run_dir.path.join("scratch.img");
+        let scratch = scratch_dir.path.join("scratch.img");
         let scratch_bytes = opts.disk.unwrap_or(DEFAULT_DISK);
         kiln_image::scratch::create_scratch(&scratch, scratch_bytes)?;
         let window = if opts.tty { super::tty::window_size() } else { None };
@@ -217,7 +291,7 @@ impl Run {
         }
         run_dir.write_info(&info)?;
         drop(lock);
-        // Dropping the VM kills it; the run directory goes with `run_dir`.
+        // Dropping the VM kills it; the run's directories go with `run_dir` and `scratch_dir`.
         check()?;
         let session = Session::start(
             vm,
@@ -234,8 +308,12 @@ impl Run {
         Ok(Run {
             session,
             console,
+            scratch_dir,
             run_dir,
             keep,
+            vmm: opts.vmm,
+            memory_mib: opts.memory_mib,
+            limited,
         })
     }
 
@@ -247,13 +325,17 @@ impl Run {
         &self.run_dir.path
     }
 
-    /// Runs to the end; the run directory is removed unless kept.
+    /// Runs to the end; the run's directories are removed unless kept.
     pub fn wait(self) -> Report {
         let Run {
             session,
             console,
+            scratch_dir,
             run_dir,
             keep,
+            vmm,
+            memory_mib,
+            limited,
         } = self;
         let outcome = session.finish();
         let log = console.log.clone();
@@ -262,12 +344,77 @@ impl Run {
             || outcome.init_failed.is_some()
             || (outcome.exited.is_none() && !outcome.killed);
         let console_tail = if failed { tail(&log, TAIL_LINES) } else { Vec::new() };
-        let kept = keep.then(|| run_dir.path.clone());
+        let kept = keep.then(|| (run_dir.path.clone(), scratch_dir.path.clone()));
+        let vmm_logs = vmm_logs(vmm, &run_dir.path);
+        // The scratch directory first: while run.json lasts, it records it.
+        drop(scratch_dir);
         drop(run_dir);
         Report {
             outcome,
             console_tail,
             kept,
+            vmm_logs,
+            memory_mib,
+            limited,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vmkit::{EndReason, VmEnd};
+
+    fn report(kept: bool, limited: bool) -> Report {
+        let dir = Path::new("/run/user/1/kiln/abc");
+        Report {
+            outcome: Outcome {
+                exit_code: 125,
+                exited: None,
+                init_failed: None,
+                stages: vec![3, 4, 5, 6, 7],
+                hello: true,
+                running: true,
+                violation: None,
+                killed: false,
+                end: VmEnd {
+                    reason: EndReason::Exited,
+                    code: Some(0),
+                    signal: None,
+                },
+                warnings: Vec::new(),
+                hello_after: None,
+                running_after: None,
+                ended_after: None,
+                drained_after: Duration::ZERO,
+            },
+            console_tail: Vec::new(),
+            kept: kept.then(|| (dir.to_path_buf(), PathBuf::from("/s/scratch/abc"))),
+            vmm_logs: vmm_logs(VmmKind::Firecracker, dir),
+            memory_mib: 512,
+            limited,
+        }
+    }
+
+    /// The VM ended without the guest's final message: the likely causes, and
+    /// where to look (the run directory goes with the run unless kept).
+    #[test]
+    fn a_vm_ending_without_a_final_message_names_the_likely_causes() {
+        assert_eq!(
+            report(false, true).no_final_message(),
+            "the VM ended without reporting the command's exit (the VMM: Exited). Likely causes: the VMM failed, \
+             or the VMM ran out of memory (it may use --memory plus 256 MiB, 768 MiB here; the kernel log shows an \
+             out-of-memory kill); KILN_KEEP_RUN_DIR=1 keeps the run directory, with the VMM's log (firecracker.log, \
+             firecracker.stderr) and console.log"
+        );
+        let kept = report(true, false).no_final_message();
+        assert!(kept.contains("the host ran out of memory"), "{kept}");
+        assert!(
+            kept.ends_with(
+                "the VMM's log is in /run/user/1/kiln/abc/sock/firecracker.log, \
+                 /run/user/1/kiln/abc/firecracker.stderr"
+            ),
+            "{kept}"
+        );
     }
 }
