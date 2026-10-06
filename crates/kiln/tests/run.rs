@@ -49,9 +49,9 @@ fn env() -> Option<Env> {
     }
 }
 
-const APPLETS: [&str; 16] = [
-    "cat", "echo", "env", "grep", "hostname", "id", "kill", "ls", "nc", "sh", "sleep", "stty", "test", "true", "tty",
-    "wc",
+const APPLETS: [&str; 17] = [
+    "cat", "dd", "echo", "env", "grep", "hostname", "id", "kill", "ls", "nc", "sh", "sleep", "stty", "test", "true",
+    "tty", "wc",
 ];
 
 /// busybox, its applets, and an extra file `marker` with `content`.
@@ -77,10 +77,13 @@ struct Fixture {
     env: Env,
 }
 
-/// A store holding `busybox`, converted by kiln.
+/// A store holding `busybox`, converted by kiln. The store (`$KILN_HOME`, where
+/// the scratch disks go) is under Cargo's target directory, on disk as a real
+/// store is: `/tmp` may be a tmpfs.
 fn fixture() -> Option<Fixture> {
     let env = env()?;
-    let (src, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let f = Fixture {
         store: home.path().to_path_buf(),
         _dirs: vec![src, home],
@@ -741,4 +744,41 @@ fn the_device_budget_is_checked_before_boot() {
         .finish();
     assert_eq!(code(&o), 125);
     assert!(text(&o.stderr).contains("--max-layers 27"), "{}", text(&o.stderr));
+}
+
+/// The scratch disk lives on the store's filesystem, in `$KILN_HOME/scratch/<id>/`
+/// (spec §5.3, rev 2.9), not in the run directory, which is usually a tmpfs whose
+/// pages count against the VMM's memory limit (`--memory` plus 256 MiB): a guest
+/// writes more than that limit to its disk and exits 0, and the scratch
+/// directory goes with the run.
+#[test]
+fn the_scratch_disk_holds_more_than_the_vmms_memory() {
+    let Some(f) = fixture() else { return };
+    let o = f
+        .run(&[
+            "--memory",
+            "256",
+            "busybox",
+            "--",
+            "sh",
+            "-c",
+            "dd if=/dev/zero of=/big bs=1M count=700 2>/dev/null && wc -c </big",
+        ])
+        .stdin(Stdio::null())
+        .finish();
+    assert_eq!(
+        (code(&o), text(&o.stdout).trim()),
+        (0, "734003200"),
+        "{}",
+        text(&o.stderr)
+    );
+    let scratch = f.store.join("scratch");
+    let left: Vec<_> = std::fs::read_dir(&scratch)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    if std::env::var_os("KILN_TEST_KEEP").is_none_or(|v| v != "1") {
+        assert!(left.is_empty(), "{left:?}");
+    }
 }
