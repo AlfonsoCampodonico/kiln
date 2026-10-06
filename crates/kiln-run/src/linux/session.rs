@@ -16,17 +16,25 @@
 //!   they arrive, never buffered whole (D-6); stdin is copied to the guest with
 //!   EOF as a half-close.
 //! - **main loop** ([`Session::pump`]): handles events, polls the VMM's end, and
-//!   enforces every deadline: the boot timeout, the bound after a requested stop,
-//!   and the bound for the VM to end after the guest's final message or after the
-//!   control connection closes (D-3). Killing the VMM never depends on control
-//!   I/O, and a VMM that is already gone is not an error (D-6).
+//!   enforces every deadline: the boot timeout, the bound after a requested stop
+//!   (until the guest's final message), the bound for the VM to end after the
+//!   guest's final message or after the control connection closes (D-3), and the
+//!   bound for a killed VMM to exit, after which kiln stops waiting for it.
+//!   Killing the VMM never depends on control I/O, and a VMM that is already gone
+//!   is not an error (D-6).
+//!
+//! After the VM ends, the control connection has a fixed bound to reach EOF; the
+//! output streams have the same bound, restarted whenever bytes move, so a slow
+//! sink of kiln's own (a pipe to a slow reader) still gets all of the output.
 
 use std::collections::BTreeSet;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -71,8 +79,13 @@ pub struct SessionOptions {
     /// After `Exited`, `InitFailed` or the control connection closing: how long the
     /// guest has to end the VM (it syncs and remounts the scratch disk first, D-3).
     pub end_timeout: Duration,
-    /// After the VM ended: how long its output streams have to reach EOF.
+    /// After the VM ended: how long the control connection has to reach EOF, and
+    /// how long the output streams may go without moving a byte before they are
+    /// abandoned.
     pub drain_timeout: Duration,
+    /// After the VMM was killed: how long to wait for it to exit before giving up
+    /// on it (the run then ends, with a warning).
+    pub kill_wait: Duration,
     /// Interpret `Ctrl-]` sequences on the terminal's input (`-t`).
     pub escape_keys: bool,
     /// Raw bytes to answer `Hello` with instead of `Config` (tests of the guest's T9).
@@ -88,6 +101,7 @@ impl Default for SessionOptions {
             stop_margin: Duration::from_secs(5),
             end_timeout: Duration::from_secs(10),
             drain_timeout: Duration::from_secs(2),
+            kill_wait: Duration::from_secs(5),
             escape_keys: false,
             reply: None,
         }
@@ -105,8 +119,8 @@ enum Event {
     Guest(GuestMessage),
     Violation(String),
     ControlClosed,
-    Connected(u32),
-    Eof(u32),
+    /// A drained stream reached EOF (it has left [`Drain::open`]): wakes the main loop.
+    Eof,
     Interrupt,
     Terminate,
     Shutdown,
@@ -118,6 +132,8 @@ enum Event {
 pub struct Handle {
     events: Sender<Event>,
     out: SyncSender<Out>,
+    /// A full queue was reported: one violation, however many sends find it full.
+    full: Arc<AtomicBool>,
 }
 
 impl Handle {
@@ -167,9 +183,11 @@ impl Handle {
         match self.out.try_send(out) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(_)) if must => {
-                let _ = self
-                    .events
-                    .send(Event::Violation("the guest is not reading its control channel".into()));
+                if !self.full.swap(true, Ordering::SeqCst) {
+                    let _ = self
+                        .events
+                        .send(Event::Violation("the guest is not reading its control channel".into()));
+                }
             }
             Err(TrySendError::Full(_)) => {}
         }
@@ -223,8 +241,34 @@ pub struct Session {
     boot_deadline: Option<Instant>,
     stop_deadline: Option<Instant>,
     end_deadline: Option<Instant>,
+    /// What started the end deadline, for its warning.
+    end_after: &'static str,
+    /// When the VMM was first killed.
+    killed_at: Option<Instant>,
     interrupts: u32,
-    open: BTreeSet<u32>,
+    drain: Arc<Drain>,
+    /// The last count of moved bytes seen, and when it last changed.
+    moved: (u64, Instant),
+}
+
+/// The connections drained after the VM ends, and the bytes the output streams
+/// have moved; shared with the threads that serve them.
+#[derive(Default)]
+struct Drain {
+    /// Ports connected and not yet at EOF: the listener adds a port before serving
+    /// it, so the main loop never sees a connection it does not wait for.
+    open: Mutex<BTreeSet<u32>>,
+    moved: AtomicU64,
+}
+
+impl Drain {
+    fn ports(&self) -> std::sync::MutexGuard<'_, BTreeSet<u32>> {
+        self.open.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn moved(&self, n: usize) {
+        self.moved.fetch_add(n as u64, Ordering::Relaxed);
+    }
 }
 
 /// The Unix socket path the VMM forwards guest port `p` to.
@@ -271,6 +315,7 @@ impl Session {
         let (out_tx, out_rx) = sync_channel(QUEUE);
         let (stream_tx, stream_rx) = channel();
         let (wake_r, wake) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(std::io::Error::from)?;
+        let drain = Arc::new(Drain::default());
         spawn("control-writer", {
             let tx = tx.clone();
             move || writer(&stream_rx, &out_rx, &tx)
@@ -284,11 +329,13 @@ impl Session {
             stdout: Some(streams.stdout),
             stderr: Some(streams.stderr),
             escape_keys: opts.escape_keys,
+            drain: drain.clone(),
         };
         let listener = spawn("vsock-listener", move || listen(listeners, &wake_r, serve))?;
         let handle = Handle {
             events: tx,
             out: out_tx,
+            full: Arc::new(AtomicBool::new(false)),
         };
         let now = Instant::now();
         let mut s = Session {
@@ -311,8 +358,11 @@ impl Session {
             boot_deadline: None,
             stop_deadline: None,
             end_deadline: None,
+            end_after: "",
+            killed_at: None,
             interrupts: 0,
-            open: BTreeSet::new(),
+            drain,
+            moved: (0, now),
         };
         s.vm.start()?;
         s.started = Instant::now();
@@ -363,7 +413,11 @@ impl Session {
     /// Like [`Session::finish`], killing the VM after `limit` (a test's overall bound).
     pub fn finish_within(mut self, limit: Option<Duration>) -> Outcome {
         let limit = limit.map(|l| Instant::now() + l);
-        while !self.done() {
+        loop {
+            self.note_moved();
+            if self.done() {
+                break;
+            }
             if limit.is_some_and(|l| Instant::now() >= l) && self.end.is_none() {
                 self.violate("timed out (the test's limit)".into());
                 if let Ok(end) = self.vm.wait_timeout(Duration::from_secs(10)) {
@@ -382,10 +436,25 @@ impl Session {
         self.outcome()
     }
 
+    /// The VM has ended and every drained connection is at EOF or past its bound:
+    /// the control connection a fixed one from the VM's end, the output streams one
+    /// from the last byte they moved.
     fn done(&self) -> bool {
-        match self.ended_at {
-            None => false,
-            Some(at) => self.open.is_empty() || at.elapsed() >= self.opts.drain_timeout,
+        let Some(at) = self.ended_at else {
+            return false;
+        };
+        let open = self.drain.ports();
+        let control = open.contains(&port::CONTROL);
+        let streams = open.iter().any(|&p| p != port::CONTROL);
+        (!control || at.elapsed() >= self.opts.drain_timeout)
+            && (!streams || self.moved.1.elapsed() >= self.opts.drain_timeout)
+    }
+
+    /// Restarts the output streams' drain bound when they have moved bytes.
+    fn note_moved(&mut self) {
+        let moved = self.drain.moved.load(Ordering::Relaxed);
+        if moved != self.moved.0 {
+            self.moved = (moved, Instant::now());
         }
     }
 
@@ -411,8 +480,18 @@ impl Session {
             if self.end_deadline.is_some_and(|d| now >= d) {
                 self.end_deadline = None;
                 self.warnings.push(format!(
-                    "the VM did not end within {}s of the guest's final message; it was killed",
-                    self.opts.end_timeout.as_secs()
+                    "{}the VM did not end within {:.1}s{}; it was killed",
+                    if self.end_after == CONTROL_CLOSED {
+                        "the control connection closed, and "
+                    } else {
+                        ""
+                    },
+                    self.opts.end_timeout.as_secs_f64(),
+                    if self.end_after == CONTROL_CLOSED {
+                        String::new()
+                    } else {
+                        format!(" of {}", self.end_after)
+                    }
                 ));
                 self.kill_vm();
             }
@@ -423,14 +502,20 @@ impl Session {
                     self.set_end(Some(lost()));
                 }
             }
+            if self.end.is_none() && self.killed_at.is_some_and(|k| now >= k + self.opts.kill_wait) {
+                self.warnings.push(format!(
+                    "the VMM did not exit within {:.1}s of being killed; kiln stopped waiting for it",
+                    self.opts.kill_wait.as_secs_f64()
+                ));
+                self.set_end(Some(lost()));
+            }
         }
+        self.note_moved();
         if self.done() {
             return;
         }
-        let mut wait = match self.ended_at {
-            None => VM_POLL,
-            Some(at) => (at + self.opts.drain_timeout).saturating_duration_since(now),
-        };
+        // After the VM's end too: the drain bounds move with the output.
+        let mut wait = VM_POLL;
         if let Some(u) = until {
             wait = wait.min(u.saturating_duration_since(now));
         }
@@ -442,8 +527,10 @@ impl Session {
 
     fn set_end(&mut self, end: Option<VmEnd>) {
         if self.end.is_none() && end.is_some() {
+            let now = Instant::now();
             self.end = end;
-            self.ended_at = Some(Instant::now());
+            self.ended_at = Some(now);
+            self.moved = (self.drain.moved.load(Ordering::Relaxed), now);
         }
     }
 
@@ -467,20 +554,18 @@ impl Session {
                         self.running_at = Some(now);
                         self.boot_deadline = None;
                     }
-                    GuestMessage::Exited(_) | GuestMessage::InitFailed(_) => self.expect_end(now),
+                    GuestMessage::Exited(_) | GuestMessage::InitFailed(_) => {
+                        // The guest has stopped: what remains is the end bound, not
+                        // the stop request's.
+                        self.stop_deadline = None;
+                        self.expect_end(now, FINAL_MESSAGE);
+                    }
                 }
             }
             Event::Violation(why) => self.violate(why),
-            Event::ControlClosed => self.expect_end(now),
-            // The control connection and the output streams are drained to EOF after
-            // the VM ends, bounded by the drain timeout; stdin need not be.
-            Event::Connected(p) if [port::CONTROL, port::STDOUT, port::STDERR, port::TTY].contains(&p) => {
-                self.open.insert(p);
-            }
-            Event::Connected(_) => {}
-            Event::Eof(p) => {
-                self.open.remove(&p);
-            }
+            Event::ControlClosed => self.expect_end(now, CONTROL_CLOSED),
+            // The drain state is shared; this only wakes the loop.
+            Event::Eof => {}
             Event::Interrupt => {
                 self.interrupts += 1;
                 if self.interrupts >= 2 {
@@ -495,15 +580,17 @@ impl Session {
     }
 
     /// The guest is done talking: it must end the VM soon (D-3).
-    fn expect_end(&mut self, now: Instant) {
+    fn expect_end(&mut self, now: Instant, after: &'static str) {
         self.boot_deadline = None;
         if self.end_deadline.is_none() {
             self.end_deadline = Some(now + self.opts.end_timeout);
+            self.end_after = after;
         }
     }
 
     fn request_stop(&mut self) {
-        if self.end.is_some() {
+        // After the guest's final message it is already ending the VM.
+        if self.end.is_some() || self.proto.terminal() {
             return;
         }
         if !self.proto.hello() {
@@ -540,6 +627,7 @@ impl Session {
         if let Err(e) = self.vm.kill() {
             self.warnings.push(format!("killing the VMM: {e}"));
         }
+        self.killed_at.get_or_insert_with(Instant::now);
     }
 
     fn outcome(&mut self) -> Outcome {
@@ -579,6 +667,10 @@ impl Drop for Session {
     }
 }
 
+/// What started the end deadline.
+const FINAL_MESSAGE: &str = "the guest's final message";
+const CONTROL_CLOSED: &str = "the control connection closing";
+
 /// The end reported when vmkit could not tell.
 fn lost() -> VmEnd {
     VmEnd {
@@ -602,6 +694,7 @@ struct Serve {
     stdout: Option<Box<dyn Write + Send>>,
     stderr: Option<Box<dyn Write + Send>>,
     escape_keys: bool,
+    drain: Arc<Drain>,
 }
 
 /// Accepts on every port until woken; a second connection on a port is a violation.
@@ -623,11 +716,12 @@ fn listen(listeners: Vec<(u32, UnixListener)>, wake: &OwnedFd, mut serve: Serve)
         }
         let ready: Vec<bool> = fds.iter().map(|f| !f.revents().is_empty()).collect();
         drop(fds);
-        if ready[listeners.len()] {
+        // The wake pipe is last.
+        if ready.last().copied().unwrap_or(true) {
             return;
         }
         for (i, (p, l)) in listeners.iter().enumerate() {
-            if !ready[i] {
+            if !ready.get(i).copied().unwrap_or(false) {
                 continue;
             }
             let stream = match l.accept() {
@@ -649,7 +743,11 @@ fn listen(listeners: Vec<(u32, UnixListener)>, wake: &OwnedFd, mut serve: Serve)
             if stream.set_nonblocking(false).is_err() {
                 continue;
             }
-            let _ = serve.events.send(Event::Connected(*p));
+            // The control connection and the output streams are drained to EOF after
+            // the VM ends; stdin need not be. Recorded before they are served.
+            if [port::CONTROL, port::STDOUT, port::STDERR, port::TTY].contains(p) {
+                serve.drain.ports().insert(*p);
+            }
             if let Err(e) = serve.dispatch(*p, stream) {
                 let _ = serve.events.send(Event::Violation(format!("vsock port {p}: {e}")));
             }
@@ -660,11 +758,12 @@ fn listen(listeners: Vec<(u32, UnixListener)>, wake: &OwnedFd, mut serve: Serve)
 impl Serve {
     fn dispatch(&mut self, p: u32, stream: UnixStream) -> Result<()> {
         let events = self.events.clone();
+        let drain = self.drain.clone();
         match p {
             port::CONTROL => {
                 let (config, reply, writer) = (self.config.clone(), self.reply.take(), self.writer.clone());
                 spawn("control-reader", move || {
-                    control(stream, &config, reply, &events, &writer)
+                    control(stream, &config, reply, &events, &writer, &drain)
                 })?;
             }
             port::STDIN => {
@@ -682,11 +781,18 @@ impl Serve {
                     && let Some(input) = self.stdin.take()
                 {
                     let (to, escape) = (stream.try_clone()?, self.escape_keys);
+                    // So a guest not reading its terminal cannot hold up the escape keys.
+                    rustix::net::sockopt::set_socket_timeout(
+                        &to,
+                        rustix::net::sockopt::Timeout::Send,
+                        Some(SEND_TIMEOUT),
+                    )
+                    .map_err(std::io::Error::from)?;
                     let events = events.clone();
                     spawn("tty-in", move || tty_in(input, to, escape, &events))?;
                 }
                 if let Some(sink) = sink {
-                    spawn("output", move || copy_out(stream, sink, p, &events))?;
+                    spawn("output", move || copy_out(stream, sink, p, &drain, &events))?;
                 }
             }
             _ => {}
@@ -703,9 +809,11 @@ fn control(
     reply: Option<Vec<u8>>,
     events: &Sender<Event>,
     writer: &Sender<UnixStream>,
+    drain: &Drain,
 ) {
     read_control(stream, config, reply, events, writer);
-    let _ = events.send(Event::Eof(port::CONTROL));
+    drain.ports().remove(&port::CONTROL);
+    let _ = events.send(Event::Eof);
 }
 
 fn read_control(
@@ -718,7 +826,12 @@ fn read_control(
     let violation = |why: String| {
         let _ = events.send(Event::Violation(why));
     };
-    let _ = rustix::net::sockopt::set_socket_timeout(&stream, rustix::net::sockopt::Timeout::Send, Some(SEND_TIMEOUT));
+    if let Err(e) =
+        rustix::net::sockopt::set_socket_timeout(&stream, rustix::net::sockopt::Timeout::Send, Some(SEND_TIMEOUT))
+    {
+        // Without it a guest that stops reading could block the writer: refuse the session.
+        return violation(format!("control socket: setting its send timeout: {e}"));
+    }
     let (mut reader, mut w) = match stream.try_clone() {
         Ok(r) => (r, stream),
         Err(e) => return violation(format!("control socket: {e}")),
@@ -788,22 +901,42 @@ fn writer(stream: &Receiver<UnixStream>, out: &Receiver<Out>, events: &Sender<Ev
 
 /// Streams guest output to `sink`. A sink that fails (a closed pipe) is dropped,
 /// but the guest's output is still read to EOF, so the guest never blocks on it.
-fn copy_out(mut from: UnixStream, mut sink: Box<dyn Write + Send>, p: u32, events: &Sender<Event>) {
+/// Every byte read or written counts as movement for the drain bound.
+fn copy_out(mut from: UnixStream, mut sink: Box<dyn Write + Send>, p: u32, drain: &Drain, events: &Sender<Event>) {
     let mut buf = vec![0u8; 64 * 1024];
     let mut ok = true;
     loop {
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if ok && sink.write_all(&buf[..n]).and_then(|()| sink.flush()).is_err() {
-                    ok = false;
+                drain.moved(n);
+                if ok {
+                    ok = write_moving(sink.as_mut(), buf.get(..n).unwrap_or_default(), drain);
                 }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
-    let _ = events.send(Event::Eof(p));
+    drain.ports().remove(&p);
+    let _ = events.send(Event::Eof);
+}
+
+/// `write_all` and `flush`, counting each write's bytes as they go; false when
+/// the sink fails.
+fn write_moving(sink: &mut dyn Write, mut bytes: &[u8], drain: &Drain) -> bool {
+    while !bytes.is_empty() {
+        match sink.write(bytes) {
+            Ok(0) => return false,
+            Ok(n) => {
+                drain.moved(n);
+                bytes = bytes.get(n..).unwrap_or_default();
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    sink.flush().is_ok()
 }
 
 /// Copies stdin to the guest; EOF is a half-close.
@@ -824,10 +957,15 @@ fn copy_in(mut from: Box<dyn Read + Send>, mut to: UnixStream) {
     let _ = to.shutdown(std::net::Shutdown::Write);
 }
 
-/// Copies the terminal's input to the guest, acting on escape sequences.
+/// Copies the terminal's input to the guest, acting on escape sequences. The
+/// keys in each read act before its bytes are written, and a guest that stops
+/// reading its terminal loses input rather than holding up the keys: a write that
+/// makes no progress within the socket's send timeout drops the rest of its bytes,
+/// and later input is offered without waiting until the guest reads again.
 fn tty_in(mut from: Box<dyn Read + Send>, mut to: UnixStream, escape: bool, events: &Sender<Event>) {
     let mut keys = Escape::default();
     let mut buf = vec![0u8; 4096];
+    let mut stalled = false;
     loop {
         let n = match from.read(&mut buf) {
             Ok(0) => return,
@@ -835,18 +973,15 @@ fn tty_in(mut from: Box<dyn Read + Send>, mut to: UnixStream, escape: bool, even
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => return,
         };
+        let read = buf.get(..n).unwrap_or_default();
         let parts = if escape {
-            keys.feed(&buf[..n])
+            keys.feed(read)
         } else {
-            vec![Key::Data(buf[..n].to_vec())]
+            vec![Key::Data(read.to_vec())]
         };
-        for k in parts {
+        for k in &parts {
             match k {
-                Key::Data(d) => {
-                    if to.write_all(&d).is_err() {
-                        return;
-                    }
-                }
+                Key::Data(_) => {}
                 Key::Shutdown => {
                     let _ = events.send(Event::Shutdown);
                 }
@@ -855,5 +990,38 @@ fn tty_in(mut from: Box<dyn Read + Send>, mut to: UnixStream, escape: bool, even
                 }
             }
         }
+        for k in parts {
+            if let Key::Data(d) = k
+                && !write_tty(&mut to, &d, &mut stalled)
+            {
+                return;
+            }
+        }
     }
+}
+
+/// Writes `bytes` to the guest's terminal; false when the connection is gone.
+/// See [`tty_in`] for `stalled`.
+fn write_tty(to: &mut UnixStream, mut bytes: &[u8], stalled: &mut bool) -> bool {
+    while !bytes.is_empty() {
+        let r = if *stalled {
+            rustix::net::send(&*to, bytes, rustix::net::SendFlags::DONTWAIT).map_err(std::io::Error::from)
+        } else {
+            to.write(bytes)
+        };
+        match r {
+            Ok(0) => return false,
+            Ok(n) => {
+                *stalled = false;
+                bytes = bytes.get(n..).unwrap_or_default();
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                *stalled = true;
+                return true;
+            }
+            Err(_) => return false,
+        }
+    }
+    true
 }
