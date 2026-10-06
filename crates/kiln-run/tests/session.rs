@@ -968,3 +968,116 @@ fn an_escape_key_right_after_config_is_a_stop_request() {
         );
     }
 }
+
+/// After a real end the output is drained to EOF however long kiln's own sink
+/// stops taking it (`kiln run … | less`, a user reading the first page): only
+/// reading is bounded, never the sink's writes.
+#[test]
+fn a_paused_sink_gets_all_of_the_output() {
+    /// Blocks on its first write, longer than the drain bound.
+    #[derive(Clone, Default)]
+    struct Paused(Shared, Arc<AtomicBool>);
+    impl Write for Paused {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if !self.1.swap(true, Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            self.0.write(b)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let data: Vec<u8> = (0..100u32 << 10).map(|i| (i % 253) as u8).collect();
+    let want = data.clone();
+    let sink = Paused::default();
+    let vm = fake(move |sock, _| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        let (mut out, err) = (connect(&sock, port::STDOUT), connect(&sock, port::STDERR));
+        boot(&mut c);
+        out.write_all(&data).unwrap();
+        drop((out, err));
+        exited(&mut c, 0);
+    });
+    let (mut st, _) = streams(None);
+    st.stdout = Box::new(sink.clone());
+    let mut o = opts();
+    o.drain_timeout = Duration::from_secs(1);
+    let out = Session::start(vm, config(), st, o).unwrap().finish_within(LIMIT);
+    assert_eq!((out.exit_code, out.violation.as_deref()), (0, None), "{out:?}");
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    let got = sink.0.bytes();
+    assert!(got == want, "{} of {} bytes arrived", got.len(), want.len());
+}
+
+/// When kiln gives up on a VMM (its kill did not take), the VMM may still write:
+/// the output gets a fixed bound from then, however many bytes move, and a stream
+/// cut off with bytes pending is warned about.
+#[test]
+fn output_after_giving_up_on_the_vmm_has_a_fixed_bound() {
+    let vm = fake_vm(
+        |sock, _| {
+            let mut c = connect(&sock, port::CONTROL);
+            handshake(&mut c);
+            let (mut out, err) = (connect(&sock, port::STDOUT), connect(&sock, port::STDERR));
+            boot(&mut c);
+            let until = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < until && out.write_all(&[b'x'; 4096]).is_ok() {}
+            drop((out, err, c));
+        },
+        true,
+    );
+    /// Takes its time, so bytes are always pending.
+    struct Slow;
+    impl Write for Slow {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(b.len().min(512))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (mut st, _) = streams(None);
+    st.stdout = Box::new(Slow);
+    let mut o = opts();
+    (o.kill_wait, o.drain_timeout) = (Duration::from_millis(300), Duration::from_millis(500));
+    let mut s = Session::start(vm, config(), st, o).unwrap();
+    assert!(s.wait_running());
+    s.handle().kill();
+    let started = Instant::now();
+    let out = s.finish_within(LIMIT);
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_eq!((out.exit_code, out.killed), (EXIT_KILLED, true), "{out:?}");
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.starts_with("the guest's stdout was cut off")),
+        "{:?}",
+        out.warnings
+    );
+}
+
+/// Output connected just as the VM ends is still drained: the listener accepts
+/// its backlog once after the end, before the drain can count as done.
+#[test]
+fn output_connected_as_the_vm_ends_is_kept() {
+    for _ in 0..30 {
+        let vm = fake(|sock, _| {
+            let mut c = connect(&sock, port::CONTROL);
+            handshake(&mut c);
+            boot(&mut c);
+            exited(&mut c, 0);
+            let (mut out, err) = (connect(&sock, port::STDOUT), connect(&sock, port::STDERR));
+            out.write_all(b"last words\n").unwrap();
+            drop((out, err));
+        });
+        let (st, io) = streams(None);
+        let out = Session::start(vm, config(), st, opts()).unwrap().finish_within(LIMIT);
+        assert_eq!((out.exit_code, out.violation.as_deref()), (0, None), "{out:?}");
+        assert_eq!(io.out.bytes(), b"last words\n");
+    }
+}
