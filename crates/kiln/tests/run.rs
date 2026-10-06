@@ -294,6 +294,28 @@ fn sigterm_asks_the_guest_and_a_second_sigint_kills() {
     assert!(killed.elapsed() < Duration::from_secs(10), "{:?}", killed.elapsed());
 }
 
+/// Ctrl-C at a terminal signals the whole foreground process group. The VMM leads
+/// a process group of its own (vmkit), so only kiln gets SIGINT and asks the guest
+/// to stop: the app's own exit, not 125 from a VMM killed under it.
+#[test]
+fn sigint_to_kilns_process_group_stops_the_guest_gracefully() {
+    let Some(f) = fixture() else { return };
+    use std::os::unix::process::CommandExt;
+    let script = "trap 'echo TERM; exit 7' TERM; echo up; while :; do sleep 0.1; done";
+    let mut child = f
+        .run(&["busybox", "--", "sh", "-c", script])
+        .stdout(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let out = Captured::spawn(child.stdout.take().unwrap());
+    out.wait_for("up\n", BOOT);
+    let group = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+    rustix::process::kill_process_group(group, rustix::process::Signal::INT).unwrap();
+    assert_eq!(wait(&mut child, Duration::from_secs(30)), 7);
+    out.wait_for("TERM\n", Duration::from_secs(5));
+}
+
 /// `-t -i` under a pseudo-terminal: raw mode, the guest's window size and its
 /// changes, Ctrl-] q, and the terminal restored afterwards.
 #[test]
