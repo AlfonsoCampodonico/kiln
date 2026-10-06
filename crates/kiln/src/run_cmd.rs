@@ -122,6 +122,9 @@ pub fn run(open_store: impl FnOnce() -> Result<kiln_store::Store>, args: &RunArg
     };
     let booting = t0.elapsed();
     signals.attach(run.handle());
+    for name in signals.dropped() {
+        eprintln!("kiln: note: {name} arrived before the guest started and was not forwarded to it");
+    }
     // A failure from here drops the run, and the session kills its VM.
     let raw = if raw_tty { Some(tty::RawMode::enter()?) } else { None };
     let report = run.wait();
