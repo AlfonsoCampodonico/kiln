@@ -14,7 +14,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use kiln_erofs::testtar::{Opts, TarBuilder};
@@ -75,19 +75,50 @@ struct Fixture {
     _dirs: Vec<tempfile::TempDir>,
     store: PathBuf,
     env: Env,
+    _turn: Turn,
 }
 
-/// A store holding `busybox`, converted by kiln. The store (`$KILN_HOME`, where
-/// the scratch disks go) is under Cargo's target directory, on disk as a real
-/// store is: `/tmp` may be a tmpfs.
+/// The disk-heavy case runs alone: under nested virtualization its guest's
+/// hundreds of MB of writes slow the other cases' guests past their boot timeouts.
+static ALONE: RwLock<()> = RwLock::new(());
+
+enum Turn {
+    Shared(#[allow(dead_code)] RwLockReadGuard<'static, ()>),
+    Alone(#[allow(dead_code)] RwLockWriteGuard<'static, ()>),
+}
+
+impl Turn {
+    fn shared() -> Self {
+        Turn::Shared(ALONE.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn alone() -> Self {
+        Turn::Alone(ALONE.write().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// A store holding `busybox`, converted by kiln, in a temporary directory.
 fn fixture() -> Option<Fixture> {
+    fixture_in(tempfile::tempdir().unwrap(), Turn::shared)
+}
+
+/// Like [`fixture`], with the store (`$KILN_HOME`, where the scratch disks go)
+/// under Cargo's target directory: on disk, as a real store is, where `/tmp` may
+/// be a tmpfs. Only the case that needs it: a disk the other cases' VMs share
+/// would slow their boots while it writes. It runs alone.
+fn fixture_on_disk() -> Option<Fixture> {
+    fixture_in(tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap(), Turn::alone)
+}
+
+fn fixture_in(home: tempfile::TempDir, turn: fn() -> Turn) -> Option<Fixture> {
     let env = env()?;
+    let _turn = turn();
     let src = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let f = Fixture {
         store: home.path().to_path_buf(),
         _dirs: vec![src, home],
         env,
+        _turn,
     };
     let path = f._dirs[0].path().join("busybox");
     let mut b = LayoutBuilder::new(&path);
@@ -340,7 +371,7 @@ fn exit_codes_as_docker_reports_them() {
     };
     assert_eq!(code(&o), 0, "{}", text(&o.stderr));
     let o = f.output(&["busybox", "--", "/nonexistent"]);
-    assert_eq!(code(&o), 127);
+    assert_eq!(code(&o), 127, "{}", text(&o.stderr));
     assert!(
         text(&o.stderr).contains("guest init failed at process: exec /nonexistent"),
         "{}",
@@ -353,7 +384,12 @@ fn exit_codes_as_docker_reports_them() {
     );
     // The environment from --env.
     let o = f.output(&["--env", "A=b c", "busybox", "--", "sh", "-c", "echo $A; cat /marker"]);
-    assert_eq!(text(&o.stdout), "b c\none");
+    assert_eq!(
+        (code(&o), text(&o.stdout)),
+        (0, "b c\none".into()),
+        "{}",
+        text(&o.stderr)
+    );
     // Without a command, the image's cmd (/bin/sh) runs: here it reads stdin.
     let mut child = f
         .run(&["-i", "busybox"])
@@ -749,26 +785,30 @@ fn the_device_budget_is_checked_before_boot() {
 /// The scratch disk lives on the store's filesystem, in `$KILN_HOME/scratch/<id>/`
 /// (spec §5.3, rev 2.9), not in the run directory, which is usually a tmpfs whose
 /// pages count against the VMM's memory limit (`--memory` plus 256 MiB): a guest
-/// writes more than that limit to its disk and exits 0, and the scratch
-/// directory goes with the run.
+/// writes more than that limit to its disk (512 MiB, with a 384 MiB limit) and
+/// exits 0, and the scratch directory goes with the run. Disk writes are slow
+/// under nested virtualization (about 4 MB/s in Lima), hence the longer bound.
 #[test]
 fn the_scratch_disk_holds_more_than_the_vmms_memory() {
-    let Some(f) = fixture() else { return };
+    let Some(f) = fixture_on_disk() else { return };
     let o = f
         .run(&[
             "--memory",
-            "256",
+            "128",
             "busybox",
             "--",
             "sh",
             "-c",
-            "dd if=/dev/zero of=/big bs=1M count=700 2>/dev/null && wc -c </big",
+            "dd if=/dev/zero of=/big bs=1M count=512 2>/dev/null && wc -c </big",
         ])
         .stdin(Stdio::null())
-        .finish();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .output(Duration::from_secs(400));
     assert_eq!(
         (code(&o), text(&o.stdout).trim()),
-        (0, "734003200"),
+        (0, "536870912"),
         "{}",
         text(&o.stderr)
     );
