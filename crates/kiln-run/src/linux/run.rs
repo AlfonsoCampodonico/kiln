@@ -124,12 +124,22 @@ pub struct Report {
 }
 
 impl Run {
-    /// Resolves, checks and boots. `notice` gets one-line warnings and notes, before boot.
-    pub fn start(store: &Store, opts: &RunOptions, streams: Streams, notice: &mut dyn FnMut(&str)) -> Result<Self> {
+    /// Resolves, checks and boots. `notice` gets one-line warnings and notes, before
+    /// boot. When `interrupted` turns true during setup (the user's SIGINT or
+    /// SIGTERM), setup stops with [`Error::Interrupted`], removing what it made.
+    pub fn start(
+        store: &Store,
+        opts: &RunOptions,
+        streams: Streams,
+        notice: &mut dyn FnMut(&str),
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Self> {
+        let check = || if interrupted() { Err(Error::Interrupted) } else { Ok(()) };
         opts.check()?;
         // Held until the VMM has every blob open (spec §5.2).
         let lock = store.lock_shared()?;
         let prepared = prepare::prepare(store, opts, prepare::host_arch())?;
+        check()?;
         for w in &prepared.warnings {
             notice(&format!("warning: {w}"));
         }
@@ -184,6 +194,7 @@ impl Run {
                 host_env: config::host_env(std::env::vars_os()),
             },
         )?;
+        check()?;
         let console = ConsoleRelay::start(&run_dir.path)?;
         let spec = vm_spec(
             &prepared.kernel,
@@ -206,6 +217,8 @@ impl Run {
         }
         run_dir.write_info(&info)?;
         drop(lock);
+        // Dropping the VM kills it; the run directory goes with `run_dir`.
+        check()?;
         let session = Session::start(
             vm,
             config,

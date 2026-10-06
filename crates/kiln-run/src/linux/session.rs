@@ -659,6 +659,12 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Not run to its end (a failure after the start, in kiln or a test): the VM
+        // must not outlive the session.
+        if self.end.is_none() {
+            let _ = self.vm.kill();
+            let _ = self.vm.wait_timeout(self.opts.kill_wait);
+        }
         let _ = rustix::io::write(&self.wake, b"x");
         let _ = self.handle.out.try_send(Out::Stop);
         if let Some(l) = self.listener.take() {

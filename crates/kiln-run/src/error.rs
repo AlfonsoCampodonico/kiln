@@ -19,6 +19,9 @@ pub enum Error {
     Refused(String),
     #[error("invalid {what}: {reason}")]
     Invalid { what: &'static str, reason: String },
+    /// SIGINT or SIGTERM arrived during setup: the run was abandoned (exit 137).
+    #[error("interrupted before the guest started")]
+    Interrupted,
 }
 
 impl Error {
