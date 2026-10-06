@@ -7,7 +7,7 @@ use std::sync::mpsc::Sender;
 use kiln_proto::{Config, GuestMessage, HOST_CID, Hello, HostMessage, PROTOCOL_VERSION, port, read_message};
 
 use super::sys::Vsock;
-use super::{CONTROL, EXIT, Event, send};
+use super::{CONTROL, EXIT, Event, HOST_FAILED, send};
 use crate::error::{Context, Failure, Result};
 
 /// Returns the validated `Config`; host messages after it go to `events`.
@@ -37,8 +37,14 @@ pub fn connect(events: Sender<Event>) -> Result<Config> {
             loop {
                 let event = match read_message::<_, HostMessage>(&mut reader) {
                     Ok(Some(msg)) => Event::Host(msg),
-                    Ok(None) => Event::HostClosed,
-                    Err(e) => Event::HostError(e),
+                    Ok(None) => {
+                        let _ = HOST_FAILED.set("the host closed the control connection".into());
+                        Event::HostClosed
+                    }
+                    Err(e) => {
+                        let _ = HOST_FAILED.set(format!("protocol violation: {e}"));
+                        Event::HostError(e)
+                    }
                 };
                 let last = !matches!(event, Event::Host(_));
                 if events.send(event).is_err() || last {
