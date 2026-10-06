@@ -23,11 +23,17 @@
 //!   Killing the VMM never depends on control I/O, and a VMM that is already gone
 //!   is not an error (D-6).
 //!
-//! After the VM ends, the control connection has a fixed bound to reach EOF; the
-//! output streams have the same bound, restarted whenever bytes move, so a slow
-//! sink of kiln's own (a pipe to a slow reader) still gets all of the output.
+//! After the VM ends, the listener accepts what is still in its backlog once, and
+//! the control connection has a fixed bound to reach EOF. When the VMM really
+//! exited, what remains of the output is finite: the output streams are drained
+//! to EOF however long kiln's own sinks take to take it (a pager whose user is
+//! reading, a stopped terminal), as a pipeline would; only reading is bounded, so a
+//! stream that brings nothing for the same bound while none of them is writing is
+//! abandoned. When kiln gave up on a VMM it could not see end (the kill did not
+//! take, or waiting failed), the VMM may still be writing, so the output streams
+//! get the fixed bound too. A stream abandoned with bytes pending is warned about.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -80,8 +86,9 @@ pub struct SessionOptions {
     /// guest has to end the VM (it syncs and remounts the scratch disk first, D-3).
     pub end_timeout: Duration,
     /// After the VM ended: how long the control connection has to reach EOF, and
-    /// how long the output streams may go without moving a byte before they are
-    /// abandoned.
+    /// how long the output streams may go without reading a byte (while none is
+    /// writing to its sink) before they are abandoned; after kiln gave up on the
+    /// VMM, how long the output streams have in all.
     pub drain_timeout: Duration,
     /// After the VMM was killed: how long to wait for it to exit before giving up
     /// on it (the run then ends, with a warning).
@@ -235,6 +242,8 @@ pub struct Session {
     warnings: Vec<String>,
     end: Option<VmEnd>,
     ended_at: Option<Instant>,
+    /// kiln gave up on the VMM ([`lost`]): it may still be running.
+    gave_up: bool,
     started: Instant,
     hello_at: Option<Instant>,
     running_at: Option<Instant>,
@@ -257,17 +266,52 @@ pub struct Session {
 struct Drain {
     /// Ports connected and not yet at EOF: the listener adds a port before serving
     /// it, so the main loop never sees a connection it does not wait for.
-    open: Mutex<BTreeSet<u32>>,
+    open: Mutex<BTreeMap<u32, Open>>,
+    /// Bytes the output streams have read and written.
     moved: AtomicU64,
+    /// The listener has accepted what was in its backlog after the VM's end (or
+    /// has stopped).
+    swept: AtomicBool,
+}
+
+/// A connection being drained.
+#[derive(Default)]
+struct Open {
+    /// An output stream in a write to its sink.
+    writing: bool,
+    /// An output stream's socket, to tell whether bytes are pending when it is abandoned.
+    socket: Option<UnixStream>,
 }
 
 impl Drain {
-    fn ports(&self) -> std::sync::MutexGuard<'_, BTreeSet<u32>> {
+    fn ports(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, Open>> {
         self.open.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn moved(&self, n: usize) {
         self.moved.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    fn writing(&self, p: u32, writing: bool) {
+        if let Some(o) = self.ports().get_mut(&p) {
+            o.writing = writing;
+        }
+    }
+
+    /// The output streams still open with bytes they have not delivered: in a
+    /// write to their sink, or unread on their socket.
+    fn pending(&self) -> Vec<u32> {
+        self.ports()
+            .iter()
+            .filter(|&(&p, o)| {
+                p != port::CONTROL
+                    && (o.writing
+                        || o.socket
+                            .as_ref()
+                            .is_some_and(|s| rustix::io::ioctl_fionread(s).is_ok_and(|n| n > 0)))
+            })
+            .map(|(&p, _)| p)
+            .collect()
     }
 }
 
@@ -352,6 +396,7 @@ impl Session {
             warnings: Vec::new(),
             end: None,
             ended_at: None,
+            gave_up: false,
             started: now,
             hello_at: None,
             running_at: None,
@@ -424,7 +469,7 @@ impl Session {
                     self.set_end(end);
                 }
                 if self.end.is_none() {
-                    self.set_end(Some(lost()));
+                    self.give_up();
                 }
             }
             self.step(limit);
@@ -433,21 +478,56 @@ impl Session {
         while let Ok(e) = self.events.try_recv() {
             self.handle_event(e);
         }
+        for p in self.drain.pending() {
+            self.warnings.push(format!(
+                "the guest's {} was cut off: {}",
+                stream_name(p),
+                if self.gave_up {
+                    format!(
+                        "kiln stopped waiting for it {:.1}s after it gave up on the VMM",
+                        self.opts.drain_timeout.as_secs_f64()
+                    )
+                } else {
+                    format!(
+                        "it brought nothing for {:.1}s after the VM ended",
+                        self.opts.drain_timeout.as_secs_f64()
+                    )
+                }
+            ));
+        }
         self.outcome()
     }
 
-    /// The VM has ended and every drained connection is at EOF or past its bound:
-    /// the control connection a fixed one from the VM's end, the output streams one
-    /// from the last byte they moved.
+    /// The VM has ended, the listener has accepted what was left in its backlog,
+    /// and every drained connection is at EOF or past its bound: the control
+    /// connection a fixed one from the VM's end; the output streams, after a real
+    /// end, one from the last byte they moved that runs only while none of them is
+    /// writing to its sink, and after kiln gave up on the VMM, the fixed one.
     fn done(&self) -> bool {
         let Some(at) = self.ended_at else {
             return false;
         };
-        let open = self.drain.ports();
-        let control = open.contains(&port::CONTROL);
-        let streams = open.iter().any(|&p| p != port::CONTROL);
-        (!control || at.elapsed() >= self.opts.drain_timeout)
-            && (!streams || self.moved.1.elapsed() >= self.opts.drain_timeout)
+        let bound = self.opts.drain_timeout;
+        // Bounded too, should the listener be stuck.
+        if !self.drain.swept.load(Ordering::SeqCst) && at.elapsed() < bound {
+            return false;
+        }
+        let (control, streams, writing) = {
+            let open = self.drain.ports();
+            (
+                open.contains_key(&port::CONTROL),
+                open.keys().any(|&p| p != port::CONTROL),
+                open.values().any(|o| o.writing),
+            )
+        };
+        // Read after the writing flags: a write that just ended has counted its bytes.
+        let unmoved = self.drain.moved.load(Ordering::Relaxed) == self.moved.0 && self.moved.1.elapsed() >= bound;
+        let streams_done = if self.gave_up {
+            at.elapsed() >= bound
+        } else {
+            !writing && unmoved
+        };
+        (!control || at.elapsed() >= bound) && (!streams || streams_done)
     }
 
     /// Restarts the output streams' drain bound when they have moved bytes.
@@ -499,7 +579,7 @@ impl Session {
                 Ok(end) => self.set_end(end),
                 Err(e) => {
                     self.warnings.push(format!("waiting for the VMM: {e}"));
-                    self.set_end(Some(lost()));
+                    self.give_up();
                 }
             }
             if self.end.is_none() && self.killed_at.is_some_and(|k| now >= k + self.opts.kill_wait) {
@@ -507,7 +587,7 @@ impl Session {
                     "the VMM did not exit within {:.1}s of being killed; kiln stopped waiting for it",
                     self.opts.kill_wait.as_secs_f64()
                 ));
-                self.set_end(Some(lost()));
+                self.give_up();
             }
         }
         self.note_moved();
@@ -531,6 +611,16 @@ impl Session {
             self.end = end;
             self.ended_at = Some(now);
             self.moved = (self.drain.moved.load(Ordering::Relaxed), now);
+            // Nothing new can connect now: the listener accepts what is in its backlog.
+            let _ = rustix::io::write(&self.wake, &[SWEEP]);
+        }
+    }
+
+    /// kiln stops waiting for a VMM it cannot see end (it may still run).
+    fn give_up(&mut self) {
+        if self.end.is_none() {
+            self.gave_up = true;
+            self.set_end(Some(lost()));
         }
     }
 
@@ -665,11 +755,24 @@ impl Drop for Session {
             let _ = self.vm.kill();
             let _ = self.vm.wait_timeout(self.opts.kill_wait);
         }
-        let _ = rustix::io::write(&self.wake, b"x");
+        let _ = rustix::io::write(&self.wake, &[STOP]);
         let _ = self.handle.out.try_send(Out::Stop);
         if let Some(l) = self.listener.take() {
             let _ = l.join();
         }
+    }
+}
+
+/// What the wake pipe tells the listener: accept the backlog once, or stop.
+const SWEEP: u8 = b's';
+const STOP: u8 = b'x';
+
+fn stream_name(p: u32) -> &'static str {
+    match p {
+        port::STDOUT => "stdout",
+        port::STDERR => "stderr",
+        port::TTY => "terminal output",
+        _ => "output",
     }
 }
 
@@ -703,8 +806,18 @@ struct Serve {
     drain: Arc<Drain>,
 }
 
-/// Accepts on every port until woken; a second connection on a port is a violation.
+/// Accepts on every port until told to stop; a second connection on a port is a
+/// violation. Told to sweep (the VM has ended), it accepts whatever is still in the
+/// listeners' backlogs, recording each connection for the drain before the main
+/// loop can count the drain done. However it stops, the drain no longer waits for it.
 fn listen(listeners: Vec<(u32, UnixListener)>, wake: &OwnedFd, mut serve: Serve) {
+    struct Stopped(Arc<Drain>);
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            self.0.swept.store(true, Ordering::SeqCst);
+        }
+    }
+    let _stopped = Stopped(serve.drain.clone());
     let mut seen = BTreeSet::new();
     loop {
         let mut fds: Vec<PollFd<'_>> = listeners
@@ -724,41 +837,71 @@ fn listen(listeners: Vec<(u32, UnixListener)>, wake: &OwnedFd, mut serve: Serve)
         drop(fds);
         // The wake pipe is last.
         if ready.last().copied().unwrap_or(true) {
-            return;
+            let mut b = [0u8; 1];
+            match rustix::io::read(wake, &mut b) {
+                Ok(1) if b == [SWEEP] => {
+                    for (p, l) in &listeners {
+                        while accept(*p, l, &mut seen, &mut serve) == Accept::Served {}
+                    }
+                    serve.drain.swept.store(true, Ordering::SeqCst);
+                    continue;
+                }
+                Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
+                // STOP, or the session is gone.
+                _ => return,
+            }
         }
         for (i, (p, l)) in listeners.iter().enumerate() {
-            if !ready.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            let stream = match l.accept() {
-                Ok((s, _)) => s,
-                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
-                Err(e) => {
-                    let _ = serve
-                        .events
-                        .send(Event::Violation(format!("accept on vsock port {p}: {e}")));
-                    return;
-                }
-            };
-            if !seen.insert(*p) {
-                let _ = serve
-                    .events
-                    .send(Event::Violation(format!("a second connection on vsock port {p}")));
-                continue;
-            }
-            if stream.set_nonblocking(false).is_err() {
-                continue;
-            }
-            // The control connection and the output streams are drained to EOF after
-            // the VM ends; stdin need not be. Recorded before they are served.
-            if [port::CONTROL, port::STDOUT, port::STDERR, port::TTY].contains(p) {
-                serve.drain.ports().insert(*p);
-            }
-            if let Err(e) = serve.dispatch(*p, stream) {
-                let _ = serve.events.send(Event::Violation(format!("vsock port {p}: {e}")));
+            if ready.get(i).copied().unwrap_or(false) && accept(*p, l, &mut seen, &mut serve) == Accept::Failed {
+                return;
             }
         }
     }
+}
+
+#[derive(PartialEq, Eq)]
+enum Accept {
+    Served,
+    /// Nothing to accept.
+    Empty,
+    /// The listener cannot go on (reported as a violation).
+    Failed,
+}
+
+/// Accepts one connection on port `p`, if any, and serves it.
+fn accept(p: u32, l: &UnixListener, seen: &mut BTreeSet<u32>, serve: &mut Serve) -> Accept {
+    let stream = match l.accept() {
+        Ok((s, _)) => s,
+        Err(e) if e.kind() == ErrorKind::WouldBlock => return Accept::Empty,
+        Err(e) if e.kind() == ErrorKind::Interrupted => return Accept::Served,
+        Err(e) => {
+            let _ = serve
+                .events
+                .send(Event::Violation(format!("accept on vsock port {p}: {e}")));
+            return Accept::Failed;
+        }
+    };
+    if !seen.insert(p) {
+        let _ = serve
+            .events
+            .send(Event::Violation(format!("a second connection on vsock port {p}")));
+        return Accept::Served;
+    }
+    if stream.set_nonblocking(false).is_err() {
+        return Accept::Served;
+    }
+    // The control connection and the output streams are drained to EOF after the
+    // VM ends; stdin need not be. Recorded before they are served.
+    if p == port::CONTROL {
+        serve.drain.ports().insert(p, Open::default());
+    } else if [port::STDOUT, port::STDERR, port::TTY].contains(&p) {
+        let socket = stream.try_clone().ok();
+        serve.drain.ports().insert(p, Open { writing: false, socket });
+    }
+    if let Err(e) = serve.dispatch(p, stream) {
+        let _ = serve.events.send(Event::Violation(format!("vsock port {p}: {e}")));
+    }
+    Accept::Served
 }
 
 impl Serve {
@@ -914,7 +1057,8 @@ fn writer(stream: &Receiver<UnixStream>, out: &Receiver<Out>, events: &Sender<Ev
 
 /// Streams guest output to `sink`. A sink that fails (a closed pipe) is dropped,
 /// but the guest's output is still read to EOF, so the guest never blocks on it.
-/// Every byte read or written counts as movement for the drain bound.
+/// Every byte read or written counts as movement for the drain bound, and time in
+/// a write to the sink does not count against it.
 fn copy_out(mut from: UnixStream, mut sink: Box<dyn Write + Send>, p: u32, drain: &Drain, events: &Sender<Event>) {
     let mut buf = vec![0u8; 64 * 1024];
     let mut ok = true;
@@ -924,7 +1068,10 @@ fn copy_out(mut from: UnixStream, mut sink: Box<dyn Write + Send>, p: u32, drain
             Ok(n) => {
                 drain.moved(n);
                 if ok {
+                    // However long the sink takes, the drain waits for it (after a real end).
+                    drain.writing(p, true);
                     ok = write_moving(sink.as_mut(), buf.get(..n).unwrap_or_default(), drain);
+                    drain.writing(p, false);
                 }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
