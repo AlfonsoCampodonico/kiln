@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds what the kiln-init boot tests need and runs them (Linux with KVM).
+# Builds what the boot tests (kiln-run) need and runs them (Linux with KVM).
 # Usage: scripts/boot-tests.sh <vmkit kernel> [cargo test args...]
 # Needs the VMMs on PATH (vmkit's scripts/install-vmms.sh), a static busybox
 # (`busybox-static`), vmkit's sandbox helper allowed to create user namespaces
@@ -37,4 +37,4 @@ export KILN_TEST_KERNEL=$kernel
 export KILN_TEST_INIT=$target/$musl/release/kiln-init
 export KILN_TEST_HOSTILE=$target/$musl/release/hostile
 export KILN_REQUIRE_KVM_TESTS=1
-cargo test -p kiln-init --test boot --test host_driver "$@"
+cargo test -p kiln-run --test boot -p kiln --test run "$@"

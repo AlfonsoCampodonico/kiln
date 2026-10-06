@@ -849,6 +849,7 @@ dependencies = [
  "kiln-store",
  "predicates",
  "rlimit",
+ "rustix",
  "serde_json",
  "tar",
  "tempfile",
@@ -887,15 +888,9 @@ dependencies = [
 name = "kiln-init"
 version = "0.1.0"
 dependencies = [
- "kiln-erofs",
- "kiln-image",
- "kiln-oci",
  "kiln-proto",
- "kiln-store",
  "rustix",
  "signal-hook",
- "tempfile",
- "vmkit",
 ]
 
 [[package]]

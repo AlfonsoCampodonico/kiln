@@ -41,7 +41,7 @@ jobs:
         run: |
           assets/make-ext4-template.sh "$RUNNER_TEMP/ext4-template.img.zst"
           cmp "$RUNNER_TEMP/ext4-template.img.zst" crates/kiln-image/assets/ext4-template.img.zst
-  # kiln-init's boot suite on x86_64 KVM with both VMMs, set up as vmkit's own contract job is (hosted arm64
+  # The boot suite (kiln-run) and kiln run end to end on x86_64 KVM with both VMMs, set up as vmkit's own contract job is (hosted arm64
   # runners have no /dev/kvm; aarch64 runs in the Lima VM).
   boot-x86_64:
     runs-on: ubuntu-24.04
