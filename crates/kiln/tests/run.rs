@@ -3,12 +3,17 @@
 //! both): KILN_TEST_KERNEL, KILN_TEST_INIT, KILN_TEST_HOSTILE, a static busybox
 //! (KILN_TEST_BUSYBOX, default /bin/busybox), the VMMs and VMKIT_SANDBOX.
 //! KILN_TEST_VMM picks the VMM (default firecracker). Without the kernel and init
-//! every test is skipped, unless KILN_REQUIRE_KVM_TESTS=1.
+//! every test is skipped, unless KILN_REQUIRE_KVM_TESTS=1. KILN_TEST_KEEP=1 keeps
+//! every run directory (KILN_KEEP_RUN_DIR=1). Every kiln a test starts is bounded:
+//! killed when it overruns (the failure shows its guest's console) or when the
+//! test fails first.
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -93,12 +98,7 @@ fn fixture() -> Option<Fixture> {
         cfg,
     );
     b.add(d, None).finish();
-    let out = f
-        .kiln()
-        .args(["convert", "--tag", "busybox"])
-        .arg(&path)
-        .output()
-        .unwrap();
+    let out = f.kiln().args(["convert", "--tag", "busybox"]).arg(&path).finish();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     Some(f)
 }
@@ -107,6 +107,9 @@ impl Fixture {
     fn kiln(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_kiln"));
         c.arg("--store").arg(&self.store);
+        if std::env::var_os("KILN_TEST_KEEP").is_some_and(|v| v == "1") {
+            c.env("KILN_KEEP_RUN_DIR", "1");
+        }
         c
     }
 
@@ -125,8 +128,118 @@ impl Fixture {
     }
 
     fn output(&self, args: &[&str]) -> Output {
-        self.run(args).stdin(Stdio::null()).output().unwrap()
+        self.run(args).finish()
     }
+}
+
+/// How long any kiln a test starts may take, unless the test bounds it tighter.
+const DEADLINE: Duration = Duration::from_secs(180);
+
+/// A kiln the test started. Dropped while running (a failed assertion), it is
+/// killed, and its VMM dies with it: no orphans.
+struct Kiln(Child);
+
+impl Deref for Kiln {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl DerefMut for Kiln {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Kiln {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+impl Kiln {
+    /// Waits for the exit; past `timeout` kiln is killed and the test fails with
+    /// the end of its guest's console.
+    fn wait_status(&mut self, timeout: Duration) -> ExitStatus {
+        let until = Instant::now() + timeout;
+        loop {
+            if let Some(s) = self.0.try_wait().unwrap() {
+                return s;
+            }
+            if Instant::now() >= until {
+                let pid = self.0.id();
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+                panic!(
+                    "kiln (pid {pid}) did not exit within {timeout:?} and was killed; the end of its guest's \
+                     console:\n{}",
+                    console_of(pid)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Like `wait_with_output`, bounded.
+    fn output(mut self, timeout: Duration) -> Output {
+        let out = self.0.stdout.take().map(Captured::spawn);
+        let err = self.0.stderr.take().map(Captured::spawn);
+        let status = self.wait_status(timeout);
+        Output {
+            status,
+            stdout: out.map(|c| c.finish()).unwrap_or_default(),
+            stderr: err.map(|c| c.finish()).unwrap_or_default(),
+        }
+    }
+}
+
+/// Starting kiln, bounded.
+trait Start {
+    fn start(&mut self) -> Kiln;
+    /// `output()` within [`DEADLINE`] (stdin is `/dev/null`, as with `output()`).
+    fn finish(&mut self) -> Output;
+}
+
+impl Start for Command {
+    fn start(&mut self) -> Kiln {
+        Kiln(self.spawn().unwrap())
+    }
+
+    fn finish(&mut self) -> Output {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .output(DEADLINE)
+    }
+}
+
+/// The last lines of the console of the run kiln `pid` made, found by the pid in
+/// its run.json.
+fn console_of(pid: u32) -> String {
+    let base = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+        Some(x) if x.is_absolute() => x.join("kiln"),
+        _ => PathBuf::from(format!("/tmp/kiln-{}", rustix::process::getuid().as_raw())),
+    };
+    for dir in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+        let Ok(info) = std::fs::read(dir.path().join("run.json")) else {
+            continue;
+        };
+        let Ok(info) = serde_json::from_slice::<serde_json::Value>(&info) else {
+            continue;
+        };
+        if info["kiln"]["pid"] == pid {
+            let log = text(&std::fs::read(dir.path().join("console.log")).unwrap_or_default());
+            let lines: Vec<&str> = log.lines().collect();
+            return lines[lines.len().saturating_sub(40)..].join("\n");
+        }
+    }
+    format!("(no run directory of kiln {pid} in {})", base.display())
 }
 
 fn text(b: &[u8]) -> String {
@@ -148,7 +261,7 @@ fn code(o: &Output) -> i32 {
 
 /// Reads a child's stdout on a thread, so tests can wait for text.
 #[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+struct Captured(Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>);
 
 impl Captured {
     fn spawn(mut r: impl Read + Send + 'static) -> Self {
@@ -162,8 +275,18 @@ impl Captured {
                 }
                 into.0.lock().unwrap().extend_from_slice(&buf[..n]);
             }
+            into.1.store(true, Ordering::SeqCst);
         });
         c
+    }
+
+    /// Everything, once the stream ended (bounded: a straggler holding it open).
+    fn finish(&self) -> Vec<u8> {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !self.1.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.0.lock().unwrap().clone()
     }
 
     fn text(&self) -> String {
@@ -184,15 +307,8 @@ fn signal(child: &Child, sig: rustix::process::Signal) {
     rustix::process::kill_process(pid, sig).unwrap();
 }
 
-fn wait(child: &mut Child, timeout: Duration) -> i32 {
-    let until = Instant::now() + timeout;
-    loop {
-        if let Some(s) = child.try_wait().unwrap() {
-            return s.code().unwrap_or(-1);
-        }
-        assert!(Instant::now() < until, "kiln did not exit");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+fn wait(child: &mut Kiln, timeout: Duration) -> i32 {
+    child.wait_status(timeout).code().unwrap_or(-1)
 }
 
 const BOOT: Duration = Duration::from_secs(60);
@@ -217,8 +333,7 @@ fn exit_codes_as_docker_reports_them() {
         f.run(&["busybox", "--", "true"])
             .env("KILN_TEST_NOT_UTF8", std::ffi::OsStr::from_bytes(b"\xff"))
             .stdin(Stdio::null())
-            .output()
-            .unwrap()
+            .finish()
     };
     assert_eq!(code(&o), 0, "{}", text(&o.stderr));
     let o = f.output(&["busybox", "--", "/nonexistent"]);
@@ -233,9 +348,26 @@ fn exit_codes_as_docker_reports_them() {
         "{}",
         text(&o.stderr)
     );
-    // The image's cmd when none is given; env from --env.
+    // The environment from --env.
     let o = f.output(&["--env", "A=b c", "busybox", "--", "sh", "-c", "echo $A; cat /marker"]);
     assert_eq!(text(&o.stdout), "b c\none");
+    // Without a command, the image's cmd (/bin/sh) runs: here it reads stdin.
+    let mut child = f
+        .run(&["-i", "busybox"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"echo from-the-image-cmd; exit 4\n").unwrap();
+    drop(stdin);
+    let o = child.output(DEADLINE);
+    assert_eq!(
+        (code(&o), text(&o.stdout)),
+        (4, "from-the-image-cmd\n".into()),
+        "{}",
+        text(&o.stderr)
+    );
 }
 
 #[test]
@@ -246,8 +378,7 @@ fn stdin_is_relayed_only_with_i() {
         .run(&["-i", "busybox", "--", "cat"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .start();
     let input: Vec<u8> = (0..1u32 << 20)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect();
@@ -256,7 +387,7 @@ fn stdin_is_relayed_only_with_i() {
     std::thread::spawn(move || {
         stdin.write_all(&data).unwrap();
     });
-    let o = child.wait_with_output().unwrap();
+    let o = child.output(DEADLINE);
     assert_eq!(code(&o), 0);
     assert!(o.stdout == input, "binary stdin came back as {} bytes", o.stdout.len());
     // Without -i the guest's stdin is at EOF at once, even with kiln's stdin open.
@@ -264,8 +395,7 @@ fn stdin_is_relayed_only_with_i() {
         .run(&["busybox", "--", "sh", "-c", "cat; echo eof"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .start();
     let _keep_open = child.stdin.take();
     let out = Captured::spawn(child.stdout.take().unwrap());
     assert_eq!(wait(&mut child, BOOT), 0);
@@ -280,8 +410,7 @@ fn sigterm_asks_the_guest_and_a_second_sigint_kills() {
     let mut child = f
         .run(&["busybox", "--", "sh", "-c", script])
         .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .start();
     let out = Captured::spawn(child.stdout.take().unwrap());
     out.wait_for("up\n", BOOT);
     signal(&child, Signal::TERM);
@@ -292,8 +421,7 @@ fn sigterm_asks_the_guest_and_a_second_sigint_kills() {
     let mut child = f
         .run(&["--stop-timeout", "100", "busybox", "--", "sh", "-c", script])
         .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .start();
     let out = Captured::spawn(child.stdout.take().unwrap());
     out.wait_for("up\n", BOOT);
     signal(&child, Signal::INT);
@@ -316,8 +444,7 @@ fn sigint_to_kilns_process_group_stops_the_guest_gracefully() {
         .run(&["busybox", "--", "sh", "-c", script])
         .stdout(Stdio::piped())
         .process_group(0)
-        .spawn()
-        .unwrap();
+        .start();
     let out = Captured::spawn(child.stdout.take().unwrap());
     out.wait_for("up\n", BOOT);
     let group = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
@@ -353,8 +480,7 @@ fn sigint_during_setup_aborts_with_137() {
         .args(["--allow-custom-init", "busybox", "--", "true"])
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .start();
     let until = Instant::now() + Duration::from_secs(30);
     while !catches_sigint(child.id()) {
         assert!(
@@ -395,7 +521,7 @@ fn sigint_during_setup_aborts_with_137() {
 fn tty_mode_on_a_pty() {
     let Some(f) = fixture() else { return };
     use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
-    use rustix::termios::{OptionalActions, Winsize, tcgetattr, tcsetwinsize};
+    use rustix::termios::{Winsize, tcgetattr, tcsetwinsize};
     let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
     grantpt(&master).unwrap();
     unlockpt(&master).unwrap();
@@ -422,8 +548,7 @@ fn tty_mode_on_a_pty() {
         .stdin(slave.try_clone().unwrap())
         .stdout(slave.try_clone().unwrap())
         .stderr(slave.try_clone().unwrap())
-        .spawn()
-        .unwrap();
+        .start();
     let mut writer = std::fs::File::from(rustix::io::dup(&master).unwrap());
     let out = Captured::spawn(std::fs::File::from(master));
     out.wait_for("30 100", BOOT);
@@ -454,13 +579,18 @@ fn tty_mode_on_a_pty() {
         (before.local_modes, before.input_modes, before.output_modes),
         "the terminal is restored"
     );
-    let _ = OptionalActions::Now;
 }
 
 #[test]
 fn the_boot_timeout_ends_a_stuck_guest() {
     let Some(f) = fixture() else { return };
-    let Some(hostile) = &f.env.hostile else { return };
+    let Some(hostile) = &f.env.hostile else {
+        assert!(
+            std::env::var_os("KILN_REQUIRE_KVM_TESTS").is_none_or(|v| v != "1"),
+            "KILN_REQUIRE_KVM_TESTS=1 but KILN_TEST_HOSTILE is unset"
+        );
+        return;
+    };
     let mut c = f.kiln();
     c.args(["run", "--vmm", &f.env.vmm, "--kernel"])
         .arg(&f.env.kernel)
@@ -475,7 +605,7 @@ fn the_boot_timeout_ends_a_stuck_guest() {
             "--",
             "hang-before-running",
         ]);
-    let o = c.stdin(Stdio::null()).output().unwrap();
+    let o = c.finish();
     assert_eq!(code(&o), 125);
     assert!(text(&o.stderr).contains("boot timeout"), "{}", text(&o.stderr));
 }
@@ -483,7 +613,7 @@ fn the_boot_timeout_ends_a_stuck_guest() {
 #[test]
 fn a_provisional_image_needs_the_custom_kernel_flags() {
     let Some(f) = fixture() else { return };
-    let o = f.kiln().args(["run", "busybox"]).output().unwrap();
+    let o = f.kiln().args(["run", "busybox"]).finish();
     assert_eq!(code(&o), 125);
     assert!(text(&o.stderr).contains("has no kernel layer"), "{}", text(&o.stderr));
     let o = f
@@ -491,8 +621,7 @@ fn a_provisional_image_needs_the_custom_kernel_flags() {
         .args(["run", "--kernel"])
         .arg(&f.env.kernel)
         .arg("busybox")
-        .output()
-        .unwrap();
+        .finish();
     assert_eq!(code(&o), 125);
     assert!(text(&o.stderr).contains("--allow-custom-kernel"), "{}", text(&o.stderr));
     let o = f
@@ -500,8 +629,7 @@ fn a_provisional_image_needs_the_custom_kernel_flags() {
         .args(["run", "--kernel"])
         .arg(&f.env.kernel)
         .args(["--allow-custom-kernel", "busybox"])
-        .output()
-        .unwrap();
+        .finish();
     assert_eq!(code(&o), 125);
     assert!(
         text(&o.stderr).contains("no pinned kiln-init") && text(&o.stderr).contains("--allow-custom-init"),
@@ -561,8 +689,7 @@ fn image_boot_layers_are_verified_and_init_replaced() {
             .args(more)
             .args(["--", "echo", "ran"])
             .stdin(Stdio::null())
-            .output()
-            .unwrap()
+            .finish()
     };
     let o = run(&["--allow-custom-kernel", "pinned"]);
     assert_eq!(code(&o), 125);
@@ -602,8 +729,7 @@ fn the_device_budget_is_checked_before_boot() {
         .kiln()
         .args(["convert", "--max-layers", "64", "--tag", "deep"])
         .arg(&path)
-        .output()
-        .unwrap();
+        .finish();
     assert!(out.status.success(), "{}", text(&out.stderr));
     let o = f
         .kiln()
@@ -612,8 +738,7 @@ fn the_device_budget_is_checked_before_boot() {
         .args(["--allow-custom-kernel", "--init"])
         .arg(&f.env.init)
         .args(["--allow-custom-init", "deep", "--", "true"])
-        .output()
-        .unwrap();
+        .finish();
     assert_eq!(code(&o), 125);
     assert!(text(&o.stderr).contains("--max-layers 27"), "{}", text(&o.stderr));
 }
