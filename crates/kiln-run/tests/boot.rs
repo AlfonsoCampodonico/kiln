@@ -7,8 +7,7 @@ mod support;
 use std::time::Duration;
 
 use kiln_proto::{
-    EXIT_CANNOT_INVOKE, EXIT_INFRA, EXIT_NOT_FOUND, GuestMessage, HostMessage, MAX_FRAME, Network, Shutdown, Signal,
-    WindowSize,
+    EXIT_CANNOT_INVOKE, EXIT_INFRA, EXIT_NOT_FOUND, HostMessage, MAX_FRAME, Network, Shutdown, Signal, WindowSize,
 };
 use support::driver::{Outcome, Reply};
 use support::{BOOT, Case, DEEP_LAYERS, END, STACK_LAYERS, fixtures};
@@ -31,7 +30,7 @@ fn exit_codes_and_stages(backend: Backend) {
     ended_cleanly(&c, &o);
     assert_eq!(o.exit_code(), 0);
     assert_eq!(o.stages(), [3, 4, 5, 6, 7]);
-    assert!(matches!(o.messages[0], GuestMessage::Hello(_)), "{:?}", o.messages);
+    assert!(o.run.hello, "{o:?}");
     assert!(o.running());
     let o = c.run(&fixtures().base, sh(&c, "exit 3"));
     ended_cleanly(&c, &o);
@@ -238,7 +237,7 @@ fn user_groups_env_and_workdir(backend: Backend) {
         lines[1],
         format!(
             "home=/home/app host=kiln-guest path={} foo=baz",
-            kiln_init::env::DEFAULT_PATH
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         )
     );
     assert_eq!(lines[2], "/work/dir");
@@ -442,7 +441,10 @@ fn a_second_hello_makes_the_host_kill_the_vm(backend: Backend) {
     let o = c.run(image, c.config(image, &["/bin/hostile"]));
     assert_eq!(o.end.reason, EndReason::Killed, "{o:?}");
     let why = o.violation.as_deref().unwrap_or_default();
-    assert!(why == "a second control connection" || why == "a second Hello", "{why}");
+    assert!(
+        why == "a second connection on vsock port 1024" || why == "a second Hello",
+        "{why}"
+    );
     assert_eq!(o.exit_code(), EXIT_INFRA);
 }
 
@@ -489,6 +491,133 @@ fn host_protocol_violations_end_the_guest(backend: Backend) {
     assert_eq!(o.exited(), None);
 }
 
+/// M-1: an image whose `/proc` is a symlink is refused at stage 4, as runc refuses it.
+fn a_symlinked_proc_is_refused(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let layers = &fixtures().proc_link;
+    let o = c.run(layers, c.config(layers, &["/bin/true"]));
+    ended_cleanly(&c, &o);
+    let f = o
+        .init_failed()
+        .unwrap_or_else(|| panic!("no InitFailed: {o:?}\n{}", c.tail()));
+    assert_eq!(f.stage, 4, "{f:?}");
+    assert!(f.message.contains("the image's /proc is a symlink"), "{f:?}");
+    assert_eq!(o.exit_code(), EXIT_INFRA);
+}
+
+/// M-2: a host that breaks the protocol right after `Config` stops the boot at
+/// the next stage, before the workload starts.
+fn a_broken_host_stops_the_boot_before_the_workload(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let config = sh(&c, "echo should-not-run");
+    let mut raw = Vec::new();
+    kiln_proto::write_message(&mut raw, &HostMessage::Config(Box::new(config.clone()))).unwrap();
+    raw.extend_from_slice(&[3, 0, 0, 0, 250, b'{', b'}']);
+    let o = c
+        .start(&fixtures().base, config, Reply::Raw(raw), Vec::new())
+        .finish(END);
+    ended_cleanly(&c, &o);
+    let f = o
+        .init_failed()
+        .unwrap_or_else(|| panic!("no InitFailed: {o:?}\n{}", c.tail()));
+    assert!((3..=6).contains(&f.stage), "{f:?}");
+    assert!(f.message.contains("unknown message type 250"), "{f:?}");
+    assert!(!o.running() && o.stdout.is_empty(), "{o:?}");
+}
+
+/// A Case whose PID 1 is the hostile program, misbehaving as `mode` says.
+fn hostile_init(backend: Backend) -> Option<Case> {
+    let mut c = Case::new(backend)?;
+    match &fixtures().hostile_init {
+        Some(p) => c.init = Some(p.clone()),
+        None => {
+            assert!(
+                !support::require(),
+                "KILN_REQUIRE_KVM_TESTS=1 but KILN_TEST_HOSTILE is unset"
+            );
+            return None;
+        }
+    }
+    Some(c)
+}
+
+/// D-1: a guest flooding valid `Stage` messages is killed at the first repeat.
+fn a_guest_flooding_stages_is_killed(backend: Backend) {
+    let Some(c) = hostile_init(backend) else { return };
+    let o = c.run(&fixtures().base, c.config(&fixtures().base, &["stage-flood"]));
+    assert_eq!(o.violation.as_deref(), Some("Stage 3 after stage 3"), "{o:?}");
+    assert_eq!((o.exit_code(), o.end.reason), (EXIT_INFRA, EndReason::Killed));
+}
+
+/// D-3: a guest that reports `Exited` but keeps its VM running is killed after the bound.
+fn a_guest_lingering_after_exited_is_killed(backend: Backend) {
+    let Some(c) = hostile_init(backend) else { return };
+    let config = c.config(&fixtures().base, &["exited-then-hang"]);
+    let spec = c.spec(&fixtures().base, &config, None);
+    let vm = c.vmm.create(&spec).expect("create the VM");
+    let mut opts = c.options();
+    opts.end_timeout = Duration::from_secs(2);
+    let o = support::driver::Session::start(vm, config, Reply::Config, Vec::new(), opts).finish(END);
+    assert_eq!((o.exit_code(), o.violation.as_deref()), (0, None), "{o:?}");
+    assert_eq!(o.end.reason, EndReason::Killed);
+    assert!(o.run.warnings.iter().any(|w| w.contains("did not end")), "{o:?}");
+}
+
+/// D-5: a second connection on a stdio port.
+fn a_second_stdout_connection_is_a_violation(backend: Backend) {
+    let Some(c) = hostile_init(backend) else { return };
+    let o = c.run(&fixtures().base, c.config(&fixtures().base, &["second-stdout"]));
+    assert_eq!(
+        o.violation.as_deref(),
+        Some("a second connection on vsock port 1026"),
+        "{o:?}"
+    );
+    assert_eq!(o.exit_code(), EXIT_INFRA);
+}
+
+/// D-2: a guest that stops reading cannot block the host's sends or its kill.
+fn a_guest_not_reading_control_is_killed(backend: Backend) {
+    let Some(c) = hostile_init(backend) else { return };
+    let mut s = c.start(
+        &fixtures().base,
+        c.config(&fixtures().base, &["no-read"]),
+        Reply::Config,
+        Vec::new(),
+    );
+    assert!(s.wait_running(BOOT), "console:\n{}", c.tail());
+    let h = s.handle();
+    let started = std::time::Instant::now();
+    for _ in 0..100_000 {
+        h.signal(1);
+    }
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let o = s.finish(END);
+    assert_eq!(
+        o.violation.as_deref(),
+        Some("the guest is not reading its control channel"),
+        "{o:?}"
+    );
+    assert_eq!(o.end.reason, EndReason::Killed);
+}
+
+/// Spec §9.7: a guest that is not running within the boot timeout is killed (125).
+fn the_boot_timeout_kills_a_stuck_guest(backend: Backend) {
+    let Some(c) = hostile_init(backend) else { return };
+    let config = c.config(&fixtures().base, &["hang-before-running"]);
+    let spec = c.spec(&fixtures().base, &config, None);
+    let vm = c.vmm.create(&spec).expect("create the VM");
+    let mut opts = c.options();
+    opts.boot_timeout = Duration::from_secs(5);
+    let o = support::driver::Session::start(vm, config, Reply::Config, Vec::new(), opts).finish(END);
+    assert!(
+        o.violation.as_deref().unwrap_or_default().starts_with("boot timeout"),
+        "{o:?}"
+    );
+    // Under load the guest may not even have reached Hello in 5 s.
+    assert!(!o.running() && o.run.stages.len() <= 1, "{o:?}");
+    assert_eq!(o.exit_code(), EXIT_INFRA);
+}
+
 macro_rules! boot_tests {
     ($($name:ident),* $(,)?) => {
         mod firecracker {
@@ -517,4 +646,56 @@ boot_tests!(
     networking_from_config,
     a_second_hello_makes_the_host_kill_the_vm,
     host_protocol_violations_end_the_guest,
+    a_symlinked_proc_is_refused,
+    a_broken_host_stops_the_boot_before_the_workload,
+    a_guest_flooding_stages_is_killed,
+    a_guest_lingering_after_exited_is_killed,
+    a_second_stdout_connection_is_a_violation,
+    a_guest_not_reading_control_is_killed,
+    the_boot_timeout_kills_a_stuck_guest,
 );
+
+/// Boot-to-`Running` and whole-run times, sequentially (run with `--ignored --nocapture`).
+#[test]
+#[ignore = "a measurement, not a check"]
+fn measure_boot_to_running() {
+    let only = std::env::var("KILN_MEASURE_VMM").ok();
+    for backend in Backend::ALL {
+        if only.as_deref().is_some_and(|v| v != format!("{backend:?}")) {
+            continue;
+        }
+        let Some(c) = Case::new(backend) else { return };
+        let n: usize = std::env::var("KILN_MEASURE_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let (mut hello, mut running, mut total) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..n {
+            let started = std::time::Instant::now();
+            let o = c.run(&fixtures().base, c.config(&fixtures().base, &["/bin/true"]));
+            if o.exit_code() != 0 {
+                eprintln!("{backend:?}: a run failed: {:?}", o.violation);
+                continue;
+            }
+            total.push(started.elapsed().as_millis());
+            hello.push(o.run.hello_after.unwrap().as_millis());
+            running.push(o.run.running_after.unwrap().as_millis());
+        }
+        let stats = |v: &mut Vec<u128>| {
+            v.sort();
+            format!(
+                "median {} ms, min {}, max {} (n={})",
+                v[v.len() / 2],
+                v[0],
+                v[v.len() - 1],
+                v.len()
+            )
+        };
+        eprintln!(
+            "{backend:?}: VM start to Hello {}; to Running {}; create+boot+run+end {}",
+            stats(&mut hello),
+            stats(&mut running),
+            stats(&mut total)
+        );
+    }
+}

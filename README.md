@@ -78,7 +78,7 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo build --release --
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo build --release --target x86_64-unknown-linux-musl -p kiln-init
 ```
 
-The boot tests (`crates/kiln-init/tests/boot.rs`) boot real guests through vmkit on both VMMs: exit codes, stdio, `-t`, shutdown and signals, users, many layers, scratch growth, networking and protocol abuse. They need Linux with KVM and the tools vmkit's own contract suite needs, which come with the vmkit revision kiln pins:
+The boot tests (`crates/kiln-run/tests/boot.rs`, on the same session code `kiln run` uses, and `crates/kiln/tests/run.rs` for the CLI) boot real guests through vmkit on both VMMs: exit codes, stdio, `-t`, shutdown and signals, users, many layers, scratch growth, networking and protocol abuse, including a hostile PID 1. They need Linux with KVM and the tools vmkit's own contract suite needs, which come with the vmkit revision kiln pins:
 
 ```bash
 vmkit=$(dirname "$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "vmkit") | .manifest_path')")
@@ -91,7 +91,7 @@ export PATH="$HOME/.local/bin:$PATH"
 KILN_TEST_NET=1 scripts/boot-tests.sh out/vmlinux-*-"$(uname -m)" -- --test-threads=4
 ```
 
-`scripts/boot-tests.sh` builds `kiln-init` and the hostile test guest for the host's musl target and runs the suite; without its environment the tests are skipped. `KILN_TEST_NET=1` adds the networking case (pasta and nft), `KILN_TEST_KEEP=1` keeps each run directory with its console log, and `KILN_TEST_VCPUS` sets the guests' vCPUs (default 1). Cargo arguments go after the kernel, for example `firecracker::` to run one VMM.
+`scripts/boot-tests.sh` builds `kiln-init` and the hostile test guest for the host's musl target and runs the suite; without its environment the tests are skipped. `KILN_TEST_NET=1` adds the networking case (pasta and nft), `KILN_TEST_KEEP=1` keeps each run directory with its console log, and `KILN_TEST_VCPUS` sets the guests' vCPUs (default 1). Cargo arguments go after the kernel, for example `firecracker::` to run one VMM's boot cases; `KILN_TEST_VMM` (default `firecracker`) picks the VMM of the `kiln run` cases.
 
 The scratch disk starts from an ext4 template embedded in `kiln-image`. `assets/make-ext4-template.sh` regenerates it with Docker, byte for byte; CI checks that it does.
 
