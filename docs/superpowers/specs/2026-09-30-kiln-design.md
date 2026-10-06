@@ -58,15 +58,20 @@
   - kiln-proto is extended, never replaced. The planned extensions (services, build mode, exec, guest stats, OOM reports, file updates) and the versioning rule for them are in §9.8.
   - Milestones (§12): M3 is split into M3a (done), M3b and M3c, with new M3d (`services`), M3e (build mode) and M4 (`kiln-shim`). sagger and sherd follow, each with its own spec.
   - The kiln-shim draft spec moved here from the potter repo.
-- **rev 2.9 (2026-10-06):** §8.1, §9.5 and §9.7 aligned with the M3b-1 plan (`kiln run`, runtime and CLI; validated prototype `m3b-proto` and the controller's rulings). M3b is planned in two parts: M3b-1, the runtime and CLI, and M3b-2, pinned artifacts, `--persist`, `--net` and the Lima template (§12).
+- **rev 2.9 (2026-10-06):** §5.2, §5.3, §8.1, §9.5 and §9.7 aligned with the M3b-1 plan (`kiln run`, runtime and CLI; validated prototype `m3b-proto` and the controller's rulings). M3b is planned in two parts: M3b-1, the runtime and CLI, and M3b-2, pinned artifacts, `--persist`, `--net` and the Lima template (§12).
   - `--init <path>` boots a static kiln-init of the user's, only with `--allow-custom-init`, as `--kernel` needs `--allow-custom-kernel`; both are warned about and recorded in `run.json`. Until kiln pins released kernels and kiln-init, every run names both; an image's kernel layer is used only with `profile: custom` and `--allow-custom-kernel` (§8.1).
-  - A run the user kills (a second SIGINT, `Ctrl-]` `k`, or a stop request before the guest's `Hello`) exits 137, as `docker kill`. Kills `kiln` decides (protocol violations, the boot timeout, the stop and end bounds below) stay 125 (§9.5).
-  - After `Exited`, `InitFailed` or the control connection closing, the guest has 10 s to end the VM, then it is killed; after `Exited` the app's exit code is kept, with a warning. After `Shutdown`, `kiln` kills the VM itself once the grace period plus 5 s has passed (125, with a warning). A stop request before `Hello` kills at once (§9.7).
+  - A run the user kills (a second SIGINT, `Ctrl-]` `k`, or a stop request before the guest's `Hello`) exits 137, as `docker kill`, unless the guest's final message came first: a kill after `Exited` keeps the app's code, one after `InitFailed` keeps init's 127, 126 or 125. Kills `kiln` decides (protocol violations, the boot timeout, the stop and end bounds below) stay 125 (§9.5).
+  - After `Exited`, `InitFailed` or the control connection closing, the guest has 10 s to end the VM, then it is killed; after `Exited` the app's exit code is kept, with a warning. After `Shutdown`, `kiln` kills the VM itself once the grace period plus 5 s has passed (125, with a warning); the guest's final message ends that bound, and only the 10 s one applies from then. A stop request before `Hello` kills at once. A killed VMM has 5 s to exit; then `kiln` stops waiting for it, with a warning (§9.7).
+  - After the VMM exits, stdout and stderr (or the terminal) are drained to EOF however long `kiln`'s own stdout takes them (a pager, a stopped terminal), as a pipeline would; only reading is bounded (2 s without a byte while nothing is being written). After `kiln` gave up on a VMM, the output gets a fixed 2 s. A stream cut off with bytes pending is warned about. Output whose connection the VMM made just before it exited is still accepted (§9.7).
+  - When the VM ends without `Exited` or `InitFailed`, `kiln` names the likely causes (the VMM failed, or ran out of memory) and the VMM's log, or that `KILN_KEEP_RUN_DIR=1` keeps it (§9.7).
   - SIGHUP, SIGQUIT, SIGUSR1 and SIGUSR2 are forwarded to the main process as `Signal`, as Docker's sig-proxy does. A second SIGTERM re-sends `Shutdown`, whose deadline can only shrink; only a second SIGINT kills. SIGWINCH is forwarded with `-t` only (§9.7).
+  - Signal handling starts before setup. SIGINT, SIGTERM or SIGHUP during setup stops it, removes what it made and exits 137, as a user's kill before `Hello` does; SIGQUIT, SIGUSR1 and SIGUSR2 then are dropped with a note, never delivered once the app runs (§9.7).
+  - With `-t -i`, terminal input to a guest that stops reading it is dropped after 5 s, so `Ctrl-]` keys always act (§9.7).
   - `-t` without `-i` gives the guest a terminal without raw mode or stdin relay; `-t -i` needs a terminal on stdin. Both as Docker (§9.7).
-  - Errors before the guest runs exit 125. Defaults: `--vmm firecracker`, `--cpus 1`, `--memory 512`; the guest's hostname is the run id's first 12 hex digits; `-e`/`--env KEY[=VALUE]` as Docker's (§9.7).
+  - Errors before the guest runs exit 125, and so do usage errors of `kiln run`, as `docker run`'s do. As with `docker run`, everything after IMAGE is the command, flags included; a `--` right after IMAGE is optional. A `Config` over the protocol's frame is refused before boot. Defaults: `--vmm firecracker`, `--cpus 1`, `--memory 512`; the guest's hostname is the run id's first 12 hex digits; `-e`/`--env KEY[=VALUE]` as Docker's (§9.7).
   - `console.log` drops its oldest half when it would pass 1 MiB; the VMM writes the console to a FIFO that `kiln` copies (§5.3).
-  - Stale run directories from other boots or hosts are left alone but not yet reported; directories kept for debugging (`KILN_KEEP_RUN_DIR=1`) are never cleaned (§5.3).
+  - Stale run directories from other boots or hosts are left alone and reported in a note; directories kept for debugging (`KILN_KEEP_RUN_DIR=1`) are never cleaned (§5.3).
+  - The scratch disk moves out of the run directory, which is usually a tmpfs (`$XDG_RUNTIME_DIR`): its pages would hold the guest's disk in host memory, charged to the VMM's cgroup (`--memory` plus 256 MiB), so a guest writing a few hundred MB had its VMM killed. It lives in a per-run directory on the store's filesystem, `$KILN_HOME/scratch/<run-id>/`, recorded in `run.json` and removed with the run or by the stale cleanup; GC never touches it (§5.2, §5.3).
 ---
 
 ## 1. Goals
@@ -281,6 +286,7 @@ $KILN_HOME/
   cache/squash/<sha256(ordered erofs digests)>@<fmt>
   cache/warnings/<layer cache key>             # JSON list of the layer's conversion warnings, removed with its cache/layers entry
   tmp/                                        # staging, same filesystem as blobs/
+  scratch/<run-id>/                           # a running VM's scratch disk (§5.3), 0700; never touched by GC
 ```
 
 - **Atomic writes:** write to `tmp/`, `fsync`, then `rename`. A cache entry is written only after its blob is committed and verified.
@@ -292,11 +298,11 @@ $KILN_HOME/
 
 - Each run's state lives in `$XDG_RUNTIME_DIR/kiln/<run-id>/`, mode 0700. If `XDG_RUNTIME_DIR` is unset, the fallback is `/tmp/kiln-<uid>/`, which is created 0700 and owner-verified with `O_NOFOLLOW`. That directory is always on a local filesystem.
 - Its contents:
-  - `run.json`: VMM pidfd-derived identity (pid plus start time), `boot_id`, hostname, VMM kind.
+  - `run.json`: VMM pidfd-derived identity (pid plus start time), `boot_id`, hostname, VMM kind, and the run's scratch directory.
   - The VMM API socket and the vsock UDS endpoints.
-  - The scratch disk, unless persisted.
   - `console.log`: a 1 MiB ring.
-- Cleanup only considers entries whose `boot_id` and hostname match the current host and whose process identity is dead. Entries from other boots or hosts are reported but never touched (T7).
+- The scratch disk, unless persisted, is not in that directory, which is usually a tmpfs whose pages would hold the guest's disk in host memory (and count against the VMM's memory limit). It lives in the run's scratch directory, `$KILN_HOME/scratch/<run-id>/` on the store's filesystem, created 0700 under an owner-verified `scratch/` and recorded in `run.json` before it is made. It is removed with the run directory, never by GC.
+- Cleanup only considers entries whose `boot_id` and hostname match the current host and whose process identity is dead; it removes the scratch directory `run.json` records (only a path of the form `…/scratch/<run-id>`) with the run directory. Entries from other boots or hosts are reported but never touched (T7).
 
 ---
 
