@@ -43,18 +43,21 @@ impl ConsoleRelay {
                     Err(_) => return,
                 }
                 let (data, woken) = (!fds[0].revents().is_empty(), !fds[1].revents().is_empty());
+                // Woken first: a VMM kiln gave up on may still be writing, and
+                // `stop` must not wait for it.
+                if woken {
+                    return;
+                }
                 if data {
                     match rustix::io::read(&read, &mut buf) {
                         // Every writer is gone: the VMM exited.
                         Ok(0) => return,
                         Ok(n) => {
-                            let _ = ring.write(&buf[..n]);
+                            let _ = ring.write(buf.get(..n).unwrap_or_default());
                         }
                         Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
                         Err(_) => return,
                     }
-                } else if woken {
-                    return;
                 }
             }
         })?;
@@ -66,7 +69,8 @@ impl ConsoleRelay {
         })
     }
 
-    /// Waits for the console to be copied (the VMM has exited), at most `limit`.
+    /// Waits for the console to be copied (the VMM has exited), at most `limit`;
+    /// then stops the copy, even while a VMM still writes.
     pub fn finish(mut self, limit: std::time::Duration) {
         let until = std::time::Instant::now() + limit;
         while self.thread.as_ref().is_some_and(|t| !t.is_finished()) && std::time::Instant::now() < until {
@@ -86,5 +90,42 @@ impl ConsoleRelay {
 impl Drop for ConsoleRelay {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    /// A console a VMM keeps writing (one kiln gave up on) does not hold `finish`.
+    #[test]
+    fn finish_is_bounded_while_the_console_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = ConsoleRelay::start(dir.path()).unwrap();
+        let fifo = relay.fifo.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = std::thread::spawn({
+            let stop = stop.clone();
+            move || {
+                let mut f = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = f.write_all(&[b'x'; 4096]);
+                }
+            }
+        });
+        // Until the relay has copied something: the writer is attached.
+        let until = Instant::now() + Duration::from_secs(10);
+        while std::fs::metadata(&relay.log).map_or(0, |m| m.len()) == 0 {
+            assert!(Instant::now() < until, "nothing was copied");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        relay.finish(Duration::from_millis(200));
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.join().unwrap();
+        assert!(took < Duration::from_secs(5), "finish took {took:?}");
     }
 }
