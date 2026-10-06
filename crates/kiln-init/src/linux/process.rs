@@ -249,22 +249,26 @@ mod tests {
         assert_eq!(hook_step(&r), None);
     }
 
+    /// The real hook, as a non-root user: setsid succeeds in the child and
+    /// setgroups fails with EPERM, reported by the name `HOOK_STEPS` gives it, not
+    /// as an exec error.
     #[test]
-    fn spawn_errors_from_the_hook_are_not_exec_errors() {
-        // A hook that fails at its first step, as a refused setsid would.
+    fn a_refused_setgroups_is_named_by_the_hook() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: as root, setgroups would succeed");
+            return;
+        }
         let (r, w) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).unwrap();
         let mut cmd = Command::new("/bin/true");
-        let hook = move || -> std::io::Result<()> {
-            let _ = rustix::io::write(&w, &[4]);
-            Err(std::io::Error::from_raw_os_error(1))
+        let id = Identity {
+            uid: 0,
+            gid: 0,
+            groups: vec![0],
+            home: "/".into(),
         };
-        // SAFETY: the hook only makes raw system calls (see drop_privileges).
-        #[allow(unsafe_code)]
-        unsafe {
-            cmd.pre_exec(hook);
-        }
+        drop_privileges(&mut cmd, &id, false, w);
         let err = cmd.spawn().unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(1));
-        assert_eq!(hook_step(&r), Some("setresuid"));
+        assert_eq!(err.raw_os_error(), Some(rustix::io::Errno::PERM.raw_os_error()));
+        assert_eq!(hook_step(&r), Some("setgroups"));
     }
 }

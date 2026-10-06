@@ -33,8 +33,9 @@ static EXIT: OnceLock<ExitMethod> = OnceLock::new();
 /// sending cannot deadlock.
 static CONTROL: OnceLock<Mutex<Vsock>> = OnceLock::new();
 /// Why the host's side of the control channel failed (a protocol error, or the
-/// host closed it), set by the control reader. Every later stage checks it, so a
-/// broken host stops the boot at the next stage rather than at stage 7.
+/// host closed it, or sent a second `Config`), set by the control reader. Every
+/// later stage, and stage 6 before `Running`, checks it, so a broken host stops the
+/// boot at the next stage rather than at stage 7.
 static HOST_FAILED: OnceLock<String> = OnceLock::new();
 
 /// What the supervisor waits for (spec §9.6 stage 7).
@@ -70,6 +71,8 @@ fn boot() -> Result<()> {
     identity::configure(&config)?;
     enter(6)?;
     let started = process::start(&config, events)?;
+    // A host that failed during this stage: its recorded reason, not a failed send.
+    host_ok()?;
     send(&GuestMessage::Running)?;
     enter(7)?;
     let exited = supervise::run(&config, started, &rx)?;
@@ -95,19 +98,29 @@ fn early() -> Result<()> {
 /// the host has broken the protocol or closed the channel.
 fn enter(n: u8) -> Result<()> {
     STAGE.store(n, Ordering::SeqCst);
-    if let Some(why) = HOST_FAILED.get() {
-        return Err(Failure::msg(why.clone()));
-    }
+    host_ok()?;
     if n >= 3 {
         send(&GuestMessage::Stage(Stage { n }))?;
     }
     Ok(())
 }
 
+/// Fails with the reason the control reader recorded, if the host has failed.
+fn host_ok() -> Result<()> {
+    match HOST_FAILED.get() {
+        Some(why) => Err(Failure::msg(why.clone())),
+        None => Ok(()),
+    }
+}
+
 fn send(msg: &GuestMessage) -> Result<()> {
     let control = CONTROL.get().expect("the control channel is up");
     let mut stream = control.lock().unwrap_or_else(|e| e.into_inner());
-    write_message(&mut *stream, msg).map_err(|e| Failure::msg(format!("send to the host: {e}")))
+    write_message(&mut *stream, msg).map_err(|e| match HOST_FAILED.get() {
+        // The host closed or broke the channel: that is why the send failed.
+        Some(why) => Failure::msg(why.clone()),
+        None => Failure::msg(format!("send to the host: {e}")),
+    })
 }
 
 /// Reports `f` and ends the VM.
