@@ -6,10 +6,12 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod console;
 mod error;
 pub mod escape;
 pub mod options;
 pub mod protocol;
+pub mod rundir;
 
 pub use error::{Error, Result};
 pub use options::{RunOptions, VmmKind};
