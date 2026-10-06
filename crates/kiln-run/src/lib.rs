@@ -10,6 +10,7 @@ pub mod console;
 mod error;
 pub mod escape;
 pub mod options;
+pub mod prepare;
 pub mod protocol;
 pub mod rundir;
 
