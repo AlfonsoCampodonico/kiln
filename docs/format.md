@@ -303,7 +303,7 @@ A frame is a `u32` little-endian length, then a `u8` message type, then the payl
 
 No string may contain a NUL byte.
 
-The whole `Config` is one frame, and a frame is at most 65536 bytes including the type byte, so the JSON payload (argv, environment, hostname and every other field, with JSON escaping) must fit in 65535 bytes. Docker allows about 2 MiB for argv and environment (ARG_MAX). A larger `Config` fails with an oversize error when the host sends it, after the VM has booted.
+The whole `Config` is one frame, and a frame is at most 65536 bytes including the type byte, so the JSON payload (argv, environment, hostname and every other field, with JSON escaping) must fit in 65535 bytes. Docker allows about 2 MiB for argv and environment (ARG_MAX). The host builds the `Config` before it boots the VM and refuses a larger one there, with an error that names the sizes of the command line and the environment; no VM is started.
 
 ### Session
 
@@ -319,6 +319,7 @@ The host kills the VM, and reports 125, on any violation: a message out of that 
 The host reports, as Docker does:
 - after `Exited`: `code`, or `128 + code` when `signaled`;
 - after `InitFailed` at stage 6: 127 when `errno` is 2 (ENOENT: the entrypoint was not found), 126 when `errno` is 13 or 21 (EACCES, EISDIR: found but not invokable);
-- after any other `InitFailed` (an unknown user or group, setgroups, ENOEXEC, ENOTDIR, any earlier stage), a protocol violation, a boot timeout, or a VM that ended without either message: 125.
+- after any other `InitFailed` (an unknown user or group, setgroups, ENOEXEC, ENOTDIR, any earlier stage), a protocol violation, a boot timeout, or a VM that ended without either message: 125;
+- when the user killed the VM (a second SIGINT, `Ctrl-]` `k`, or a stop request before `Hello`) before the guest's final message: 137, as `docker kill`. A kill after `Exited` or `InitFailed` keeps the code above.
 
 Signals are numbered as on Linux aarch64 and x86_64 (1 SIGHUP to 31 SIGSYS). Real-time signals are not supported: an image whose `STOPSIGNAL` is one (`SIGRTMIN+3`, or 32–64) is refused with an error that says so.
