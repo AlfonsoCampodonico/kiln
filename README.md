@@ -92,7 +92,7 @@ export PATH="$HOME/.local/bin:$PATH"
 KILN_TEST_NET=1 scripts/boot-tests.sh out/vmlinux-*-"$(uname -m)" -- --test-threads=4
 ```
 
-`scripts/boot-tests.sh` builds `kiln-init` and the hostile test guest for the host's musl target and runs the suite; without its environment the tests are skipped. `KILN_TEST_NET=1` adds the networking case (pasta and nft), `KILN_TEST_KEEP=1` keeps each run directory with its console log, and `KILN_TEST_VCPUS` sets the guests' vCPUs (default 1). Cargo arguments go after the kernel, for example `firecracker::` to run one VMM's boot cases; `KILN_TEST_VMM` (default `firecracker`) picks the VMM of the `kiln run` cases.
+`scripts/boot-tests.sh` builds `kiln-init` and the hostile test guest for the host's musl target and runs the suite; without its environment the tests are skipped. `KILN_TEST_NET=1` adds the networking case (pasta and nft), `KILN_TEST_KEEP=1` keeps each run directory with its console log (the `kiln run` cases' through `KILN_KEEP_RUN_DIR=1`; CI uploads their logs when the job fails), and `KILN_TEST_VCPUS` sets the guests' vCPUs (default 1). Cargo arguments go after the kernel, for example `firecracker::` to run one VMM's boot cases; `KILN_TEST_VMM` (default `firecracker`) picks the VMM of the `kiln run` cases.
 
 The scratch disk starts from an ext4 template embedded in `kiln-image`. `assets/make-ext4-template.sh` regenerates it with Docker, byte for byte; CI checks that it does.
 
