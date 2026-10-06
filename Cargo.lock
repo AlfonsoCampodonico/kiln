@@ -937,6 +937,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-run"
+version = "0.1.0"
+dependencies = [
+ "kiln-erofs",
+ "kiln-image",
+ "kiln-oci",
+ "kiln-proto",
+ "kiln-store",
+ "rustix",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
+ "thiserror",
+ "vmkit",
+]
+
+[[package]]
 name = "kiln-store"
 version = "0.1.0"
 dependencies = [

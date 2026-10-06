@@ -1,0 +1,27 @@
+[package]
+name = "kiln-run"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The host runtime of kiln microVMs: boot, the control protocol, stdio and signals"
+
+[dependencies]
+kiln-image = { path = "../kiln-image" }
+kiln-proto = { path = "../kiln-proto" }
+kiln-store = { path = "../kiln-store" }
+rustix = { version = "1.1.5", features = ["fs", "process", "system"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+
+# The VMMs run on Linux only; elsewhere `kiln run` explains how to use a Lima VM.
+# Pinned to the commit that declares Cloud Hypervisor disks raw.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.5", features = ["event", "net", "pipe", "stdio", "termios"] }
+signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
+vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "b6958ffa70bda43d332bbf888fbcd3da93f3cfd6" }
+
+[dev-dependencies]
+kiln-erofs = { path = "../kiln-erofs" }
+kiln-oci = { path = "../kiln-oci" }
+tempfile = "3.27.0"
