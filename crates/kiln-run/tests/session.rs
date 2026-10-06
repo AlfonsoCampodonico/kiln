@@ -930,3 +930,41 @@ fn dropping_an_unfinished_session_kills_its_vm() {
     drop(s);
     assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
 }
+
+/// The main loop knows of `Hello` before the guest gets `Config`: a `Ctrl-]` `q`
+/// typed the moment the guest's terminal connects is a stop request, never a kill
+/// "before Hello". (Racy before the fix; repeated to make a loss likely.)
+#[test]
+fn an_escape_key_right_after_config_is_a_stop_request() {
+    for _ in 0..50 {
+        let vm = fake(|sock, _| {
+            let mut c = connect(&sock, port::CONTROL);
+            handshake(&mut c);
+            let tty = connect(&sock, port::TTY);
+            c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let msg = read_message::<_, HostMessage>(&mut c).unwrap();
+            assert!(matches!(msg, Some(HostMessage::Shutdown(_))), "{msg:?}");
+            boot(&mut c);
+            drop(tty);
+            send(
+                &mut c,
+                GuestMessage::Exited(Exited {
+                    signaled: true,
+                    code: 15,
+                }),
+            );
+        });
+        let mut cfg = config();
+        cfg.tty = Some(WindowSize { rows: 24, cols: 80 });
+        cfg.interactive = true;
+        let (st, _) = streams(Some(b"\x1dq"));
+        let mut o = opts();
+        o.escape_keys = true;
+        let out = Session::start(vm, cfg, st, o).unwrap().finish_within(LIMIT);
+        assert_eq!(
+            (out.exit_code, out.killed, out.violation.as_deref()),
+            (143, false, None),
+            "{out:?}"
+        );
+    }
+}
