@@ -13,5 +13,10 @@ pub mod options;
 pub mod protocol;
 pub mod rundir;
 
+#[cfg(target_os = "linux")]
+mod linux;
+
 pub use error::{Error, Result};
+#[cfg(target_os = "linux")]
+pub use linux::*;
 pub use options::{RunOptions, VmmKind};
