@@ -168,6 +168,19 @@ mod tests {
         );
     }
 
+    /// `kiln run` keeps a running VM's scratch disk in `scratch/<run-id>/` (kiln-run's
+    /// rundir); GC never touches it.
+    #[test]
+    fn gc_leaves_run_scratch_directories_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let disk = dir.path().join("scratch/0123456789abcdef/scratch.img");
+        fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        fs::write(&disk, b"disk").unwrap();
+        s.gc().unwrap();
+        assert_eq!(fs::read(&disk).unwrap(), b"disk");
+    }
+
     #[test]
     fn gc_waits_for_shared_holders() {
         let dir = tempfile::tempdir().unwrap();
