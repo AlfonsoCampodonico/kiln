@@ -35,18 +35,22 @@ pub fn connect(events: Sender<Event>) -> Result<Config> {
         .name("control".into())
         .spawn(move || {
             loop {
-                let event = match read_message::<_, HostMessage>(&mut reader) {
-                    Ok(Some(msg)) => Event::Host(msg),
-                    Ok(None) => {
-                        let _ = HOST_FAILED.set("the host closed the control connection".into());
-                        Event::HostClosed
+                let (event, failed) = match read_message::<_, HostMessage>(&mut reader) {
+                    // Caught by the next stage, or by the supervisor during stage 7.
+                    Ok(Some(msg @ HostMessage::Config(_))) => {
+                        (Event::Host(msg), Some("protocol violation: a second Config".into()))
                     }
+                    Ok(Some(msg)) => (Event::Host(msg), None),
+                    Ok(None) => (Event::HostClosed, Some("the host closed the control connection".into())),
                     Err(e) => {
-                        let _ = HOST_FAILED.set(format!("protocol violation: {e}"));
-                        Event::HostError(e)
+                        let why = format!("protocol violation: {e}");
+                        (Event::HostError(e), Some(why))
                     }
                 };
-                let last = !matches!(event, Event::Host(_));
+                let last = failed.is_some();
+                if let Some(why) = failed {
+                    let _ = HOST_FAILED.set(why);
+                }
                 if events.send(event).is_err() || last {
                     return;
                 }

@@ -501,7 +501,11 @@ fn a_symlinked_proc_is_refused(backend: Backend) {
         .init_failed()
         .unwrap_or_else(|| panic!("no InitFailed: {o:?}\n{}", c.tail()));
     assert_eq!(f.stage, 4, "{f:?}");
-    assert!(f.message.contains("the image's /proc is a symlink"), "{f:?}");
+    assert!(
+        f.message
+            .contains("the image's /proc is a symlink; kiln-init refuses it, as runc does"),
+        "{f:?}"
+    );
     assert_eq!(o.exit_code(), EXIT_INFRA);
 }
 
@@ -522,6 +526,23 @@ fn a_broken_host_stops_the_boot_before_the_workload(backend: Backend) {
         .unwrap_or_else(|| panic!("no InitFailed: {o:?}\n{}", c.tail()));
     assert!((3..=6).contains(&f.stage), "{f:?}");
     assert!(f.message.contains("unknown message type 250"), "{f:?}");
+    assert!(!o.running() && o.stdout.is_empty(), "{o:?}");
+
+    // A well-formed second Config is caught the same way, not only at stage 7.
+    let config = sh(&c, "echo should-not-run");
+    let mut raw = Vec::new();
+    for _ in 0..2 {
+        kiln_proto::write_message(&mut raw, &HostMessage::Config(Box::new(config.clone()))).unwrap();
+    }
+    let o = c
+        .start(&fixtures().base, config, Reply::Raw(raw), Vec::new())
+        .finish(END);
+    ended_cleanly(&c, &o);
+    let f = o
+        .init_failed()
+        .unwrap_or_else(|| panic!("no InitFailed: {o:?}\n{}", c.tail()));
+    assert!((3..=6).contains(&f.stage), "{f:?}");
+    assert!(f.message.contains("a second Config"), "{f:?}");
     assert!(!o.running() && o.stdout.is_empty(), "{o:?}");
 }
 

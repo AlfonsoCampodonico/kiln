@@ -35,8 +35,10 @@ fn dev_link(name: &str, target: &str) -> Result<()> {
 }
 
 /// Refuses an image whose `/proc`, `/sys`, `/dev` or `/etc` is a symlink or not a
-/// directory, as runc does: mounting there would follow the link (into init's root,
-/// before the pivot) or fail obscurely. Nothing else runs yet, so the check holds.
+/// directory: mounting there would follow the link (into init's root, before the
+/// pivot) or fail obscurely. runc refuses such a `/proc` and `/sys` too; for `/dev`
+/// and `/etc` the refusal is kiln's own rule (runc resolves symlinks there inside
+/// the rootfs). Nothing else runs yet, so the check holds.
 fn check_mount_points() -> Result<()> {
     use rustix::fs::{AtFlags, CWD, FileType, statat};
     for dir in ["proc", "sys", "dev", "etc"] {
@@ -52,7 +54,12 @@ fn check_mount_points() -> Result<()> {
             _ => "not a directory",
         };
         return Err(Failure::msg(format!(
-            "the image's /{dir} is {what}; kiln-init refuses it, as runc does"
+            "the image's /{dir} is {what}; kiln-init refuses it{}",
+            if matches!(dir, "proc" | "sys") {
+                ", as runc does"
+            } else {
+                ""
+            }
         )));
     }
     Ok(())
