@@ -134,7 +134,8 @@ pub fn run(open_store: impl FnOnce() -> Result<kiln_store::Store>, args: &RunArg
     if let Some(v) = &o.violation {
         eprintln!("kiln: the VM was killed: {}", clean_line(v));
     } else if let Some(f) = &o.init_failed {
-        eprintln!("kiln: {}", f.describe());
+        // describe() is sanitised already; cleaned here too so this file is obviously safe.
+        eprintln!("kiln: {}", clean_line(&f.describe()));
     } else if o.exited.is_none() && !o.killed {
         eprintln!(
             "kiln: the VM ended without reporting the command's exit ({:?})",
@@ -143,8 +144,9 @@ pub fn run(open_store: impl FnOnce() -> Result<kiln_store::Store>, args: &RunArg
     }
     if !report.console_tail.is_empty() {
         eprintln!("kiln: the end of the guest's console:");
+        // Sanitised by console::tail already; cleaned here too (T8).
         for l in &report.console_tail {
-            eprintln!("  | {l}");
+            eprintln!("  | {}", clean_line(l));
         }
     }
     if std::env::var_os("KILN_TIMINGS").is_some_and(|v| v == "1") {
