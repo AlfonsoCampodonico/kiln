@@ -32,6 +32,10 @@ static EXIT: OnceLock<ExitMethod> = OnceLock::new();
 /// failure path write; the latter only tries the lock, so a panic while
 /// sending cannot deadlock.
 static CONTROL: OnceLock<Mutex<Vsock>> = OnceLock::new();
+/// Why the host's side of the control channel failed (a protocol error, or the
+/// host closed it), set by the control reader. Every later stage checks it, so a
+/// broken host stops the boot at the next stage rather than at stage 7.
+static HOST_FAILED: OnceLock<String> = OnceLock::new();
 
 /// What the supervisor waits for (spec §9.6 stage 7).
 #[derive(Debug)]
@@ -87,9 +91,13 @@ fn early() -> Result<()> {
     rustix::system::reboot(RebootCommand::CadOff).context("reboot(CAD_OFF)")
 }
 
-/// Records the stage and reports it once the channel is up.
+/// Records the stage and reports it once the channel is up; fails instead if
+/// the host has broken the protocol or closed the channel.
 fn enter(n: u8) -> Result<()> {
     STAGE.store(n, Ordering::SeqCst);
+    if let Some(why) = HOST_FAILED.get() {
+        return Err(Failure::msg(why.clone()));
+    }
     if n >= 3 {
         send(&GuestMessage::Stage(Stage { n }))?;
     }

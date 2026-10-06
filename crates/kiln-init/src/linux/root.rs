@@ -7,7 +7,7 @@ use rustix::fs::Mode;
 use rustix::io::Errno;
 use rustix::mount::{MountFlags, UnmountFlags, mount};
 
-use crate::error::{Context, Result};
+use crate::error::{Context, Failure, Result};
 
 const ROOT: &str = "/kiln/root";
 
@@ -34,8 +34,33 @@ fn dev_link(name: &str, target: &str) -> Result<()> {
     rustix::fs::symlink(target, path.as_str()).context(format!("symlink /dev/{name}"))
 }
 
+/// Refuses an image whose `/proc`, `/sys`, `/dev` or `/etc` is a symlink or not a
+/// directory, as runc does: mounting there would follow the link (into init's root,
+/// before the pivot) or fail obscurely. Nothing else runs yet, so the check holds.
+fn check_mount_points() -> Result<()> {
+    use rustix::fs::{AtFlags, CWD, FileType, statat};
+    for dir in ["proc", "sys", "dev", "etc"] {
+        let path = format!("{ROOT}/{dir}");
+        let kind = match statat(CWD, path.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => FileType::from_raw_mode(st.st_mode),
+            Err(Errno::NOENT) => continue,
+            Err(e) => return Err(e).context(format!("stat /{dir}")),
+        };
+        let what = match kind {
+            FileType::Directory => continue,
+            FileType::Symlink => "a symlink",
+            _ => "not a directory",
+        };
+        return Err(Failure::msg(format!(
+            "the image's /{dir} is {what}; kiln-init refuses it, as runc does"
+        )));
+    }
+    Ok(())
+}
+
 pub fn pivot() -> Result<()> {
     let hard = MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC;
+    check_mount_points()?;
     // Missing mount points are created in the upper layer.
     mkdir(&format!("{ROOT}/etc"))?;
     mount_at("proc", "/proc", hard, None)?;
