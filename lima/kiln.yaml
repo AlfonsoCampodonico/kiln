@@ -1,0 +1,68 @@
+# kiln on macOS (spec §10): a Linux VM with nested KVM that runs `kiln run`.
+# Needs an Apple M3 or later and macOS 15 or later.
+#   limactl start --name kiln lima/kiln.yaml
+#   limactl shell kiln kiln run <image> [args...]
+# Images converted on macOS stay usable: the macOS store is mounted read-only at
+# /mnt/kiln-store, and KILN_IMPORT_FROM makes `kiln run` import what it lacks
+# (only missing blobs are copied). Create ~/.local/share/kiln on macOS first
+# (`kiln convert` does). The VM keeps its own store and run directories:
+# Unix sockets and flock are not reliable on shared mounts.
+# kiln and vmkit-sandbox go to /usr/local/bin (root-owned: the AppArmor profile
+# below lets that path create user namespaces); until releases exist, build them
+# in the VM and install them there.
+# Ports `kiln run --net -p HOST:GUEST` publishes on the VM's 127.0.0.1 (the
+# default) reach the Mac's localhost: Lima forwards the VM's loopback listeners.
+base: template:ubuntu-26.04
+vmType: vz
+nestedVirtualization: true
+cpus: 4
+memory: 8GiB
+disk: 50GiB
+mounts:
+  - location: "~/.local/share/kiln"
+    mountPoint: /mnt/kiln-store
+    writable: false
+env:
+  KILN_IMPORT_FROM: /mnt/kiln-store
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y curl passt nftables iproute2 uidmap
+      usermod -aG kvm "{{.User}}"
+      # Firecracker 1.17.0 and Cloud Hypervisor 53.0, the versions vmkit is tested with.
+      arch=$(uname -m)
+      case $arch in
+        aarch64)
+          fc_sha=e351ebe4f7a16b5873bbd51005d2e6767103cff4d5ebc829df2d3f95a93e2256
+          ch_asset=cloud-hypervisor-static-aarch64
+          ch_sha=f192b510eea1c710cbc439d716bb0573c223fc463dbe3e6523788a2b7ef62850 ;;
+        x86_64)
+          fc_sha=06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558
+          ch_asset=cloud-hypervisor-static
+          ch_sha=448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc ;;
+      esac
+      work=$(mktemp -d)
+      curl -sfL --retry 3 -o "$work/fc.tgz" \
+        "https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-$arch.tgz"
+      echo "$fc_sha  $work/fc.tgz" | sha256sum -c -
+      tar -xzf "$work/fc.tgz" -C "$work"
+      install -m 0755 "$work/release-v1.17.0-$arch/firecracker-v1.17.0-$arch" /usr/local/bin/firecracker
+      curl -sfL --retry 3 -o "$work/ch" \
+        "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v53.0/$ch_asset"
+      echo "$ch_sha  $work/ch" | sha256sum -c -
+      install -m 0755 "$work/ch" /usr/local/bin/cloud-hypervisor
+      rm -rf "$work"
+      # vmkit's sandbox helper may create user namespaces (Ubuntu restricts them).
+      cat > /etc/apparmor.d/vmkit-sandbox <<'PROFILE'
+      abi <abi/4.0>,
+      include <tunables/global>
+      profile vmkit-sandbox /usr/local/bin/vmkit-sandbox flags=(unconfined) {
+        userns,
+      }
+      PROFILE
+      apparmor_parser -r /etc/apparmor.d/vmkit-sandbox
+      echo 'export KILN_IMPORT_FROM=/mnt/kiln-store' > /etc/profile.d/kiln.sh

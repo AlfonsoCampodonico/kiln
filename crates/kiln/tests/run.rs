@@ -980,6 +980,29 @@ fn persisted_disks_are_reused_and_guarded() {
     assert_eq!(std::fs::metadata(&disk).unwrap().len(), 64 << 20);
 }
 
+/// `KILN_IMPORT_FROM` (spec §10, the Lima template's dev loop): a run in an empty
+/// store imports the image from the other store first.
+#[test]
+fn images_are_imported_from_kiln_import_from() {
+    let Some(f) = fixture() else { return };
+    let other = tempfile::tempdir().unwrap();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_kiln"));
+    c.arg("--store").arg(other.path()).env("KILN_IMPORT_FROM", &f.store);
+    c.args(["run", "--vmm", &f.env.vmm, "--kernel"])
+        .arg(&f.env.kernel)
+        .arg("--allow-custom-kernel")
+        .arg("--init")
+        .arg(&f.env.init)
+        .args(["--allow-custom-init", "busybox", "--", "cat", "/marker"]);
+    let o = c.finish();
+    assert_eq!((code(&o), text(&o.stdout)), (0, "one".into()), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("kiln: imported busybox from"),
+        "{}",
+        text(&o.stderr)
+    );
+}
+
 fn net_enabled() -> bool {
     let on = std::env::var_os("KILN_TEST_NET").is_some_and(|v| v == "1");
     assert!(
