@@ -2,11 +2,21 @@
 //! options, checked before anything boots: valid, and small enough for one
 //! control frame (D-4). Also the device budget (spec §9.7).
 
+use std::net::Ipv4Addr;
+
 use kiln_image::types::Process as ImageProcess;
-use kiln_proto::{Config, ExitMethod, HostMessage, MAX_FRAME, Process, ProtoError, Scratch, WindowSize};
+use kiln_proto::{Config, ExitMethod, HostMessage, MAX_FRAME, Network, Process, ProtoError, Scratch, WindowSize};
 
 use crate::error::{Error, Result};
 use crate::options::RunOptions;
+
+/// The guest's address on vmkit's tap network (spec §9.3; vmkit's `net::GUEST`,
+/// which a Linux test compares).
+pub const GUEST: Ipv4Addr = Ipv4Addr::new(172, 30, 0, 2);
+/// The guest's gateway and DNS server (vmkit's `net::GATEWAY`).
+pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(172, 30, 0, 1);
+/// vmkit's `net::PREFIX`.
+pub const PREFIX: u8 = 30;
 
 /// The run-specific values `Config` needs besides the image and options.
 #[derive(Debug, Clone)]
@@ -61,7 +71,13 @@ pub fn build(image: &ImageProcess, opts: &RunOptions, rt: &Runtime) -> Result<Co
         tty: opts.tty.then(|| rt.window.unwrap_or(WindowSize { rows: 24, cols: 80 })),
         interactive: opts.interactive,
         hostname: rt.hostname.clone(),
-        network: None,
+        // `--net`: vmkit's fixed addressing, with DNS through the gateway.
+        network: opts.net.as_ref().map(|_| Network {
+            address: GUEST,
+            prefix_len: PREFIX,
+            gateway: GATEWAY,
+            dns: vec![GATEWAY],
+        }),
         layers: rt.layers,
         scratch: Scratch {
             size_bytes: rt.scratch_bytes,
@@ -168,11 +184,21 @@ mod tests {
         o.env = vec!["A=2".into(), "HOSTVAR".into(), "UNSET".into()];
         o.tty = true;
         o.interactive = true;
+        o.net = Some(Default::default());
         o.stop_timeout = 3;
         let c = build(&image(), &o, &rt()).unwrap();
         assert_eq!(c.process.argv(), ["/entry", "other", "arg"]);
         assert_eq!(c.process.env, ["A=1", "A=2", "HOSTVAR=hv"]);
         assert_eq!(c.tty, Some(WindowSize { rows: 24, cols: 80 }));
+        assert_eq!(
+            c.network,
+            Some(Network {
+                address: GUEST,
+                prefix_len: 30,
+                gateway: GATEWAY,
+                dns: vec![GATEWAY]
+            })
+        );
         assert_eq!(c.shutdown_grace_secs, 3);
     }
 

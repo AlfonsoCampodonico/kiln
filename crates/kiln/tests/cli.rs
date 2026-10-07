@@ -600,6 +600,29 @@ fn run_refuses_bad_flags_with_125() {
         .assert()
         .code(125)
         .stderr(predicate::str::contains("exclude each other"));
+    for (args, needle) in [
+        (&["run", "-p", "8080:80", "img"][..], "need --net"),
+        (&["run", "--egress", "deny-all", "img"], "need --net"),
+        (&["run", "--net", "--egress", "everything", "img"], "unknown --egress"),
+        (
+            &["run", "--net", "--egress", "open", "--egress", "deny-all", "img"],
+            "two policies",
+        ),
+        (
+            &["run", "--net", "--egress", "allow=10.0.0.0/40", "img"],
+            "not an IPv4 address or CIDR",
+        ),
+        (
+            &["run", "--net", "-p", "8080:80", "-p", "0.0.0.0:8080:81", "img"],
+            "published twice",
+        ),
+    ] {
+        kiln(home.path())
+            .args(args)
+            .assert()
+            .code(125)
+            .stderr(predicate::str::contains(needle));
+    }
 }
 
 /// Usage errors of `kiln run` exit 125, as `docker run`'s do; help and version
@@ -614,6 +637,7 @@ fn run_usage_errors_exit_125() {
         (&["run"], "IMAGE"),
         (&["run", "--bogus", "img"], "--bogus"),
         (&["run", "-e"], "-e"),
+        (&["run", "--net", "-p", "80", "img"], "[ADDRESS:]HOST:GUEST"),
     ] {
         kiln(home.path())
             .args(args)
@@ -667,6 +691,20 @@ fn run_refuses_an_image_without_a_kernel_before_booting() {
         .code(125)
         .stderr(predicate::str::contains("has no kernel layer").and(predicate::str::contains("--allow-custom-kernel")));
     kiln(home.path()).args(["run", "missing"]).assert().code(125);
+    // An egress exception for the host's outbound address is refused before boot
+    // (pasta gives the VM's namespace that address).
+    let outbound = {
+        let s = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        s.connect("192.0.2.1:9").unwrap();
+        s.local_addr().unwrap().ip()
+    };
+    kiln(home.path())
+        .args(["run", "--net", "--egress", &format!("allow={outbound}"), "app"])
+        .assert()
+        .code(125)
+        .stderr(predicate::str::contains(format!(
+            "is the host's own address {outbound}"
+        )));
     // -t -i puts kiln's terminal in raw mode: without one on stdin, a clear error.
     kiln(home.path())
         .args(["run", "-t", "-i", "app"])

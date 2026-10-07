@@ -14,7 +14,7 @@ use super::session::{Handle, Outcome, Session, SessionOptions, Streams};
 use crate::config::{self, Runtime};
 use crate::console::{TAIL_LINES, tail};
 use crate::error::{Error, Result};
-use crate::options::{DEFAULT_DISK, RunOptions, VmmKind};
+use crate::options::{DEFAULT_DISK, Egress, NetOptions, Protocol, RunOptions, VmmKind};
 use crate::persist;
 use crate::prepare::{self, InitLayer};
 use crate::rundir::{self, Identity, RUN_INFO_VERSION, RunDir, RunInfo, ScratchDir, ScratchInfo};
@@ -47,6 +47,32 @@ pub fn exit_method(vmm: &dyn Vmm) -> ExitMethod {
     match vmm.capabilities().guest_exit {
         GuestExit::Reboot => ExitMethod::Reboot,
         GuestExit::Poweroff => ExitMethod::Poweroff,
+    }
+}
+
+/// `--net`'s options as vmkit's (spec §9.3).
+pub fn net_spec(n: &NetOptions) -> NetSpec {
+    use vmkit::net::{Cidr, Egress as E, PortForward, Protocol as P};
+    NetSpec {
+        egress: match n.egress {
+            Egress::Restricted => E::Restricted,
+            Egress::DenyAll => E::DenyAll,
+            Egress::Open => E::Open,
+        },
+        allow: n.allow.iter().filter_map(|c| Cidr::new(c.addr, c.prefix)).collect(),
+        forwards: n
+            .publish
+            .iter()
+            .map(|p| PortForward {
+                protocol: match p.protocol {
+                    Protocol::Tcp => P::Tcp,
+                    Protocol::Udp => P::Udp,
+                },
+                address: p.address,
+                host: p.host,
+                guest: p.guest,
+            })
+            .collect(),
     }
 }
 
@@ -207,6 +233,25 @@ impl Run {
     ) -> Result<Self> {
         let check = || if interrupted() { Err(Error::Interrupted) } else { Ok(()) };
         opts.check()?;
+        let net = opts.net.as_ref().map(net_spec);
+        if let Some(n) = &net {
+            // pasta gives the VM's namespace the host's outbound address, so the guest
+            // can never reach it (finding 4.1): an exception for it alone is refused,
+            // a wider one that includes it is warned about.
+            let outbound = vmkit::net::outbound_address();
+            n.check_allow(outbound.as_slice())
+                .map_err(|e| Error::refused(format!("--egress: {e}")))?;
+            if n.egress == vmkit::net::Egress::Open {
+                notice("warning: --egress open: the guest can reach private networks, the host and cloud metadata");
+            } else if let Some(a) = outbound {
+                for c in n.allow.iter().filter(|c| c.contains(a)) {
+                    notice(&format!(
+                        "warning: --egress allow={c} includes the host's own address {a}, which the guest can never \
+                         reach"
+                    ));
+                }
+            }
+        }
         // Held until the VMM has every blob open (spec §5.2).
         let lock = store.lock_shared()?;
         let prepared = prepare::prepare(
@@ -222,7 +267,12 @@ impl Run {
         }
         let vmm = backend(opts.vmm).discover()?;
         let caps = vmm.capabilities();
-        config::check_devices(prepared.layers.len(), false, caps.available_devices(), vmm.name())?;
+        config::check_devices(
+            prepared.layers.len(),
+            net.is_some(),
+            caps.available_devices(),
+            vmm.name(),
+        )?;
         let limited = vmkit::cgroups_available();
         if !limited {
             notice("warning: no systemd user session for a cgroup: the VM's memory and CPU use are not limited");
@@ -338,7 +388,7 @@ impl Run {
             &prepared.layer_paths,
             opts.cpus,
             opts.memory_mib,
-            None,
+            net,
             &console.fifo,
             &run_dir.path,
         );
@@ -466,6 +516,42 @@ mod tests {
             memory_mib: 512,
             limited,
         }
+    }
+
+    /// kiln's copy of vmkit's fixed addressing (the platform-independent config
+    /// builds the guest's `Config` from it) matches vmkit's.
+    #[test]
+    fn the_guest_addressing_is_vmkits() {
+        assert_eq!(config::GUEST, vmkit::net::GUEST);
+        assert_eq!(config::GATEWAY, vmkit::net::GATEWAY);
+        assert_eq!(config::PREFIX, vmkit::net::PREFIX);
+    }
+
+    #[test]
+    fn net_options_map_onto_vmkit() {
+        use std::net::Ipv4Addr;
+        let mut n = NetOptions::default();
+        let mut set = false;
+        n.add_egress("deny-all", &mut set).unwrap();
+        n.add_egress("allow=10.1.2.3/16", &mut set).unwrap();
+        n.add_egress("allow=192.0.2.7", &mut set).unwrap();
+        n.publish = vec!["8080:80".parse().unwrap(), "0.0.0.0:5353:53/udp".parse().unwrap()];
+        let spec = net_spec(&n);
+        assert_eq!(spec.egress, vmkit::net::Egress::DenyAll);
+        assert_eq!(spec.allow[0].to_string(), "10.1.0.0/16");
+        let f = &spec.forwards;
+        assert_eq!(
+            (f[0].address, f[0].host, f[0].guest, f[0].protocol),
+            (Ipv4Addr::LOCALHOST, 8080, 80, vmkit::net::Protocol::Tcp)
+        );
+        assert_eq!(
+            (f[1].address, f[1].protocol),
+            (Ipv4Addr::UNSPECIFIED, vmkit::net::Protocol::Udp)
+        );
+        // An exception that is only the host's outbound address is refused before boot;
+        // one that includes it still reaches its other addresses.
+        assert!(spec.check_allow(&[Ipv4Addr::new(192, 0, 2, 7)]).is_err());
+        assert!(spec.check_allow(&[Ipv4Addr::new(10, 1, 9, 9)]).is_ok());
     }
 
     /// The VM ended without the guest's final message: the likely causes, and
