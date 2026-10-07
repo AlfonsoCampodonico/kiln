@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.9: 2026-10-06)
-**Status:** Draft rev 2.9, awaiting review
+**Date:** 2026-09-30 (rev 2.10: 2026-10-07)
+**Status:** Draft rev 2.10, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:**
 - `../../../../ROADMAP.md`: the three-repo roadmap (`vmkit`, `kiln`, `potter`).
@@ -72,6 +72,15 @@
   - `console.log` drops its oldest half when it would pass 1 MiB; the VMM writes the console to a FIFO that `kiln` copies (§5.3).
   - Stale run directories from other boots or hosts are left alone and reported in a note; directories kept for debugging (`KILN_KEEP_RUN_DIR=1`) are never cleaned (§5.3).
   - The scratch disk moves out of the run directory, which is usually a tmpfs (`$XDG_RUNTIME_DIR`): its pages would hold the guest's disk in host memory, charged to the VMM's cgroup (`--memory` plus 256 MiB), so a guest writing a few hundred MB had its VMM killed. It lives in a per-run directory on the store's filesystem, `$KILN_HOME/scratch/<run-id>/`, recorded in `run.json` and removed with the run or by the stale cleanup; it carries its own identity (`scratch.json`), so it is cleaned up even after a reboot or logout emptied the run directories; GC never touches it (§5.2, §5.3).
+- **rev 2.10 (2026-10-07):** §5.1, §5.2, §6.5, §8.1, §9.3, §9.4, §9.5, §9.6, §9.7, §10 and §12 aligned with the M3b-2 plan (`docs/superpowers/plans/2026-10-07-m3b2-artifacts-persist-net.md`: pinned artifacts, `--persist`, `--net` and the Lima VM), the controller's rulings 2, 3, 4, 7 and 10, and a field report from a real user of `kiln run`.
+  - `-p [ADDRESS:]HOST:GUEST[/tcp|udp]`: the host address defaults to `127.0.0.1` (Docker's is `0.0.0.0`), so an untrusted image's ports stay on the host unless `-p 0.0.0.0:…` (or another of the host's addresses) says otherwise; vmkit's `PortForward` gains the address. A host port is published once per protocol whatever its addresses. The image owns its listen port: the app must listen on `0.0.0.0` or the guest's address, and a forward to a guest listening on `127.0.0.1` ends at once (§9.3).
+  - Without a network, or with one that names no DNS server, `/etc/resolv.conf` adds `nameserver 127.0.0.1` after its comment, as Docker's `--network none` lists a resolver: lookups fail at once instead of tools refusing to start (§9.6, `docs/format.md`).
+  - pasta copies the host's outbound address (the one on its default route) into the VM's namespace, so the guest can never reach it: an `--egress allow=` entry that is only that address is refused before boot, by `kiln` and by vmkit, and a wider one that includes it is warned about. The host's other addresses can be reached through `allow=` (finding 4.1, §9.3).
+  - `--persist` reuses a disk whose sidecar lists the same app layers in the same order even when the manifest differs (another env or cmd); the sidecar records the new manifest and a note is printed (ruling 2). `--persist-reset` and `--persist-force` exclude each other; a disk without a readable sidecar needs one of them; the disk is locked for the run; it replaces the run's scratch directory and no cleanup touches it; the guest gets 60 s instead of 10 s to end the VM after its final message (§9.4, §9.7).
+  - `kiln gc` keeps every blob the compiled pin table names, and the init layers built from pinned kiln-init binaries with their `cache/init-layers` entries, so offline runs survive it (ruling 3, finding 4.2, §5.2).
+  - A pin names the artifact's blob (the kernel image, the static kiln-init), its repository and size: fetching is one digest-verified blob GET, from the store when it is there. The table ships empty until vmkit's kernel and kiln's kiln-init releases exist (ruling 7). `convert` adds each boot layer whose artifact is pinned for the architecture, independently (a kernel can be pinned before any kiln-init release); without either it makes a provisional image and says what `kiln run` needs, and `inspect` prints a `boot:` line. `config.init` is informational, since `kiln run` always replaces the init layer (finding 4.3) (§5.1, §6.5, §8.1).
+  - The device budget's remedy is `kiln convert --max-layers N` (finding 4.4, §9.7); the config's grace field is `shutdownGraceSecs` (finding 4.5, §9.5).
+  - §10: `KILN_IMPORT_FROM` imports (missing blobs only) and retags on every run when the source store has the name, so the newest convert on macOS wins (ruling 4); ports published on the Lima VM's `127.0.0.1` reach the Mac's `localhost` through Lima's own forwarding.
 ---
 
 ## 1. Goals
@@ -256,8 +265,8 @@ A `kiln` image is an OCI 1.1 artifact.
   - `schemaVersion` (starts at 1)
   - `architecture` (`arm64` | `amd64`)
   - `process`: `entrypoint`, `cmd`, `env`, `workingDir`, `user`, `stopSignal` (all from the source OCI config)
-  - `kernel`: `{ profile, version }`
-  - `init`: `{ version }`
+  - `kernel`: `{ profile, version }`, present with the kernel layer (`kiln run` verifies that layer against the pin for it, §8.1)
+  - `init`: `{ version }`, present with the init layer; informational, since `kiln run` always replaces that layer
   - `source`: `{ manifestDigest, reference? }`. `reference` is present only for registry inputs, normalised (e.g. `docker.io/library/php:8.4-cli`). Local inputs omit it, keeping manifests deterministic.
   - `erofsFormatVersion`
   - There is **no** kernel cmdline field (T4). There is **no** `kiln` version field, so patch releases that produce identical output produce identical digests.
@@ -285,13 +294,14 @@ $KILN_HOME/
   cache/layers-ctx/<src-digest>@<diff-id-hex>@<fmt>@<ctx>  # erofs digest for a layer with inherited parents (§6.3)
   cache/squash/<sha256(ordered erofs digests)>@<fmt>
   cache/warnings/<layer cache key>             # JSON list of the layer's conversion warnings, removed with its cache/layers entry
+  cache/init-layers/<kiln-init digest>@<fmt>   # the init layer built around that kiln-init binary (§6.5)
   tmp/                                        # staging, same filesystem as blobs/
   scratch/<run-id>/                           # a running VM's scratch disk (§5.3), 0700; never touched by GC
 ```
 
 - **Atomic writes:** write to `tmp/`, `fsync`, then `rename`. A cache entry is written only after its blob is committed and verified.
 - **Cache hits** `stat` the target blob. A missing blob counts as a miss.
-- **GC** takes the exclusive lock, marks from `refs.json`, deletes dangling or unreferenced cache entries **before** blobs, then deletes blobs.
+- **GC** takes the exclusive lock, marks from `refs.json` and from the pinned artifacts (every blob the compiled table of §8.1 names, and the init layers built from its kiln-init binaries), deletes dangling or unreferenced cache entries **before** blobs, then deletes blobs. The pinned roots keep runs that need no network working after GC.
 - **`kiln run`** holds the shared lock only during setup. Once the VMM sandbox holds open file descriptors and bind mounts, a GC that deletes a blob cannot affect the running VM on Linux.
 
 ### 5.3 Run state
@@ -379,6 +389,7 @@ The VM's device budget is `max_virtio_devices` minus the fixed devices: the init
    - It is wrapped in a tiny erofs containing `/kiln-init` and the empty directories `/proc`, `/sys`, `/dev` and `/kiln`.
    - Cache key: `kiln-init` digest plus `erofsFormatVersion`.
 2. **Kernel:** fetch `profile@version` for the arch by pinned digest.
+   - Each of the two layers is added when the table pins its artifact for the arch, independently; without either the image is provisional (app layers only), `convert` says what `kiln run` will need, and `inspect` shows a `boot:` line. The library's convert makes provisional images unless asked for the pinned layers; `kiln convert` asks.
 3. **Commit:** write the config, manifest and multi-arch index, then update `refs.json` under the lock.
 
 ### 6.6 Determinism rules
@@ -487,11 +498,13 @@ The per-image limit counts the bytes one conversion decompresses. Layers served 
 ### 8.1 Pinned artifacts and run-time verification (T4)
 
 - `kiln` compiles in a table: `(kind ∈ {kernel, init}, profile/version, arch) → digest`.
+  - A pin names the artifact's blob itself (the kernel image, the static kiln-init binary), the registry repository holding it and its size. Fetching is one blob GET by digest, verified; no tag or manifest is resolved. A blob already in the store is used without contacting the registry.
+  - The table is empty until the first vmkit kernel and kiln kiln-init releases exist; until then every run names `--kernel` and `--init`.
   - Kernels come from `vmkit` releases. `kiln-init` comes from `kiln` releases.
   - Both are also published as OCI artifacts.
 - **At build:** artifacts are fetched and verified against the table.
 - **At run:**
-  - The image's kernel layer digest must equal the pinned digest for the `(profile, version, arch)` in its config.
+  - The image's kernel layer digest must equal the pinned digest for the `(profile, version, arch)` in its config. An image without a kernel layer needs `--kernel`.
   - `--kernel <path>` and `profile: custom` images are refused unless `--allow-custom-kernel` is given; `--init <path>` (a static kiln-init) is refused unless `--allow-custom-init` is given.
   - The image's init layer is **replaced** with the init layer for the pinned `kiln-init` of the running `kiln`. A warning is printed when the image's init layer differs.
   - `inspect` labels `source` as unverified provenance.
@@ -566,11 +579,11 @@ Inside the VM's own net namespace:
   - DNS from the guest to `.1:53` is DNAT'd to pasta's `--dns-forward` address. pasta queries the host's resolver from the host namespace, so loopback stubs such as `127.0.0.53` work.
 - **Egress policy** (`--egress`):
   - **Default `restricted`:** deny `169.254.0.0/16`, `100.64.0.0/10`, RFC 1918, `0.0.0.0/8`, `127.0.0.0/8`, multicast, and the host's own addresses; allow the rest.
-  - `--egress allow=<cidr>`: adds exceptions.
+  - `--egress allow=<cidr>`: adds exceptions (repeatable). pasta copies the host's outbound address (the one on its default route) into the namespace, so the guest can never reach it: an exception that is only that address is refused before boot, and a wider one that includes it is warned about. The host's other addresses can be reached through an exception.
   - `--egress deny-all`: blocks everything except DNS and `allow=` exceptions.
   - `--egress open`: removes the default denies, with a warning.
   - The guest cannot modify the policy; it lives outside the guest.
-- **Port forwarding:** `-p HOST:GUEST[/tcp|udp]` via `pasta` port forwarding plus DNAT to `.2`, on both of pasta's paths: through its interface (prerouting), and spliced from host loopback as a local connection to the namespace's own address (nat output, with `route_localnet` on `tap0`).
+- **Port forwarding:** `-p [ADDRESS:]HOST:GUEST[/tcp|udp]` (repeatable). The host address `pasta` listens on defaults to `127.0.0.1`, so a published port stays on the host unless an address is given (`0.0.0.0` for all); a host port is published once per protocol whatever its addresses, since the namespace sees only the port. The image owns its listen port: the app must listen on `0.0.0.0` or the guest's address, and a forward to a guest listening on `127.0.0.1` ends at once. Forwarding is `pasta` port forwarding plus DNAT to `.2`, on both of pasta's paths: through its interface (prerouting), and spliced from host loopback as a local connection to the namespace's own address (nat output, with `route_localnet` on `tap0`).
 - **Guest addressing** is delivered in the config message (§9.5). The guest configures `eth0` over netlink.
 
 ### 9.4 Scratch disk and `--persist`
@@ -582,8 +595,9 @@ Inside the VM's own net namespace:
 - **In the guest** (§9.6 stage 3): mount with `noinit_itable`, **then** grow online with `EXT4_IOC_RESIZE_FS` on an fd for the mount point.
 - **`--persist <path>`:**
   - The disk lives at `<path>`, with a host-side sidecar `<path>.kiln.json` recording the image manifest digest, the ordered layer digests and the size.
-  - **Different image:** reuse with a different image or layer set is refused unless `--persist-reset` (recreate) or `--persist-force` (accept the risk, with a warning) is given. overlayfs forbids offline lower-layer changes when `xino` is on.
-  - **Size:** the disk is never truncated; a `--disk` smaller than the current size is refused.
+  - **Different layers:** reuse with a different ordered set of app layers is refused unless `--persist-reset` (recreate) or `--persist-force` (accept the risk, with a warning) is given; the two exclude each other. overlayfs forbids offline lower-layer changes when `xino` is on. The same layers under another manifest (a changed env or cmd) are reused: the sidecar records the new manifest, with a note. A disk without a readable sidecar is refused unless reset or forced.
+  - **Size:** the disk is never truncated; a `--disk` smaller than the current size is refused; a larger one grows it.
+  - **One run at a time:** the disk is locked (`flock`) for the run. It replaces the run's scratch directory (§5.3), so no cleanup touches it; symlinks are refused.
   - The host never parses the guest-written ext4.
 
 ### 9.5 Control protocol (`kiln-proto`, normative in `docs/format.md`, T9)
@@ -605,7 +619,7 @@ Inside the VM's own net namespace:
 | Direction | Message | Meaning |
 |---|---|---|
 | guest → host | `Hello { protocol }` | First message. The host replies with `Config` **once per run**. A second `Hello` (e.g. after a guest reset) makes the host kill the VM. |
-| host → guest | `Config { … }` | Process overrides, `stopSignal`, `tty`, `interactive`, `hostname`, network, `layers`, `scratch`, `exitMethod`, `shutdownGrace`. |
+| host → guest | `Config { … }` | Process overrides, `stopSignal`, `tty`, `interactive`, `hostname`, network, `layers`, `scratch`, `exitMethod`, `shutdownGraceSecs`. |
 | guest → host | `Stage { n }` | Progress, for diagnostics. |
 | guest → host | `Running` | Workload started. Ends the boot timeout. |
 | guest → host | `Exited { signaled, code }` | Main process ended. Sent after its stdout and stderr hit EOF. |
@@ -643,7 +657,7 @@ Each stage reports `Stage { n }`. A failure reports `InitFailed` when the contro
    - **No** tmpfs on `/run` or `/tmp`, matching Docker.
    - `pivot_root(".", ".")`, then detach the old root.
 5. **Identity and network:**
-   - Write `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf` as regular files, replacing any symlink at those paths (unlink, then `O_CREAT|O_NOFOLLOW`).
+   - Write `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf` as regular files, replacing any symlink at those paths (unlink, then `O_CREAT|O_NOFOLLOW`). Without a network (or DNS servers), `resolv.conf` names `127.0.0.1`, as Docker's `--network none` does, so lookups fail at once.
    - Bring up `lo`. Configure `eth0` over netlink when there's a network.
 6. **Process:**
    - **User:** resolve `user` against the image's `/etc/passwd` and `/etc/group`. Numeric `uid[:gid]` works without entries.
@@ -662,7 +676,7 @@ Each stage reports `Stage { n }`. A failure reports `InitFailed` when the contro
 ```
 kiln run <ref> [--vmm firecracker|cloud-hypervisor] [--cpus N] [--memory MiB]
                [-i] [-t] [--disk SIZE] [--persist PATH [--persist-reset|--persist-force]]
-               [--net [--egress POLICY]... [-p HOST:GUEST[/proto]]...]
+               [--net [--egress POLICY]... [-p [ADDRESS:]HOST:GUEST[/proto]]...]
                [--env K=V]... [--stop-timeout SECS] [--boot-timeout SECS]
                [--kernel PATH] [--allow-custom-kernel] [--init PATH] [--allow-custom-init] [-- CMD ARGS...]
 ```
@@ -674,7 +688,7 @@ kiln run <ref> [--vmm firecracker|cloud-hypervisor] [--cpus N] [--memory MiB]
   - Second SIGINT: kill the VMM.
 - **The VMM never touches the terminal.** Its stdin is `/dev/null` and the serial console goes to `console.log`. A sanitised tail of `console.log` is printed when the run fails.
 - **`--boot-timeout`** (default 30 s) bounds the time from VMM start to `Running`.
-- **Device budget:** checked before boot (§6.4).
+- **Device budget:** checked before boot; the remedy offered is `kiln convert --max-layers N` (§6.4).
 - **On macOS:** `run` exits with instructions for the Lima template (§10).
 
 ### 9.8 Control protocol growth
@@ -744,7 +758,8 @@ kiln-init is pinned to the kiln release that boots it (§8.1), and potter and `k
 - `lima/kiln.yaml`: `vmType: vz`, `nestedVirtualization: true` (needs an M3 or later and macOS 15 or later), Firecracker, Cloud Hypervisor and `pasta` installed, and the user in the `kvm` group.
 - **The macOS store is mounted read-only** into the VM. The Linux side uses its own local `$KILN_HOME` and its own `$XDG_RUNTIME_DIR`. Unix sockets and flock aren't reliable on Lima shared mounts.
 - **`kiln import --from-store <path> <ref>`** copies an image's blobs into the local store by digest, verifying each one.
-- The template sets `KILN_IMPORT_FROM` to the read-only mount, so `kiln run <ref>` imports missing blobs automatically. Only changed layers are copied.
+- The template sets `KILN_IMPORT_FROM` to the read-only mount, so `kiln run <ref>` imports the image from it whenever that store has the name: only missing blobs are copied, and the image is tagged again every time, so the newest convert on macOS is what runs.
+- Ports published on the VM's `127.0.0.1` (the `-p` default) reach the Mac's `localhost` through Lima's forwarding of loopback listeners; the template needs no `portForwards` entry.
 
 ---
 
@@ -830,7 +845,7 @@ One parametrised suite runs against both backends, using a test guest (the kerne
 | **M1: convert** (planned as **M1a**, `kiln-erofs`, and **M1b**, store, registry, OCI inputs, pipeline and CLI) | `kiln` | `kiln-store`, `kiln-registry`, `kiln-oci`, `kiln-erofs` (writer, reader, profile, semantics, limits), §6.1–6.4 and §6.6, the oracle tests, the hostile-registry tests, and the CLI `convert`/`pull`/`push`/`import`/`inspect`/`ls`/`gc`/`bench`. Output is the app-layer set plus a provisional manifest without kernel and init layers. | No | Done |
 | **M2: vmkit** | `vmkit` | `Vmm` trait (snapshot/restore shapes only), Firecracker and Cloud Hypervisor drivers, `sandbox`, `net` (tap, nftables, `pasta`), `Capabilities`, the kernel profiles pipeline, the contract suite, and the hostile-guest network tests (with the busybox guest). | Yes | Done |
 | **M3a: guest** | `kiln` | `kiln-proto` (protocol version 1), `kiln-init`, the ext4 template, the init layer (§6.5), the guest side of §9, the boot suite on both VMMs, and the control protocol in `docs/format.md`. | Yes | Done (PR #5) |
-| **M3b: run** (planned as **M3b-1**, the runtime and CLI, and **M3b-2**, pinned artifacts, `--persist`, `--net` and Lima) | `kiln` | `kiln run` (§9.7): the host runtime, its CLI flags, host signal handling and console tails; kernel and init layers in images with their pins and run-time verification (§6.5, §8.1); the Lima template (§10). | Yes | Planned (M3b-1: `docs/superpowers/plans/2026-10-06-m3b1-run.md`) |
+| **M3b: run** (planned as **M3b-1**, the runtime and CLI, and **M3b-2**, pinned artifacts, `--persist`, `--net` and Lima) | `kiln` | `kiln run` (§9.7): the host runtime, its CLI flags, host signal handling and console tails; kernel and init layers in images with their pins and run-time verification (§6.5, §8.1); the Lima template (§10). | Yes | Planned (M3b-1: `docs/superpowers/plans/2026-10-06-m3b1-run.md`; M3b-2: `docs/superpowers/plans/2026-10-07-m3b2-artifacts-persist-net.md`) |
 | **M3d: services** | `kiln` | kiln-proto and `kiln-init` `services` (§9.8), as a protocol version bump. Needed by potter P2 (PHP web images). | Yes | Planned |
 | **M3c: build** | `kiln` | `kiln build` backend dispatch: potter, BuildKit, Podman or Buildah (§6). The end-to-end matrix (§11.4), the kernel and init swap tests (§11.5), the release pipeline and the docs (§15). | Yes | Planned |
 | **M3e: build mode** | `kiln` | kiln-proto `Config.mode = Build`, the build-mode messages and `kiln-init` build mode (§9.8), as a protocol version bump. Lands with potter P4 (the VM executor). | Yes | Planned |
