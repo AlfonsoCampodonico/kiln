@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use kiln_run::options::{DEFAULT_CPUS, DEFAULT_MEMORY_MIB, DEFAULT_STOP_TIMEOUT, parse_size};
+use kiln_run::options::{DEFAULT_CPUS, DEFAULT_MEMORY_MIB, DEFAULT_STOP_TIMEOUT, NetOptions, PortSpec, parse_size};
 use kiln_run::{RunOptions, VmmKind};
 
 /// The exit code for errors before the guest runs, as `docker run` uses it.
@@ -41,6 +41,17 @@ pub struct RunArgs {
     /// Reuse the --persist disk although it was used with other layers.
     #[arg(long)]
     persist_force: bool,
+    /// Give the guest a network (eth0, egress through the host).
+    #[arg(long)]
+    net: bool,
+    /// With --net: restricted (the default), deny-all, open, or allow=CIDR (repeatable).
+    #[arg(long, value_name = "POLICY")]
+    egress: Vec<String>,
+    /// With --net: publish a guest port on the host, [ADDRESS:]HOST:GUEST[/tcp|udp]
+    /// (repeatable). The address defaults to 127.0.0.1; 0.0.0.0 publishes it on
+    /// every address.
+    #[arg(short = 'p', long = "publish", value_name = "[ADDRESS:]HOST:GUEST", value_parser = |s: &str| s.parse::<PortSpec>())]
+    publish: Vec<PortSpec>,
     /// KEY=VALUE, or KEY to pass kiln's own value (repeatable).
     #[arg(short, long = "env", value_name = "KEY[=VALUE]")]
     env: Vec<String>,
@@ -69,6 +80,22 @@ pub struct RunArgs {
 
 impl RunArgs {
     pub fn options(&self) -> Result<RunOptions> {
+        let net = if self.net {
+            let mut n = NetOptions {
+                publish: self.publish.clone(),
+                ..NetOptions::default()
+            };
+            let mut policy_set = false;
+            for e in &self.egress {
+                n.add_egress(e, &mut policy_set).map_err(anyhow::Error::msg)?;
+            }
+            Some(n)
+        } else {
+            if !self.egress.is_empty() || !self.publish.is_empty() {
+                anyhow::bail!("--egress and -p need --net");
+            }
+            None
+        };
         let o = RunOptions {
             image: self.image.clone(),
             vmm: self.vmm,
@@ -80,6 +107,7 @@ impl RunArgs {
             persist: self.persist.clone(),
             persist_reset: self.persist_reset,
             persist_force: self.persist_force,
+            net,
             env: self.env.clone(),
             cmd: self.cmd.clone(),
             stop_timeout: self.stop_timeout,

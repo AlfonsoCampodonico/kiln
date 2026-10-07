@@ -365,7 +365,7 @@ fn hostname_hosts_and_resolv_conf_replace_symlinks(backend: Backend) {
         "{out}"
     );
     assert!(
-        out.contains("127.0.1.1\tkiln-guest\n# kiln: this VM has no network\n"),
+        out.contains("127.0.1.1\tkiln-guest\n# kiln: this VM has no network\nnameserver 127.0.0.1\n"),
         "{out}"
     );
     assert!(!out.contains("stale"), "{out}");
@@ -398,6 +398,7 @@ fn networking_from_config(backend: Backend) {
     let net = NetSpec {
         forwards: vec![PortForward {
             protocol: Protocol::Tcp,
+            address: std::net::Ipv4Addr::LOCALHOST,
             host: port,
             guest: 8080,
         }],

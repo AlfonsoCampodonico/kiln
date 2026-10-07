@@ -17,11 +17,14 @@ pub fn hosts(name: &str, network: Option<&Network>) -> String {
     )
 }
 
+/// The guest's resolvers. Without any, `nameserver 127.0.0.1` (as Docker's
+/// `--network none` still lists one): lookups fail at once with "connection
+/// refused" instead of tools refusing to start without a resolver.
 pub fn resolv_conf(network: Option<&Network>) -> String {
     match network {
         Some(n) if !n.dns.is_empty() => n.dns.iter().map(|d| format!("nameserver {d}\n")).collect(),
-        Some(_) => "# kiln: no DNS servers configured\n".to_string(),
-        None => "# kiln: this VM has no network\n".to_string(),
+        Some(_) => "# kiln: no DNS servers configured\nnameserver 127.0.0.1\n".to_string(),
+        None => "# kiln: this VM has no network\nnameserver 127.0.0.1\n".to_string(),
     }
 }
 
@@ -41,10 +44,15 @@ mod tests {
         assert!(hosts("box", None).ends_with("\n127.0.1.1\tbox\n"));
         assert!(hosts("box", None).starts_with("127.0.0.1\tlocalhost\n"));
         assert_eq!(resolv_conf(Some(&net)), "nameserver 172.30.0.1\n");
-        assert!(resolv_conf(None).starts_with('#'));
-        assert!(resolv_conf(None).contains("no network"));
+        assert_eq!(
+            resolv_conf(None),
+            "# kiln: this VM has no network\nnameserver 127.0.0.1\n"
+        );
         let no_dns = Network { dns: vec![], ..net };
-        assert_eq!(resolv_conf(Some(&no_dns)), "# kiln: no DNS servers configured\n");
+        assert_eq!(
+            resolv_conf(Some(&no_dns)),
+            "# kiln: no DNS servers configured\nnameserver 127.0.0.1\n"
+        );
         assert_eq!(hostname("box"), "box\n");
     }
 }

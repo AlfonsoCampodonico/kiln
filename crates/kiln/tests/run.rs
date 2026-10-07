@@ -49,9 +49,9 @@ fn env() -> Option<Env> {
     }
 }
 
-const APPLETS: [&str; 17] = [
-    "cat", "dd", "echo", "env", "grep", "hostname", "id", "kill", "ls", "nc", "sh", "sleep", "stty", "test", "true",
-    "tty", "wc",
+const APPLETS: [&str; 19] = [
+    "cat", "dd", "echo", "env", "grep", "hostname", "httpd", "id", "kill", "ls", "nc", "nslookup", "sh", "sleep",
+    "stty", "test", "true", "tty", "wc",
 ];
 
 /// busybox, its applets, and an extra file `marker` with `content`.
@@ -978,6 +978,175 @@ fn persisted_disks_are_reused_and_guarded() {
     ]);
     assert_eq!(code(&o), 1, "a reset disk is empty: {}", text(&o.stderr));
     assert_eq!(std::fs::metadata(&disk).unwrap().len(), 64 << 20);
+}
+
+fn net_enabled() -> bool {
+    let on = std::env::var_os("KILN_TEST_NET").is_some_and(|v| v == "1");
+    assert!(
+        on || std::env::var_os("KILN_REQUIRE_KVM_TESTS").is_none_or(|v| v != "1"),
+        "KILN_REQUIRE_KVM_TESTS=1 but KILN_TEST_NET is not (needs pasta and nft)"
+    );
+    on
+}
+
+/// The host's primary address (no packet is sent).
+fn host_ip() -> std::net::Ipv4Addr {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    s.connect("1.1.1.1:80").unwrap();
+    match s.local_addr().unwrap().ip() {
+        std::net::IpAddr::V4(a) => a,
+        other => panic!("{other}"),
+    }
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("0.0.0.0:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// What `addr` sends before it closes, once it sends anything (retried while the
+/// guest starts).
+fn read_from(addr: (std::net::Ipv4Addr, u16)) -> String {
+    let until = Instant::now() + BOOT;
+    loop {
+        let mut got = String::new();
+        if let Ok(mut conn) = std::net::TcpStream::connect(addr) {
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = conn.read_to_string(&mut got);
+            if !got.is_empty() {
+                return got;
+            }
+        }
+        assert!(Instant::now() < until, "{addr:?} never answered");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `-p` (spec §9.3, rev 2.10): published on 127.0.0.1 unless an address is given,
+/// so the host's other addresses refuse it; `0.0.0.0` publishes it on all of them.
+/// A guest listening on its own loopback only cannot be reached: the connection
+/// ends at once (the image must listen on 0.0.0.0), it does not hang.
+#[test]
+fn published_ports_bind_to_loopback_unless_told_otherwise() {
+    let Some(f) = fixture() else { return };
+    if !net_enabled() {
+        return;
+    }
+    let (loopback, everywhere, guest_loopback) = (free_port(), free_port(), free_port());
+    let script = "httpd -f -p 127.0.0.1:8080 -h / & \
+                  (while :; do echo hello-from-guest | nc -l -p 8081; done) & \
+                  (while :; do echo hello-everywhere | nc -l -p 8082; done) & \
+                  sleep 1; echo up; sleep 120";
+    let (p0, p1, p2) = (
+        format!("{guest_loopback}:8080"),
+        format!("{loopback}:8081"),
+        format!("0.0.0.0:{everywhere}:8082"),
+    );
+    let mut child = f
+        .run(&[
+            "--net", "-p", &p0, "-p", &p1, "-p", &p2, "busybox", "--", "sh", "-c", script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .start();
+    let out = Captured::spawn(child.stdout.take().unwrap());
+    out.wait_for("up\n", BOOT);
+    let (lo, host) = (std::net::Ipv4Addr::LOCALHOST, host_ip());
+    assert_eq!(read_from((lo, loopback)), "hello-from-guest\n");
+    let refused = std::net::TcpStream::connect((host, loopback)).map(|_| ()).unwrap_err();
+    assert_eq!(
+        refused.kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "{host}: {refused}"
+    );
+    assert_eq!(read_from((host, everywhere)), "hello-everywhere\n");
+    // The guest's 127.0.0.1-only listener: closed or reset quickly, never a hang.
+    let started = Instant::now();
+    let ended = match std::net::TcpStream::connect((lo, guest_loopback)) {
+        Ok(mut conn) => {
+            conn.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let mut buf = Vec::new();
+            match conn.read_to_end(&mut buf) {
+                Ok(_) => buf.is_empty(),
+                Err(e) => matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ),
+            }
+        }
+        Err(e) => e.kind() == std::io::ErrorKind::ConnectionRefused,
+    };
+    assert!(
+        ended,
+        "the connection to a loopback-only guest listener did not end cleanly"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    signal(&child, rustix::process::Signal::TERM);
+    assert_eq!(wait(&mut child, Duration::from_secs(30)), 143, "{}", out.text());
+}
+
+/// T5 and `--egress` (spec §9.3): the host's own address is denied, a public
+/// address is reachable by default, not under deny-all, and again with an
+/// allow= exception (1.1.1.1:80, so this needs the internet). Without `--net`,
+/// lookups fail at once instead of tools lacking a resolver (rev 2.10).
+#[test]
+fn egress_policy_and_the_resolver_without_a_network() {
+    let Some(f) = fixture() else { return };
+    if !net_enabled() {
+        return;
+    }
+    let server = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let hport = server.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in server.incoming().flatten() {
+            let _ = (&c).write_all(b"host\n");
+        }
+    });
+    let probe = |addr: String| format!("nc -w 3 {addr} </dev/null >/dev/null 2>&1 && echo reached || echo blocked");
+    let o = f.output(&[
+        "--net",
+        "busybox",
+        "--",
+        "sh",
+        "-c",
+        &probe(format!("{} {hport}", host_ip())),
+    ]);
+    assert_eq!(text(&o.stdout), "blocked\n", "{}", text(&o.stderr));
+    let public = probe("1.1.1.1 80".into());
+    for (egress, want) in [
+        (&[][..], "reached\n"),
+        (&["--egress", "deny-all"][..], "blocked\n"),
+        (&["--egress", "deny-all", "--egress", "allow=1.1.1.1"][..], "reached\n"),
+    ] {
+        let mut args = vec!["--net"];
+        args.extend_from_slice(egress);
+        args.extend(["busybox", "--", "sh", "-c", &public]);
+        let o = f.output(&args);
+        assert_eq!(text(&o.stdout), want, "{egress:?}: {}", text(&o.stderr));
+    }
+    let o = f.output(&["--net", "--egress", "open", "busybox", "--", "true"]);
+    assert!(
+        text(&o.stderr).contains("warning: --egress open"),
+        "{}",
+        text(&o.stderr)
+    );
+    // No network: a resolver that refuses at once.
+    let o = f.output(&[
+        "busybox",
+        "--",
+        "sh",
+        "-c",
+        "grep nameserver /etc/resolv.conf; nslookup example.com >/dev/null 2>&1; echo rc=$?",
+    ]);
+    assert_eq!(
+        (code(&o), text(&o.stdout)),
+        (0, "nameserver 127.0.0.1\nrc=1\n".into()),
+        "{}",
+        text(&o.stderr)
+    );
 }
 
 /// The scratch disk lives on the store's filesystem, in `$KILN_HOME/scratch/<id>/`
