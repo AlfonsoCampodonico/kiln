@@ -940,6 +940,7 @@ dependencies = [
  "kiln-image",
  "kiln-oci",
  "kiln-proto",
+ "kiln-registry",
  "kiln-store",
  "rustix",
  "serde",

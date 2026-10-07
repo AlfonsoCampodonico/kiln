@@ -1,18 +1,23 @@
 //! Choosing what boots (spec §8.1, T4, §11.5 "kernel and init swap"), without a VM.
-//! This kiln pins no kernel or kiln-init yet, so every kernel and init is the user's.
+//! The compiled table pins nothing yet, so each test passes its own: none, or pins
+//! for blobs it puts in the store or serves from the in-process registry.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use kiln_erofs::testtar::{Opts, TarBuilder};
+use kiln_image::artifacts::{ArtifactKind, Fetcher, INIT_VERSION, Pin, RegistryFetcher};
 use kiln_image::types::{
     InitRef, KILN_ARTIFACT, KILN_CONFIG, KILN_INIT, KILN_KERNEL, KILN_LAYER, KernelRef, KilnConfig,
 };
 use kiln_image::{ConvertOptions, LocalRequest, convert_local, load, resolve_name};
 use kiln_oci::testlayout::{LayoutBuilder, TestLayer};
 use kiln_oci::{Descriptor, ImageIndex, Platform};
+use kiln_registry::DockerConfig;
+use kiln_registry::testregistry::{Config, TestRegistry};
 use kiln_run::RunOptions;
-use kiln_run::prepare::prepare;
-use kiln_store::Store;
+use kiln_run::prepare::{InitLayer, Pins, Prepared, Table};
+use kiln_store::{Digest, Store};
 
 const ARCH: &str = "arm64";
 const INDEX: &str = "application/vnd.oci.image.index.v1+json";
@@ -142,8 +147,54 @@ impl Setup {
     }
 }
 
-fn err(r: kiln_run::Result<kiln_run::prepare::Prepared>) -> String {
+fn err(r: kiln_run::Result<Prepared>) -> String {
     r.map(|_| ()).unwrap_err().to_string()
+}
+
+/// No pins, and a fetcher that must never be asked.
+fn prepare(store: &Store, o: &RunOptions, arch: &str) -> kiln_run::Result<Prepared> {
+    kiln_run::prepare::prepare(store, o, arch, &Table(&[]), &Offline::default())
+}
+
+/// Fails the test's fetch if asked: the store must have answered.
+#[derive(Default)]
+struct Offline(Cell<usize>);
+
+impl Fetcher for Offline {
+    fn fetch(&self, _: &Pin, _: &Store) -> kiln_image::Result<()> {
+        self.0.set(self.0.get() + 1);
+        Err(kiln_image::ImageError::BadOption("offline".into()))
+    }
+}
+
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// The kernel `with_boot_layers` puts in images, pinned as `base` 6.18.54.
+fn kernel_pin(bytes: &[u8]) -> Pin {
+    Pin {
+        kind: ArtifactKind::Kernel,
+        name: "base",
+        version: "6.18.54",
+        arch: ARCH,
+        repository: "127.0.0.1:1/unused",
+        digest: leak(Digest::of(bytes).to_string()),
+        size: bytes.len() as u64,
+    }
+}
+
+/// This build's kiln-init, served by `reg`.
+fn init_pin(reg: &TestRegistry, bytes: &[u8]) -> Pin {
+    Pin {
+        kind: ArtifactKind::Init,
+        name: "kiln-init",
+        version: INIT_VERSION,
+        arch: ARCH,
+        repository: leak(format!("{}/kiln/kiln-init", reg.host())),
+        digest: leak(Digest::of(bytes).to_string()),
+        size: bytes.len() as u64,
+    }
 }
 
 #[test]
@@ -167,7 +218,7 @@ fn a_provisional_image_needs_a_custom_kernel_and_init() {
     let kernel = std::fs::canonicalize(s.files.join("kernel")).unwrap();
     assert_eq!((&p.kernel, p.custom_kernel.as_ref()), (&kernel, Some(&kernel)));
     assert_eq!(p.custom_init, Some(s.files.join("init")));
-    assert!(!p.init_layer.is_empty());
+    assert!(matches!(&p.init, InitLayer::Built(b) if !b.is_empty()));
     assert_eq!(p.layers.len(), 1);
     assert!(p.layer_paths[0].exists());
     assert_eq!(p.warnings.len(), 2, "{:?}", p.warnings);
@@ -179,10 +230,10 @@ fn a_provisional_image_needs_a_custom_kernel_and_init() {
     assert!(err(prepare(&s.store, &o, ARCH)).contains("--init"));
 }
 
-/// T4 without pins: an image's kernel that names a pinned profile cannot be
+/// T4: an image's kernel that names a profile this kiln does not pin cannot be
 /// verified and is refused; `--kernel` replaces it.
 #[test]
-fn an_image_kernel_is_refused_until_kiln_pins_kernels() {
+fn an_image_kernel_kiln_does_not_pin_is_refused() {
     let s = setup();
     s.with_boot_layers("booted", "base", b"\x7fELF the image's init");
     let mut o = RunOptions::new("booted");
@@ -190,7 +241,7 @@ fn an_image_kernel_is_refused_until_kiln_pins_kernels() {
     o.allow_custom_init = true;
     let e = err(prepare(&s.store, &o, ARCH));
     assert!(
-        e.contains("kernel base 6.18.54 for arm64") && e.contains("cannot verify") && e.contains("--kernel PATH"),
+        e.contains("does not pin the kernel base 6.18.54 for arm64") && e.contains("--kernel PATH"),
         "{e}"
     );
     s.custom(&mut o);
@@ -230,8 +281,8 @@ fn the_init_layer_is_always_replaced_with_a_warning_when_it_differs() {
     s.custom(&mut o);
     let p = prepare(&s.store, &o, ARCH).unwrap();
     assert_eq!(
-        p.init_layer,
-        kiln_image::init_layer(b"\x7fELF my own init", &s.store.tmp_dir()).unwrap()
+        p.init,
+        InitLayer::Built(kiln_image::init_layer(b"\x7fELF my own init", &s.store.tmp_dir()).unwrap())
     );
     let replaced: Vec<&String> = p.warnings.iter().filter(|w| w.contains("replaced")).collect();
     assert!(
@@ -338,4 +389,98 @@ fn misplaced_or_unknown_layers_are_refused() {
     }
     // App layers are only of the layer type.
     s.edited("ok", |_, l| assert!(l.iter().all(|d| d.media_type == KILN_LAYER)));
+}
+
+/// T4 with pins: the image's kernel boots when it is the pinned one; the init
+/// layer is the pinned kiln-init's, fetched once by digest and then built once
+/// (`cache/init-layers`); later runs need no registry. Neither is "custom".
+#[test]
+fn the_pinned_kernel_boots_and_the_pinned_init_is_fetched_once() {
+    let s = setup();
+    s.with_boot_layers("booted", "base", b"\x7fELF the image's init");
+    let reg = TestRegistry::start(Config::default());
+    let init = b"\x7fELF the pinned kiln-init".repeat(10);
+    reg.put_blob(&init);
+    let table = [kernel_pin(b"an image's kernel"), init_pin(&reg, &init)];
+    let o = RunOptions::new("booted");
+    let fetcher = RegistryFetcher {
+        config: DockerConfig::anonymous(),
+    };
+    let p = kiln_run::prepare::prepare(&s.store, &o, ARCH, &Table(&table), &fetcher).unwrap();
+    assert_eq!(std::fs::read(&p.kernel).unwrap(), b"an image's kernel");
+    assert_eq!((p.custom_kernel.as_ref(), p.custom_init.as_ref()), (None, None));
+    let InitLayer::Stored(path) = &p.init else {
+        panic!("{:?}", p.init)
+    };
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        kiln_image::init_layer(&init, &s.store.tmp_dir()).unwrap()
+    );
+    assert_eq!(reg.blob_requests("GET"), 1);
+    // The image's own init layer differs: replaced, with one warning and nothing else.
+    assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+    assert!(p.warnings[0].contains("is not the one booting"), "{:?}", p.warnings);
+    // Cached: the second run asks no registry.
+    let offline = Offline::default();
+    let again = kiln_run::prepare::prepare(&s.store, &o, ARCH, &Table(&table), &offline).unwrap();
+    assert_eq!(again.init, p.init);
+    assert_eq!(offline.0.get(), 0);
+}
+
+/// A kernel layer whose digest is not the pinned one is refused (T4), whatever
+/// its config claims; `--kernel` with `--allow-custom-kernel` still boots another.
+#[test]
+fn a_kernel_layer_that_is_not_the_pinned_one_is_refused() {
+    let s = setup();
+    s.with_boot_layers("booted", "base", b"\x7fELF the image's init");
+    let table = [kernel_pin(b"the real kernel")];
+    let mut o = RunOptions::new("booted");
+    o.init = Some(s.files.join("init"));
+    o.allow_custom_init = true;
+    let none = Offline::default();
+    let e = err(kiln_run::prepare::prepare(&s.store, &o, ARCH, &Table(&table), &none));
+    assert!(
+        e.contains("is not the pinned kernel base 6.18.54 for arm64") && e.contains("convert the image again"),
+        "{e}"
+    );
+    s.custom(&mut o);
+    kiln_run::prepare::prepare(&s.store, &o, ARCH, &Table(&table), &none).unwrap();
+}
+
+/// A provisional image converted before the table pinned a kernel: convert it
+/// again (or name a kernel). A pinned kiln-init that cannot be fetched is named.
+#[test]
+fn a_provisional_image_after_kernels_are_pinned_and_an_unreachable_init() {
+    let s = setup();
+    let reg = TestRegistry::start(Config::default());
+    let table = [kernel_pin(b"a kernel"), init_pin(&reg, b"\x7fELF never served")];
+    let none = Offline::default();
+    let mut o = RunOptions::new("app");
+    let e = err(kiln_run::prepare::prepare(&s.store, &o, ARCH, &Table(&table), &none));
+    assert!(
+        e.contains("converted before this kiln pinned a kernel for arm64") && e.contains("convert it again"),
+        "{e}"
+    );
+    o.kernel = Some(s.files.join("kernel"));
+    o.allow_custom_kernel = true;
+    let e = err(kiln_run::prepare::prepare(&s.store, &o, ARCH, &Table(&table), &none));
+    assert!(
+        e.contains(&format!(
+            "fetching the pinned kiln-init kiln-init {INIT_VERSION} for arm64"
+        )),
+        "{e}"
+    );
+    assert_eq!(none.0.get(), 1);
+}
+
+/// The compiled table and a test table answer the same questions.
+#[test]
+fn pins_are_looked_up_by_profile_version_and_arch() {
+    let reg = TestRegistry::start(Config::default());
+    let table = [kernel_pin(b"k"), init_pin(&reg, b"i")];
+    let pins: &dyn Pins = &Table(&table);
+    assert!(pins.kernel("base", "6.18.54", ARCH).is_some());
+    assert!(pins.kernel("base", "6.18.54", "amd64").is_none());
+    assert!(pins.kernel("custom", "6.18.54", ARCH).is_none());
+    assert!(pins.init(ARCH).is_some() && pins.init("amd64").is_none());
 }

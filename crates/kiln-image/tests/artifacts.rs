@@ -142,3 +142,121 @@ fn gc_keeps_pinned_artifacts_and_their_init_layers() {
     assert_eq!(init_layer_blob(&store, &i).unwrap(), layer);
     assert_eq!(offline.0.get(), 0);
 }
+
+mod convert {
+    use super::*;
+    use kiln_image::types::{KILN_INIT, KILN_KERNEL, KILN_LAYER};
+    use kiln_image::{Boot, BootLayers, ConvertOptions, LocalRequest, convert_local, load};
+    use kiln_oci::Platform;
+    use kiln_oci::testlayout::{LayoutBuilder, TestLayer};
+
+    fn layout(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("layout");
+        let mut b = LayoutBuilder::new(&path);
+        let tar = kiln_erofs::testtar::TarBuilder::new()
+            .file("hello", b"hi", &kiln_erofs::testtar::Opts::default())
+            .finish();
+        let desc = b.image(
+            &Platform::parse("linux/arm64").unwrap(),
+            &[TestLayer::tar(tar)],
+            Default::default(),
+        );
+        b.add(desc, Some("app"));
+        b.finish();
+        path
+    }
+
+    fn convert(store: &Store, path: &std::path::Path, boot: BootLayers) -> kiln_image::Output {
+        let platforms = [Platform::parse("linux/arm64").unwrap()];
+        let req = LocalRequest {
+            source_ref: None,
+            platforms: &platforms,
+            tag: Some("t"),
+        };
+        let opts = ConvertOptions {
+            boot,
+            ..Default::default()
+        };
+        convert_local(store, path, &req, &opts).unwrap()
+    }
+
+    fn layer_types(store: &Store, out: &kiln_image::Output) -> Vec<String> {
+        let m = &load(store, &out.digest).unwrap().entries[0].1;
+        m.manifest.layers.iter().map(|l| l.media_type.clone()).collect()
+    }
+
+    #[test]
+    fn pinned_boot_layers_come_first_and_name_their_versions() {
+        let reg = TestRegistry::start(Config::default());
+        let (kernel, init) = (b"a kernel Image".to_vec(), b"\x7fELF kiln-init".to_vec());
+        reg.put_blob(&kernel);
+        reg.put_blob(&init);
+        let mut kpin = pin(&reg, &kernel);
+        (kpin.kind, kpin.name, kpin.version) = (ArtifactKind::Kernel, "base", "6.18.54");
+        let ipin = pin(&reg, &init);
+        let src = tempfile::tempdir().unwrap();
+        let path = layout(src.path());
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let boot = Boot {
+            kernel: Some(kpin.clone()),
+            init: Some(ipin.clone()),
+        };
+        let out = convert(&store, &path, BootLayers::Explicit(boot.clone()));
+        assert_eq!(out.images[0].boot.as_ref(), Some(&boot));
+        // Each fetched once, by digest, into the store.
+        assert_eq!(reg.blob_requests("GET"), 2);
+        assert_eq!(layer_types(&store, &out), [KILN_KERNEL, KILN_INIT, KILN_LAYER]);
+        let m = &load(&store, &out.digest).unwrap().entries[0].1;
+        assert_eq!(m.manifest.layers[0].digest, kpin.digest().unwrap());
+        let init_layer = init_layer_blob(&store, &ipin.digest().unwrap()).unwrap();
+        assert_eq!(m.manifest.layers[1].digest, init_layer);
+        let k = m.config.kernel.as_ref().unwrap();
+        assert_eq!((k.profile.as_str(), k.version.as_str()), ("base", "6.18.54"));
+        assert_eq!(m.config.init.as_ref().unwrap().version, "0.0.0-test");
+    }
+
+    /// A kernel is pinned before any kiln-init is released: the image gets the
+    /// kernel layer alone (and `kiln run` then needs only `--init`).
+    #[test]
+    fn each_boot_layer_is_added_when_it_is_pinned() {
+        let reg = TestRegistry::start(Config::default());
+        let kernel = b"a kernel Image".to_vec();
+        reg.put_blob(&kernel);
+        let mut kpin = pin(&reg, &kernel);
+        (kpin.kind, kpin.name, kpin.version) = (ArtifactKind::Kernel, "base", "6.18.54");
+        let src = tempfile::tempdir().unwrap();
+        let path = layout(src.path());
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let boot = Boot {
+            kernel: Some(kpin),
+            init: None,
+        };
+        let out = convert(&store, &path, BootLayers::Explicit(boot));
+        assert_eq!(layer_types(&store, &out), [KILN_KERNEL, KILN_LAYER]);
+        let m = &load(&store, &out.digest).unwrap().entries[0].1;
+        assert!(m.config.kernel.is_some() && m.config.init.is_none());
+    }
+
+    /// Provisional: no boot layers, as before M3. It is the library's default, and
+    /// what `Pinned` gives while the compiled table pins nothing.
+    #[test]
+    fn provisional_images_have_no_boot_layers() {
+        let src = tempfile::tempdir().unwrap();
+        let path = layout(src.path());
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open(home.path()).unwrap();
+        for boot in [BootLayers::default(), BootLayers::Explicit(Boot::default())] {
+            let out = convert(&store, &path, boot.clone());
+            assert!(out.images[0].boot.is_none(), "{boot:?}");
+            assert_eq!(layer_types(&store, &out), [KILN_LAYER], "{boot:?}");
+            let m = &load(&store, &out.digest).unwrap().entries[0].1;
+            assert!(m.config.kernel.is_none() && m.config.init.is_none());
+        }
+        assert_eq!(BootLayers::default(), BootLayers::Provisional);
+        if kiln_image::artifacts::PINS.is_empty() {
+            assert_eq!(BootLayers::Pinned.for_arch("arm64"), None);
+        }
+    }
+}

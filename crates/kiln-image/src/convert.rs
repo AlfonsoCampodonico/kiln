@@ -11,6 +11,7 @@ use kiln_oci::media::{self, Compression};
 use kiln_oci::{Descriptor, ImageManifest, Platform, ResolvedImage, canonical_json};
 use kiln_store::{CacheKind, Digest, HashingReader, Store, TmpBlob};
 
+use crate::artifacts::{self, Pin, RegistryFetcher};
 use crate::ctx::{ctx_hash, parents_entry, parse_parents};
 use crate::decompress::{Budget, Tripped, layer_limit, open_bounded};
 use crate::error::{ImageError, Result};
@@ -28,6 +29,46 @@ pub struct ConvertOptions {
     pub max_expansion_ratio: u64,
     /// Layers converted in parallel.
     pub jobs: usize,
+    /// Which kernel and init layers to add (spec §6.5).
+    pub boot: BootLayers,
+}
+
+/// The kernel and `kiln-init` an image boots, as pins (spec §8.1). Each is added
+/// when it is pinned: an image may carry the kernel layer before a `kiln-init`
+/// release exists (`kiln run` then needs only `--init`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Boot {
+    pub kernel: Option<Pin>,
+    pub init: Option<Pin>,
+}
+
+/// Which boot layers `convert` adds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BootLayers {
+    /// None: a provisional image. The default, so that library callers and tests
+    /// never fetch boot artifacts unless they ask; `kiln convert` asks for `Pinned`.
+    #[default]
+    Provisional,
+    /// The compiled-in pins (`kiln_image::artifacts::PINS`) for the image's
+    /// architecture: the `base` kernel and this build's `kiln-init`, each when pinned.
+    Pinned,
+    /// These artifacts (tests, and later explicit choices).
+    Explicit(Boot),
+}
+
+impl BootLayers {
+    /// The pins to add for `arch`; `None` when there are none (a provisional image).
+    pub fn for_arch(&self, arch: &str) -> Option<Boot> {
+        let boot = match self {
+            BootLayers::Provisional => return None,
+            BootLayers::Pinned => Boot {
+                kernel: artifacts::kernel_pin(artifacts::KERNEL_PROFILE, artifacts::KERNEL_VERSION, arch).cloned(),
+                init: artifacts::init_pin(arch).cloned(),
+            },
+            BootLayers::Explicit(b) => b.clone(),
+        };
+        (boot.kernel.is_some() || boot.init.is_some()).then_some(boot)
+    }
 }
 
 impl Default for ConvertOptions {
@@ -38,6 +79,7 @@ impl Default for ConvertOptions {
             max_image_bytes: 64 << 30,
             max_expansion_ratio: 200,
             jobs: std::thread::available_parallelism().map_or(4, |n| n.get()),
+            boot: BootLayers::default(),
         }
     }
 }
@@ -81,6 +123,8 @@ pub struct Converted {
     pub layers: Vec<LayerReport>,
     /// How many source layers were merged into the bottom layer (0: no squash).
     pub squashed: usize,
+    /// The kernel and init layers the image carries; `None` for a provisional image.
+    pub boot: Option<Boot>,
 }
 
 /// A layer whose tar is consumed but whose metadata waits for its lowers.
@@ -439,12 +483,33 @@ pub fn convert_image(
         reports = squash_bottom(store, reports, squashed)?;
     }
 
+    // The kernel, then the init layer (spec §5.1), each fetched by its pinned digest.
+    let boot = opts.boot.for_arch(&platform.architecture);
+    let (kernel_pin, init_pin) = boot
+        .as_ref()
+        .map_or((None, None), |b| (b.kernel.as_ref(), b.init.as_ref()));
+    let mut boot_layers = Vec::new();
+    let fetcher = RegistryFetcher::from_env();
+    if let Some(pin) = kernel_pin {
+        let kernel = artifacts::ensure(store, pin, &fetcher)?;
+        boot_layers.push(Descriptor::new(KILN_KERNEL, kernel.clone(), store.blob_size(&kernel)?));
+    }
+    if let Some(pin) = init_pin {
+        let init_bin = artifacts::ensure(store, pin, &fetcher)?;
+        let init = artifacts::init_layer_blob(store, &init_bin)?;
+        boot_layers.push(Descriptor::new(KILN_INIT, init.clone(), store.blob_size(&init)?));
+    }
     let config = KilnConfig {
         schema_version: SCHEMA_VERSION,
         architecture: platform.architecture.clone(),
         process: Process::from_oci(img.config.config.as_ref()),
-        kernel: None,
-        init: None,
+        kernel: kernel_pin.map(|p| KernelRef {
+            profile: p.name.to_string(),
+            version: p.version.to_string(),
+        }),
+        init: init_pin.map(|p| InitRef {
+            version: p.version.to_string(),
+        }),
         source: SourceRef {
             manifest_digest: img.manifest_digest.clone(),
             reference: reference.map(str::to_string),
@@ -458,7 +523,10 @@ pub fn convert_image(
         media_type: Some(media::OCI_MANIFEST.to_string()),
         artifact_type: Some(KILN_ARTIFACT.to_string()),
         config: Descriptor::new(KILN_CONFIG, config_digest, config_bytes.len() as u64),
-        layers: reports.iter().map(layer_descriptor).collect(),
+        layers: boot_layers
+            .into_iter()
+            .chain(reports.iter().map(layer_descriptor))
+            .collect(),
         annotations: None,
     };
     let bytes = canonical_json(&manifest);
@@ -469,6 +537,7 @@ pub fn convert_image(
         manifest_size: bytes.len() as u64,
         layers: reports,
         squashed,
+        boot,
     })
 }
 

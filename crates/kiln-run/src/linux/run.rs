@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use kiln_image::artifacts::RegistryFetcher;
 use kiln_proto::{ExitMethod, GUEST_CID};
 use kiln_store::Store;
 use vmkit::{Backend, Disk, GuestExit, NetSpec, VmSpec, Vmm, VsockSpec};
@@ -14,7 +15,7 @@ use crate::config::{self, Runtime};
 use crate::console::{TAIL_LINES, tail};
 use crate::error::{Error, Result};
 use crate::options::{DEFAULT_DISK, RunOptions, VmmKind};
-use crate::prepare;
+use crate::prepare::{self, InitLayer};
 use crate::rundir::{self, Identity, RUN_INFO_VERSION, RunDir, RunInfo, ScratchDir, ScratchInfo};
 
 /// The kernel command line (spec §8.3); vmkit appends the console and its backend's parameters.
@@ -202,7 +203,13 @@ impl Run {
         opts.check()?;
         // Held until the VMM has every blob open (spec §5.2).
         let lock = store.lock_shared()?;
-        let prepared = prepare::prepare(store, opts, prepare::host_arch())?;
+        let prepared = prepare::prepare(
+            store,
+            opts,
+            prepare::host_arch(),
+            &prepare::CompiledPins,
+            &RegistryFetcher::from_env(),
+        )?;
         check()?;
         for w in &prepared.warnings {
             notice(&format!("warning: {w}"));
@@ -262,8 +269,16 @@ impl Run {
             scratch_dir.keep();
         }
 
-        let init_layer = run_dir.path.join("init.erofs");
-        std::fs::write(&init_layer, &prepared.init_layer)?;
+        // The pinned kiln-init's layer is a blob in the store, opened by the VMM while
+        // the lock is held; one built from --init goes in the run directory.
+        let init_layer = match &prepared.init {
+            InitLayer::Stored(path) => path.clone(),
+            InitLayer::Built(bytes) => {
+                let path = run_dir.path.join("init.erofs");
+                std::fs::write(&path, bytes)?;
+                path
+            }
+        };
         let scratch = scratch_dir.path.join("scratch.img");
         let scratch_bytes = opts.disk.unwrap_or(DEFAULT_DISK);
         kiln_image::scratch::create_scratch(&scratch, scratch_bytes)?;

@@ -24,4 +24,5 @@ vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "4aa0913617
 [dev-dependencies]
 kiln-erofs = { path = "../kiln-erofs" }
 kiln-oci = { path = "../kiln-oci" }
+kiln-registry = { path = "../kiln-registry" }
 tempfile = "3.27.0"
