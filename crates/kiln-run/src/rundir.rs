@@ -12,7 +12,10 @@
 //! behind (kiln was killed) are removed by a later run only when the `run.json`
 //! names this host's boot and hostname and neither kiln nor the VMM it names is
 //! alive: entries from other boots or hosts (a shared `/tmp`) are never touched
-//! ([`Cleanup::foreign`] lists them). `kiln gc` never touches scratch directories.
+//! ([`Cleanup::foreign`] lists them). Scratch directories also carry their own
+//! identity (`scratch.json`), so one whose run directory is gone (a reboot or a
+//! logout emptied the tmpfs) is still removed once its run is over
+//! ([`clean_stale_scratch`]). `kiln gc` never touches scratch directories.
 
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::{Read, Write};
@@ -88,16 +91,22 @@ impl RunDir {
     /// Replaces `run.json` atomically: written and synced to a temporary file,
     /// then renamed over it.
     pub fn write_info(&self, info: &RunInfo) -> Result<()> {
-        let path = self.path.join("run.json");
-        let tmp = self.path.join("run.json.tmp");
-        let _ = std::fs::remove_file(&tmp);
-        let json = serde_json::to_vec_pretty(info).map_err(|e| Error::invalid("run.json", e.to_string()))?;
-        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        f.write_all(&json)?;
-        f.sync_all()?;
-        std::fs::rename(tmp, path)?;
-        Ok(())
+        write_json(&self.path, "run.json", info)
     }
+}
+
+/// Replaces `dir/name` atomically: written and synced to a temporary file, then
+/// renamed over it.
+fn write_json(dir: &Path, name: &'static str, value: &impl Serialize) -> Result<()> {
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{name}.tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    let json = serde_json::to_vec_pretty(value).map_err(|e| Error::invalid(name, e.to_string()))?;
+    let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    f.write_all(&json)?;
+    f.sync_all()?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
 }
 
 impl Drop for RunDir {
@@ -113,19 +122,62 @@ pub const SCRATCH: &str = "scratch";
 
 /// One run's scratch directory, `$KILN_HOME/scratch/<run-id>/` (spec §5.3, rev
 /// 2.9): it holds the scratch disk, on the store's filesystem rather than in the
-/// run directory's tmpfs. Removed when dropped unless kept.
+/// run directory's tmpfs, and its own identity, `scratch.json`
+/// ([`ScratchInfo`]), so it can be cleaned up when its run directory is gone
+/// (the tmpfs was emptied by a reboot or a logout). Removed when dropped unless
+/// kept.
 #[derive(Debug)]
 pub struct ScratchDir {
     pub path: PathBuf,
     keep: bool,
 }
 
+/// `scratch.json`: whose a scratch directory is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScratchInfo {
+    pub version: u32,
+    pub id: String,
+    pub boot_id: String,
+    pub hostname: String,
+    /// The `kiln` process that owns the run.
+    pub kiln: Identity,
+    /// The VMM, once it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vmm: Option<Identity>,
+    /// Kept for debugging (`KILN_KEEP_RUN_DIR=1`): never cleaned up by later runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep: bool,
+}
+
+impl From<&RunInfo> for ScratchInfo {
+    fn from(r: &RunInfo) -> Self {
+        Self {
+            version: RUN_INFO_VERSION,
+            id: r.id.clone(),
+            boot_id: r.boot_id.clone(),
+            hostname: r.hostname.clone(),
+            kiln: r.kiln,
+            vmm: r.vmm,
+            keep: r.keep,
+        }
+    }
+}
+
 impl ScratchDir {
-    /// A fresh directory `<base>/<id>` (see [`scratch_base`]), mode 0700.
-    pub fn create(base: &Path, id: &str) -> Result<Self> {
-        let path = base.join(id);
+    /// A fresh directory `<base>/<id>` (see [`scratch_base`]), mode 0700, with its
+    /// identity written at once.
+    pub fn create(base: &Path, info: &ScratchInfo) -> Result<Self> {
+        let path = base.join(&info.id);
         dir_builder().create(&path)?;
-        Ok(Self { path, keep: false })
+        let dir = Self { path, keep: false };
+        dir.write_info(info)?;
+        Ok(dir)
+    }
+
+    /// Replaces `scratch.json` atomically (once the VMM's identity is known).
+    pub fn write_info(&self, info: &ScratchInfo) -> Result<()> {
+        write_json(&self.path, "scratch.json", info)
     }
 
     /// Leaves the directory in place (`KILN_KEEP_RUN_DIR=1`).
@@ -273,20 +325,35 @@ pub struct Cleanup {
 }
 
 impl Cleanup {
-    /// The note for the user about directories left alone (spec §5.3), if any.
+    /// The note for the user about run directories left alone (spec §5.3), if any.
     pub fn notice(&self, base: &Path) -> Option<String> {
+        self.note(base, "run", "belong", "to another boot or host")
+    }
+
+    /// The note for the user about scratch directories left alone, if any.
+    pub fn scratch_notice(&self, base: &Path) -> Option<String> {
+        self.note(
+            base,
+            "scratch",
+            "belong",
+            "to another host or have no identity kiln can read",
+        )
+    }
+
+    fn note(&self, base: &Path, what: &str, verb: &str, whose: &str) -> Option<String> {
         if self.foreign.is_empty() {
             return None;
         }
         let mut names = self.foreign.clone();
         names.sort();
+        let one = names.len() == 1;
         Some(format!(
-            "note: {} run director{} in {} belong{} to another boot or host and {} left alone: {}",
+            "note: {} {what} director{} in {} {verb}{} {whose} and {} left alone: {}",
             names.len(),
-            if names.len() == 1 { "y" } else { "ies" },
+            if one { "y" } else { "ies" },
             base.display(),
-            if names.len() == 1 { "s" } else { "" },
-            if names.len() == 1 { "was" } else { "were" },
+            if one { "s" } else { "" },
+            if one { "was" } else { "were" },
             names.join(", ")
         ))
     }
@@ -331,6 +398,70 @@ pub fn clean_stale(base: &Path, boot_id: &str, hostname: &str, alive: impl Fn(&I
             .as_deref()
             .is_none_or(|s| remove_scratch(Path::new(s), &info.id, uid))
         {
+            continue;
+        }
+        if std::fs::remove_dir_all(entry.path()).is_ok() {
+            report.removed.push(name);
+        }
+    }
+    report
+}
+
+/// How long a scratch directory without a readable `scratch.json` is assumed to
+/// be one a run is creating right now.
+pub const SCRATCH_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Removes scratch directories under `base` (`$KILN_HOME/scratch`) whose runs are
+/// over, whether or not their run directories still exist (a reboot or a logout
+/// empties the run directories' tmpfs). A directory is removed when its
+/// `scratch.json` names this host and either another boot (every process of that
+/// boot is gone) or this boot with kiln and the VMM it names both dead, unless it
+/// was kept. Only real directories of this user's are considered, and
+/// `scratch.json` is never read through a symlink. Directories of other hosts (a
+/// store shared over NFS), and those whose `scratch.json` cannot be read once
+/// they are older than [`SCRATCH_GRACE`], are left alone and reported; younger
+/// ones may be a run that is being set up, and are skipped.
+pub fn clean_stale_scratch(
+    base: &Path,
+    boot_id: &str,
+    hostname: &str,
+    alive: impl Fn(&Identity) -> bool,
+    now: std::time::SystemTime,
+) -> Cleanup {
+    use std::os::unix::fs::MetadataExt;
+    let uid = rustix::process::getuid().as_raw();
+    let mut report = Cleanup::default();
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return report;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.uid() != uid {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let info = read_run_json(&entry.path().join("scratch.json"))
+            .and_then(|b| serde_json::from_slice::<ScratchInfo>(&b).ok())
+            .filter(|i| i.version == RUN_INFO_VERSION && i.id == name);
+        let Some(info) = info else {
+            let young = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_none_or(|age| age < SCRATCH_GRACE);
+            if !young {
+                report.foreign.push(name);
+            }
+            continue;
+        };
+        if info.hostname != hostname || boot_id.is_empty() {
+            report.foreign.push(name);
+            continue;
+        }
+        let over = info.boot_id != boot_id || !(alive(&info.kiln) || info.vmm.as_ref().is_some_and(&alive));
+        if info.keep || !over {
             continue;
         }
         if std::fs::remove_dir_all(entry.path()).is_ok() {
@@ -499,7 +630,7 @@ mod tests {
             std::fs::write(base.path().join(&i.id).join("run.json"), serde_json::to_vec(i).unwrap()).unwrap();
         };
         let with_scratch = |i: RunInfo| {
-            let s = ScratchDir::create(&scratch, &i.id).unwrap();
+            let s = ScratchDir::create(&scratch, &ScratchInfo::from(&i)).unwrap();
             std::fs::write(s.path.join("scratch.img"), b"disk").unwrap();
             let mut s = s;
             s.keep();
@@ -545,11 +676,95 @@ mod tests {
         assert!(scratch_base(store.path()).is_err());
         // A scratch directory is removed when dropped.
         std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let s = ScratchDir::create(&scratch, "x").unwrap();
+        let x = ScratchInfo::from(&info("x", "b", "h", 1));
+        let s = ScratchDir::create(&scratch, &x).unwrap();
         let path = s.path.clone();
-        assert!(ScratchDir::create(&scratch, "x").is_err(), "a run id is never reused");
+        assert!(ScratchDir::create(&scratch, &x).is_err(), "a run id is never reused");
         drop(s);
         assert!(!path.exists());
+    }
+
+    /// Scratch directories are swept by their own identity, with or without a run
+    /// directory: another boot of this host, or this boot with kiln and the VMM
+    /// dead, is removed; a live run's, a kept one, another host's and one being
+    /// created stay, and those that cannot be identified are reported.
+    #[test]
+    fn scratch_directories_are_swept_by_their_own_identity() {
+        use std::time::{Duration, SystemTime};
+        let store = tempfile::tempdir().unwrap();
+        let scratch = scratch_base(store.path()).unwrap();
+        let mk = |i: RunInfo, vmm: Option<u32>| {
+            let mut s = ScratchDir::create(&scratch, &ScratchInfo::from(&i)).unwrap();
+            if let Some(pid) = vmm {
+                s.write_info(&ScratchInfo {
+                    vmm: Some(Identity { pid, start_time: 1 }),
+                    ..ScratchInfo::from(&i)
+                })
+                .unwrap();
+            }
+            std::fs::write(s.path.join("scratch.img"), b"disk").unwrap();
+            s.keep();
+        };
+        // Live pids are 2 and 3; every other pid is dead.
+        mk(info("dead", "b", "h", 1), None);
+        mk(info("dead-vmm-too", "b", "h", 1), Some(4));
+        mk(info("old-boot", "b0", "h", 2), Some(3));
+        mk(info("live", "b", "h", 2), None);
+        mk(info("live-vmm", "b", "h", 1), Some(3));
+        mk(
+            RunInfo {
+                keep: true,
+                ..info("kept", "b", "h", 1)
+            },
+            None,
+        );
+        mk(info("other-host", "b", "h2", 1), None);
+        // Being created (no identity yet), and old with an unreadable identity.
+        std::fs::create_dir(scratch.join("creating")).unwrap();
+        std::fs::create_dir(scratch.join("unknown")).unwrap();
+        std::fs::write(scratch.join("unknown/scratch.json"), b"{").unwrap();
+        // Not directories: left alone, not reported.
+        std::fs::write(scratch.join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink(store.path(), scratch.join("link")).unwrap();
+        let alive = |id: &Identity| id.pid == 2 || id.pid == 3;
+
+        let now = SystemTime::now();
+        let mut r = clean_stale_scratch(&scratch, "b", "h", alive, now);
+        r.removed.sort();
+        r.foreign.sort();
+        assert_eq!(r.removed, ["dead", "dead-vmm-too", "old-boot"]);
+        assert_eq!(r.foreign, ["other-host"], "the young unidentified ones are skipped");
+        for kept in [
+            "live",
+            "live-vmm",
+            "kept",
+            "other-host",
+            "creating",
+            "unknown",
+            "file",
+            "link",
+        ] {
+            assert!(scratch.join(kept).symlink_metadata().is_ok(), "{kept}");
+        }
+        assert!(store.path().join("scratch").exists());
+
+        // A minute later the unidentified ones are reported, never removed.
+        let later = now + SCRATCH_GRACE + Duration::from_secs(1);
+        let mut r = clean_stale_scratch(&scratch, "b", "h", alive, later);
+        r.foreign.sort();
+        assert!(r.removed.is_empty(), "{r:?}");
+        assert_eq!(r.foreign, ["creating", "other-host", "unknown"]);
+        assert_eq!(
+            r.scratch_notice(Path::new("/s")).unwrap(),
+            "note: 3 scratch directories in /s belong to another host or have no identity kiln can read and \
+             were left alone: creating, other-host, unknown"
+        );
+        // Without a boot id nothing is judged.
+        assert!(
+            clean_stale_scratch(&scratch, "", "h", |_| false, now)
+                .removed
+                .is_empty()
+        );
     }
 
     #[test]

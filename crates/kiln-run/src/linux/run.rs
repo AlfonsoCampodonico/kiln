@@ -15,7 +15,7 @@ use crate::console::{TAIL_LINES, tail};
 use crate::error::{Error, Result};
 use crate::options::{DEFAULT_DISK, RunOptions, VmmKind};
 use crate::prepare;
-use crate::rundir::{self, Identity, RUN_INFO_VERSION, RunDir, RunInfo, ScratchDir};
+use crate::rundir::{self, Identity, RUN_INFO_VERSION, RunDir, RunInfo, ScratchDir, ScratchInfo};
 
 /// The kernel command line (spec §8.3); vmkit appends the console and its backend's parameters.
 pub const CMDLINE: [&str; 7] = [
@@ -221,13 +221,25 @@ impl Run {
         if let Some(note) = cleanup.notice(&base) {
             notice(&note);
         }
+        // On the store's filesystem, not the run directory's tmpfs (spec §5.3, rev 2.9).
+        // Those whose run directories are gone (a reboot or a logout emptied them) are
+        // swept by their own identity.
+        let scratch_base = rundir::scratch_base(store.root())?;
+        let swept = rundir::clean_stale_scratch(
+            &scratch_base,
+            &boot_id,
+            &hostname,
+            rundir::alive,
+            std::time::SystemTime::now(),
+        );
+        if let Some(note) = swept.scratch_notice(&scratch_base) {
+            notice(&note);
+        }
         let mut run_dir = RunDir::create(&base)?;
         let keep = std::env::var_os("KILN_KEEP_RUN_DIR").is_some_and(|v| v == "1");
         if keep {
             run_dir.keep();
         }
-        // On the store's filesystem, not the run directory's tmpfs (spec §5.3, rev 2.9).
-        let scratch_base = rundir::scratch_base(store.root())?;
         let scratch_path = scratch_base.join(&run_dir.id);
         let mut info = RunInfo {
             version: RUN_INFO_VERSION,
@@ -245,7 +257,7 @@ impl Run {
         };
         // Recorded before it exists, so a stale cleanup always knows of it.
         run_dir.write_info(&info)?;
-        let mut scratch_dir = ScratchDir::create(&scratch_base, &run_dir.id)?;
+        let mut scratch_dir = ScratchDir::create(&scratch_base, &ScratchInfo::from(&info))?;
         if keep {
             scratch_dir.keep();
         }
@@ -290,6 +302,7 @@ impl Run {
             );
         }
         run_dir.write_info(&info)?;
+        scratch_dir.write_info(&ScratchInfo::from(&info))?;
         drop(lock);
         // Dropping the VM kills it; the run's directories go with `run_dir` and `scratch_dir`.
         check()?;
