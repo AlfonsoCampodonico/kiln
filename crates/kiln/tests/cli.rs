@@ -48,7 +48,12 @@ fn convert_ls_inspect_gc_import() {
         .arg(&path)
         .assert()
         .success()
-        .stdout(predicate::str::contains("app:latest → sha256:"));
+        .stdout(predicate::str::contains("app:latest → sha256:"))
+        // The table pins nothing yet: a provisional image, and what `kiln run` needs for it.
+        .stderr(predicate::str::contains(
+            "note: this kiln pins no kernel or kiln-init for arm64 yet, so the image has no kernel or \
+             kiln-init layers; `kiln run` needs --kernel and --init for it",
+        ));
     kiln(home.path())
         .args(["ls"])
         .assert()
@@ -61,7 +66,10 @@ fn convert_ls_inspect_gc_import() {
         .stdout(
             predicate::str::contains("cmd:        php")
                 .and(predicate::str::contains("env:        A=1"))
-                .and(predicate::str::contains("unverified provenance")),
+                .and(predicate::str::contains("unverified provenance"))
+                .and(predicate::str::contains(
+                    "boot:       none (a provisional image: run it with --kernel and --init)",
+                )),
         );
     let json = kiln(home.path())
         .args(["inspect", "--json", "app:latest"])

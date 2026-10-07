@@ -12,8 +12,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use kiln_image::ImageError;
 use kiln_image::{
-    ConvertOptions, LocalRequest, Output, RegistryRequest, convert_local, convert_registry, import_image, load,
-    pull_image, push_image, resolve_name,
+    BootLayers, ConvertOptions, LocalRequest, Output, RegistryRequest, convert_local, convert_registry, import_image,
+    load, pull_image, push_image, resolve_name,
 };
 use kiln_oci::{OciError, Platform};
 use kiln_registry::{Client, DockerConfig, Reference, RegistryError};
@@ -49,6 +49,8 @@ impl ConvertArgs {
     fn options(&self) -> ConvertOptions {
         let mut o = ConvertOptions {
             max_layers: self.max_layers,
+            // The pinned kernel and kiln-init (spec §6.5), fetched by digest.
+            boot: BootLayers::Pinned,
             ..Default::default()
         };
         if let Some(j) = self.jobs {
@@ -281,6 +283,51 @@ fn human_size(n: u64) -> String {
     }
 }
 
+/// What `kiln run` will need for an image `convert` made without some boot layer
+/// (the table pins no kernel or kiln-init for its architecture yet).
+fn boot_note(c: &kiln_image::Converted) -> Option<String> {
+    let b = c.boot.clone().unwrap_or_default();
+    let missing: Vec<(&str, &str)> = [
+        ("kernel", "--kernel", b.kernel.is_none()),
+        ("kiln-init", "--init", b.init.is_none()),
+    ]
+    .into_iter()
+    .filter(|m| m.2)
+    .map(|m| (m.0, m.1))
+    .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = missing.iter().map(|m| m.0).collect();
+    let flags: Vec<&str> = missing.iter().map(|m| m.1).collect();
+    Some(format!(
+        "this kiln pins no {} for {} yet, so the image has no {} layer{}; `kiln run` needs {} for it",
+        names.join(" or "),
+        clean_line(&c.platform.architecture),
+        names.join(" or "),
+        if missing.len() > 1 { "s" } else { "" },
+        flags.join(" and ")
+    ))
+}
+
+/// `inspect`'s boot line: the kernel and kiln-init an image names (spec §8.1).
+fn boot_line(config: &kiln_image::types::KilnConfig) -> String {
+    let kernel = config
+        .kernel
+        .as_ref()
+        .map(|k| format!("kernel {} {}", clean_line(&k.profile), clean_line(&k.version)));
+    let init = config
+        .init
+        .as_ref()
+        .map(|i| format!("kiln-init {}", clean_line(&i.version)));
+    match (kernel, init) {
+        (Some(k), Some(i)) => format!("{k}, {i}"),
+        (Some(k), None) => format!("{k}, no init layer (run it with --init)"),
+        (None, Some(i)) => format!("{i}, no kernel layer (run it with --kernel)"),
+        (None, None) => "none (a provisional image: run it with --kernel and --init)".to_string(),
+    }
+}
+
 fn convert_summary(out: &Output, tag: &str) -> serde_json::Value {
     json!({
         "tag": tag,
@@ -292,6 +339,10 @@ fn convert_summary(out: &Output, tag: &str) -> serde_json::Value {
             "platform": c.platform.to_string(),
             "manifest": c.manifest_digest.to_string(),
             "squashed": c.squashed,
+            "boot": c.boot.as_ref().map(|b| json!({
+                "kernel": b.kernel.as_ref().map(|k| format!("{}@{}", k.name, k.version)),
+                "init": b.init.as_ref().map(|i| i.version),
+            })),
             "layers": c.layers.iter().map(|l| json!({
                 "erofs": l.erofs.to_string(),
                 "size": l.size,
@@ -351,6 +402,11 @@ fn run(cli: Cli) -> Result<()> {
                     })?
                 }
             };
+            for c in &out.images {
+                if let Some(note) = boot_note(c) {
+                    eprintln!("note: {note}");
+                }
+            }
             if *json {
                 println!("{}", serde_json::to_string_pretty(&convert_summary(&out, &tag))?);
                 return Ok(());
@@ -475,6 +531,7 @@ fn run(cli: Cli) -> Result<()> {
                     "  source:     {}{reference} (unverified provenance)",
                     m.config.source.manifest_digest
                 );
+                println!("  boot:       {}", boot_line(&m.config));
                 println!("  layers:");
                 for l in &m.manifest.layers {
                     let inherits = if l.annotation(kiln_image::types::ANN_INHERITS).is_some() {

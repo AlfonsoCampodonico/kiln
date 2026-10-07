@@ -15,7 +15,7 @@ mod registry;
 pub mod scratch;
 pub mod types;
 
-pub use convert::{ConvertOptions, Converted, LayerReport, LayerSource, StoredLayers, convert_image};
+pub use convert::{Boot, BootLayers, ConvertOptions, Converted, LayerReport, LayerSource, StoredLayers, convert_image};
 pub use error::{ImageError, Result};
 pub use import::{ImportReport, import_image};
 pub use init::init_layer;

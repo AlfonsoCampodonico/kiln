@@ -709,8 +709,8 @@ fn with_boot_layers(store: &kiln_store::Store, from: &str, tag: &str, kernel: &P
     store.set_ref(tag, &manifest).unwrap();
 }
 
-/// An image with boot layers (spec §8.1, §11.5): a `base` kernel is refused while
-/// kiln pins no kernel, a `custom` one boots with --allow-custom-kernel, and the
+/// An image with boot layers (spec §8.1, §11.5): a `base` kernel this kiln does
+/// not pin is refused, a `custom` one boots with --allow-custom-kernel, and the
 /// image's init layer never boots (here it wraps busybox, which cannot be kiln's
 /// PID 1): it is replaced, with a warning.
 #[test]
@@ -733,7 +733,7 @@ fn image_boot_layers_are_verified_and_init_replaced() {
     let o = run(&["--allow-custom-kernel", "pinned"]);
     assert_eq!(code(&o), 125);
     assert!(
-        text(&o.stderr).contains("kernel base 6.18.54") && text(&o.stderr).contains("cannot verify"),
+        text(&o.stderr).contains("does not pin the kernel base 6.18.54"),
         "{}",
         text(&o.stderr)
     );
@@ -741,6 +741,66 @@ fn image_boot_layers_are_verified_and_init_replaced() {
     assert_eq!(code(&o), 125);
     assert!(text(&o.stderr).contains("boots a custom kernel"), "{}", text(&o.stderr));
     let o = run(&["--allow-custom-kernel", "custom"]);
+    assert_eq!((code(&o), text(&o.stdout)), (0, "ran\n".into()), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("init layer") && text(&o.stderr).contains("replaced"),
+        "{}",
+        text(&o.stderr)
+    );
+}
+
+/// The boot layers `convert` adds (spec §6.5), from pins for the test kernel and,
+/// as the image's "kiln-init", busybox: the image runs with the custom flags, and
+/// its init layer is replaced.
+#[test]
+fn converted_boot_layers_are_replaced_or_refused_at_run() {
+    let Some(f) = fixture() else { return };
+    use kiln_image::artifacts::{ArtifactKind, Pin};
+    use kiln_image::{Boot, BootLayers, ConvertOptions, LocalRequest, convert_local};
+    let store = kiln_store::Store::open(&f.store).unwrap();
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let put = |path: &Path, kind, name, version| {
+        let bytes = std::fs::read(path).unwrap();
+        let d = store.put_bytes(&bytes).unwrap();
+        Pin {
+            kind,
+            name,
+            version,
+            arch: leak(Platform::host().architecture),
+            repository: "127.0.0.1:1/unused",
+            digest: leak(d.to_string()),
+            size: bytes.len() as u64,
+        }
+    };
+    let boot = Boot {
+        kernel: Some(put(&f.env.kernel, ArtifactKind::Kernel, "base", "6.18.54")),
+        init: Some(put(&f.env.busybox, ArtifactKind::Init, "kiln-init", "0.0.1")),
+    };
+    let layout = f._dirs[0].path().join("busybox");
+    let platforms = [Platform::host()];
+    let req = LocalRequest {
+        source_ref: None,
+        platforms: &platforms,
+        tag: Some("booted"),
+    };
+    let opts = ConvertOptions {
+        boot: BootLayers::Explicit(boot),
+        ..Default::default()
+    };
+    convert_local(&store, &layout, &req, &opts).unwrap();
+    let o = f
+        .kiln()
+        .args(["run", "--vmm", &f.env.vmm, "--init"])
+        .arg(&f.env.init)
+        .args(["--allow-custom-init", "booted", "--", "true"])
+        .finish();
+    assert_eq!(code(&o), 125);
+    assert!(
+        text(&o.stderr).contains("does not pin the kernel base 6.18.54"),
+        "{}",
+        text(&o.stderr)
+    );
+    let o = f.output(&["booted", "--", "echo", "ran"]);
     assert_eq!((code(&o), text(&o.stdout)), (0, "ran\n".into()), "{}", text(&o.stderr));
     assert!(
         text(&o.stderr).contains("init layer") && text(&o.stderr).contains("replaced"),
