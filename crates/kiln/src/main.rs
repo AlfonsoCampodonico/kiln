@@ -521,8 +521,9 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Gc => {
             // Source OCI blobs are not referenced by kiln images, so GC frees them;
-            // a later convert re-verifies them from the source.
-            let r = open_store(&cli)?.gc()?;
+            // a later convert re-verifies them from the source. Pinned kernels and
+            // kiln-init stay, so cached runs keep working offline (spec §5.2).
+            let r = open_store(&cli)?.gc_with_roots(kiln_image::artifacts::gc_roots)?;
             println!(
                 "removed {} blobs ({}) and {} cache entries",
                 r.blobs_removed,

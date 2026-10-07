@@ -44,11 +44,14 @@ An OCI image manifest (`mediaType` `application/vnd.oci.image.manifest.v1+json`,
 
 ### Local store (informative)
 
-`$KILN_HOME` (default `~/.local/share/kiln`) holds `blobs/sha256/<hex>`, `refs.json` (`{"refs": {"<name>": "<digest>"}}`), and four caches of small text files. Each entry is written only after the layer it describes has been verified and committed:
+`$KILN_HOME` (default `~/.local/share/kiln`) holds `blobs/sha256/<hex>`, `refs.json` (`{"refs": {"<name>": "<digest>"}}`), and five caches of small text files. Each entry is written only after the layer it describes has been verified and committed:
 - `cache/layers/<source layer digest>@<hex diff_id>@<format version>`: `erofs <digest>` for a layer that depends only on its tar, or `parents <JSON list of hex-encoded implicit paths>`.
 - `cache/layers-ctx/<source layer digest>@<hex diff_id>@<format version>@<ctx>`: the erofs digest for a layer with implicit parents. `ctx` is the hex SHA-256 of the JSON list, in implicit-path order, of `[hex(path), null]` (absent in the lowers, or not a directory) or `[hex(path), [mode, uid, gid, mtime_sec, mtime_nsec, [[xattr_index, hex(name), hex(value)], …]]]`.
 - `cache/squash/<hex SHA-256 of the newline-joined erofs digests>@<format version>`: a squashed bottom layer.
 - `cache/warnings/<layer cache key>`: the JSON list of warnings converting that layer produced, so a cache hit reports them too. Removed by GC together with the `cache/layers/` entry of the same name.
+- `cache/init-layers/<kiln-init binary digest>@<format version>`: the digest of the init layer built around that `kiln-init` binary (see Init layer below).
+
+GC keeps every blob reachable from `refs.json`, and also kiln's pinned boot artifacts (the kernel and `kiln-init` blobs its compiled table names) with the init layers built from the pinned `kiln-init` binaries, so runs that need no network keep working after `kiln gc`.
 
 Keying by the verified `diff_id` as well as the compressed digest ties a cache hit to the decompressed content the image config claims, so a blob listed with a different compression or a wrong `diff_id` misses instead of being served another image's filesystem.
 

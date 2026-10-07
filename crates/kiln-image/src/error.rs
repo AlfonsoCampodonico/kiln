@@ -43,6 +43,8 @@ pub enum ImageError {
     RefNotFound(String),
     #[error("invalid option: {0}")]
     BadOption(String),
+    #[error("fetching the pinned {what}: {source}")]
+    Artifact { what: String, source: Box<ImageError> },
 }
 
 pub type Result<T> = std::result::Result<T, ImageError>;

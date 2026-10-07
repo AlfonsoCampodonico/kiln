@@ -18,6 +18,8 @@ pub enum CacheKind {
     /// `<layer cache key>` → JSON list of the warnings converting that layer
     /// produced, so cache hits report them too. Lives as long as its `Layers` entry.
     Warnings,
+    /// `<kiln-init digest>@<fmt>` → digest of the init layer built around it (spec §6.5).
+    InitLayers,
 }
 
 impl CacheKind {
@@ -27,14 +29,16 @@ impl CacheKind {
             CacheKind::LayersCtx => "cache/layers-ctx",
             CacheKind::Squash => "cache/squash",
             CacheKind::Warnings => "cache/warnings",
+            CacheKind::InitLayers => "cache/init-layers",
         }
     }
 
     /// `Warnings` comes last: GC decides its entries after the `Layers` entries.
-    pub(crate) const ALL: [CacheKind; 4] = [
+    pub(crate) const ALL: [CacheKind; 5] = [
         CacheKind::Layers,
         CacheKind::LayersCtx,
         CacheKind::Squash,
+        CacheKind::InitLayers,
         CacheKind::Warnings,
     ];
 }

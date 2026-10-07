@@ -192,6 +192,18 @@ impl TestRegistry {
         self.state.content.lock().unwrap().blobs.remove(d);
     }
 
+    /// Stores a blob under its digest (in every repository).
+    pub fn put_blob(&self, bytes: &[u8]) -> Digest {
+        let d = Digest::of(bytes);
+        self.state
+            .content
+            .lock()
+            .unwrap()
+            .blobs
+            .insert(d.clone(), bytes.to_vec());
+        d
+    }
+
     /// Stores a manifest under its digest and `tag` (in every repository).
     pub fn put_manifest(&self, tag: &str, media_type: &str, bytes: &[u8]) -> Digest {
         let d = Digest::of(bytes);
