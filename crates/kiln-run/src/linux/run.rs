@@ -15,6 +15,7 @@ use crate::config::{self, Runtime};
 use crate::console::{TAIL_LINES, tail};
 use crate::error::{Error, Result};
 use crate::options::{DEFAULT_DISK, RunOptions, VmmKind};
+use crate::persist;
 use crate::prepare::{self, InitLayer};
 use crate::rundir::{self, Identity, RUN_INFO_VERSION, RunDir, RunInfo, ScratchDir, ScratchInfo};
 
@@ -30,8 +31,10 @@ pub const CMDLINE: [&str; 7] = [
 ];
 
 /// How long the guest has to end the VM after its final message (it syncs and
-/// remounts the scratch disk first, D-3).
+/// remounts the scratch disk first, D-3); longer with `--persist`, whose disk
+/// outlives the run.
 const END_TIMEOUT: Duration = Duration::from_secs(10);
+const END_TIMEOUT_PERSIST: Duration = Duration::from_secs(60);
 
 pub fn backend(kind: VmmKind) -> Backend {
     match kind {
@@ -109,9 +112,11 @@ pub fn vmm_identity(run_dir: &Path) -> Option<Identity> {
 pub struct Run {
     session: Session,
     console: ConsoleRelay,
-    /// Dropped before `run_dir`, whose run.json records it.
-    scratch_dir: ScratchDir,
+    /// Dropped before `run_dir`, whose run.json records it; none with `--persist`.
+    scratch_dir: Option<ScratchDir>,
     run_dir: RunDir,
+    /// The `--persist` disk, locked until the run ends.
+    _persist: Option<std::fs::File>,
     /// `KILN_KEEP_RUN_DIR=1` at the start.
     keep: bool,
     /// For the message when the VM ends without the guest's final message.
@@ -127,8 +132,9 @@ pub struct Report {
     pub outcome: Outcome,
     /// The sanitised end of the console when the run failed (T8).
     pub console_tail: Vec<String>,
-    /// The run directory and the scratch directory, when kept (`KILN_KEEP_RUN_DIR=1`).
-    pub kept: Option<(PathBuf, PathBuf)>,
+    /// The run directory and the scratch directory (none with `--persist`), when
+    /// kept (`KILN_KEEP_RUN_DIR=1`).
+    pub kept: Option<(PathBuf, Option<PathBuf>)>,
     /// The VMM's own logs, in the run directory.
     pub vmm_logs: Vec<PathBuf>,
     /// Guest memory, and whether the VMM's memory was limited to it plus 256 MiB.
@@ -247,7 +253,8 @@ impl Run {
         if keep {
             run_dir.keep();
         }
-        let scratch_path = scratch_base.join(&run_dir.id);
+        // A persisted disk replaces the run's scratch directory (spec §9.4).
+        let scratch_path = opts.persist.is_none().then(|| scratch_base.join(&run_dir.id));
         let mut info = RunInfo {
             version: RUN_INFO_VERSION,
             id: run_dir.id.clone(),
@@ -260,13 +267,16 @@ impl Run {
             custom_kernel: prepared.custom_kernel.as_ref().map(|p| p.display().to_string()),
             custom_init: prepared.custom_init.as_ref().map(|p| p.display().to_string()),
             keep,
-            scratch_dir: Some(scratch_path.display().to_string()),
+            scratch_dir: scratch_path.as_ref().map(|p| p.display().to_string()),
         };
         // Recorded before it exists, so a stale cleanup always knows of it.
         run_dir.write_info(&info)?;
-        let mut scratch_dir = ScratchDir::create(&scratch_base, &ScratchInfo::from(&info))?;
-        if keep {
-            scratch_dir.keep();
+        let mut scratch_dir = match &scratch_path {
+            Some(_) => Some(ScratchDir::create(&scratch_base, &ScratchInfo::from(&info))?),
+            None => None,
+        };
+        if keep && let Some(d) = &mut scratch_dir {
+            d.keep();
         }
 
         // The pinned kiln-init's layer is a blob in the store, opened by the VMM while
@@ -279,9 +289,33 @@ impl Run {
                 path
             }
         };
-        let scratch = scratch_dir.path.join("scratch.img");
-        let scratch_bytes = opts.disk.unwrap_or(DEFAULT_DISK);
-        kiln_image::scratch::create_scratch(&scratch, scratch_bytes)?;
+        let (scratch, scratch_bytes, persist_file) = match (&opts.persist, &scratch_dir) {
+            (Some(path), _) => {
+                let existing = persist::inspect(path)?;
+                let (plan, lines) = persist::decide(
+                    path,
+                    existing.as_ref(),
+                    &prepared.manifest,
+                    &prepared.layers,
+                    opts.disk,
+                    opts.persist_reset,
+                    opts.persist_force,
+                )?;
+                for line in lines {
+                    notice(&line);
+                }
+                let file = persist::apply(path, &plan, &prepared.manifest, &prepared.layers)?;
+                let size = file.metadata()?.len();
+                (std::fs::canonicalize(path)?, size, Some(file))
+            }
+            (None, Some(dir)) => {
+                let path = dir.path.join("scratch.img");
+                let size = opts.disk.unwrap_or(DEFAULT_DISK);
+                kiln_image::scratch::create_scratch(&path, size)?;
+                (path, size, None)
+            }
+            (None, None) => return Err(Error::refused("no scratch directory for the run")),
+        };
         let window = if opts.tty { super::tty::window_size() } else { None };
         let config = config::build(
             &prepared.process,
@@ -317,7 +351,9 @@ impl Run {
             );
         }
         run_dir.write_info(&info)?;
-        scratch_dir.write_info(&ScratchInfo::from(&info))?;
+        if let Some(d) = &scratch_dir {
+            d.write_info(&ScratchInfo::from(&info))?;
+        }
         drop(lock);
         // Dropping the VM kills it; the run's directories go with `run_dir` and `scratch_dir`.
         check()?;
@@ -328,7 +364,11 @@ impl Run {
             SessionOptions {
                 boot_timeout: opts.boot_timeout,
                 stop_timeout: opts.stop_timeout,
-                end_timeout: END_TIMEOUT,
+                end_timeout: if opts.persist.is_some() {
+                    END_TIMEOUT_PERSIST
+                } else {
+                    END_TIMEOUT
+                },
                 escape_keys: opts.tty && opts.interactive,
                 ..SessionOptions::default()
             },
@@ -338,6 +378,7 @@ impl Run {
             console,
             scratch_dir,
             run_dir,
+            _persist: persist_file,
             keep,
             vmm: opts.vmm,
             memory_mib: opts.memory_mib,
@@ -360,6 +401,7 @@ impl Run {
             console,
             scratch_dir,
             run_dir,
+            _persist,
             keep,
             vmm,
             memory_mib,
@@ -372,11 +414,13 @@ impl Run {
             || outcome.init_failed.is_some()
             || (outcome.exited.is_none() && !outcome.killed);
         let console_tail = if failed { tail(&log, TAIL_LINES) } else { Vec::new() };
-        let kept = keep.then(|| (run_dir.path.clone(), scratch_dir.path.clone()));
+        let kept = keep.then(|| (run_dir.path.clone(), scratch_dir.as_ref().map(|d| d.path.clone())));
         let vmm_logs = vmm_logs(vmm, &run_dir.path);
-        // The scratch directory first: while run.json lasts, it records it.
+        // The scratch directory first: while run.json lasts, it records it. The
+        // persisted disk's lock goes once the VMM has ended.
         drop(scratch_dir);
         drop(run_dir);
+        drop(_persist);
         Report {
             outcome,
             console_tail,
@@ -417,7 +461,7 @@ mod tests {
                 drained_after: Duration::ZERO,
             },
             console_tail: Vec::new(),
-            kept: kept.then(|| (dir.to_path_buf(), PathBuf::from("/s/scratch/abc"))),
+            kept: kept.then(|| (dir.to_path_buf(), Some(PathBuf::from("/s/scratch/abc")))),
             vmm_logs: vmm_logs(VmmKind::Firecracker, dir),
             memory_mib: 512,
             limited,

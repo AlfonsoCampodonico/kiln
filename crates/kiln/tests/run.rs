@@ -842,6 +842,144 @@ fn the_device_budget_is_checked_before_boot() {
     assert!(text(&o.stderr).contains("--max-layers 27"), "{}", text(&o.stderr));
 }
 
+/// Converts, as `tag`, a busybox image whose `marker` holds `content`, with `config`.
+fn add_image(f: &Fixture, tag: &str, content: &str, config: ContainerConfig) {
+    let path = f._dirs[0].path().join(tag);
+    let mut b = LayoutBuilder::new(&path);
+    let d = b.image(
+        &Platform::host(),
+        &[TestLayer::tar(busybox_layer(&f.env.busybox, content))],
+        config,
+    );
+    b.add(d, None).finish();
+    let out = f.kiln().args(["convert", "--tag", tag]).arg(&path).finish();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+/// `--persist` (spec §9.4): the disk and its sidecar outlive the run; it is never
+/// shrunk; another image with the same layers reuses it with a note (ruling 2),
+/// one with other layers only with --persist-force; --persist-reset starts over;
+/// two runs never share it; and no cleanup of the run's directories touches it.
+#[test]
+fn persisted_disks_are_reused_and_guarded() {
+    let Some(f) = fixture() else { return };
+    let env = ContainerConfig {
+        env: Some(vec!["CHANGED=1".into()]),
+        ..ContainerConfig::default()
+    };
+    add_image(&f, "same-layers", "one", env);
+    add_image(&f, "other", "two", ContainerConfig::default());
+    let disk = f._dirs[0].path().join("data.img");
+    let d = disk.to_str().unwrap();
+    let o = f.output(&[
+        "--persist",
+        d,
+        "--disk",
+        "128M",
+        "busybox",
+        "--",
+        "sh",
+        "-c",
+        "echo kept > /keep",
+    ]);
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    assert_eq!(std::fs::metadata(&disk).unwrap().len(), 128 << 20);
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(f._dirs[0].path().join("data.img.kiln.json")).unwrap()).unwrap();
+    assert_eq!(sidecar["size"], 128 << 20);
+    // No scratch directory was made for the run, and none is left.
+    let scratch: Vec<_> = std::fs::read_dir(f.store.join("scratch")).unwrap().flatten().collect();
+    assert!(scratch.is_empty(), "{scratch:?}");
+    let o = f.output(&["--persist", d, "busybox", "--", "cat", "/keep"]);
+    assert_eq!((code(&o), text(&o.stdout)), (0, "kept\n".into()), "{}", text(&o.stderr));
+    // Never shrunk.
+    let o = f.output(&["--persist", d, "--disk", "64M", "busybox", "--", "true"]);
+    assert_eq!(code(&o), 125);
+    assert!(text(&o.stderr).contains("never shrunk"), "{}", text(&o.stderr));
+    // The same layers under another manifest: reused, with a note.
+    let o = f.output(&[
+        "--persist",
+        d,
+        "same-layers",
+        "--",
+        "sh",
+        "-c",
+        "cat /keep; echo $CHANGED",
+    ]);
+    assert_eq!(
+        (code(&o), text(&o.stdout)),
+        (0, "kept\n1\n".into()),
+        "{}",
+        text(&o.stderr)
+    );
+    assert!(
+        text(&o.stderr).contains("kiln: note:") && text(&o.stderr).contains("same layers"),
+        "{}",
+        text(&o.stderr)
+    );
+    // Other layers: refused, unless forced or reset.
+    let o = f.output(&["--persist", d, "other", "--", "true"]);
+    assert_eq!(code(&o), 125);
+    assert!(text(&o.stderr).contains("--persist-reset"), "{}", text(&o.stderr));
+    let o = f.output(&[
+        "--persist",
+        d,
+        "--persist-force",
+        "other",
+        "--",
+        "cat",
+        "/keep",
+        "/marker",
+    ]);
+    assert_eq!(
+        (code(&o), text(&o.stdout)),
+        (0, "kept\ntwo".into()),
+        "{}",
+        text(&o.stderr)
+    );
+    assert!(text(&o.stderr).contains("--persist-force"), "{}", text(&o.stderr));
+    // Two runs never share it.
+    let mut first = f
+        .run(&[
+            "--persist",
+            d,
+            "--persist-force",
+            "busybox",
+            "--",
+            "sh",
+            "-c",
+            "echo up; sleep 60",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .start();
+    let out = Captured::spawn(first.stdout.take().unwrap());
+    out.wait_for("up\n", BOOT);
+    let o = f.output(&["--persist", d, "busybox", "--", "true"]);
+    assert_eq!(code(&o), 125);
+    assert!(
+        text(&o.stderr).contains("in use by another kiln run"),
+        "{}",
+        text(&o.stderr)
+    );
+    signal(&first, rustix::process::Signal::TERM);
+    assert_eq!(wait(&mut first, Duration::from_secs(30)), 143);
+    // A reset starts from the template, at the size asked for.
+    let o = f.output(&[
+        "--persist",
+        d,
+        "--persist-reset",
+        "--disk",
+        "64M",
+        "busybox",
+        "--",
+        "cat",
+        "/keep",
+    ]);
+    assert_eq!(code(&o), 1, "a reset disk is empty: {}", text(&o.stderr));
+    assert_eq!(std::fs::metadata(&disk).unwrap().len(), 64 << 20);
+}
+
 /// The scratch disk lives on the store's filesystem, in `$KILN_HOME/scratch/<id>/`
 /// (spec §5.3, rev 2.9), not in the run directory, which is usually a tmpfs whose
 /// pages count against the VMM's memory limit (`--memory` plus 256 MiB): a guest

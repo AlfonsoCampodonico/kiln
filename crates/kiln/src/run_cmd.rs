@@ -28,9 +28,19 @@ pub struct RunArgs {
     /// Ctrl-] q stops the guest, Ctrl-] k kills it).
     #[arg(short, long)]
     tty: bool,
-    /// The scratch disk's size (default 4G; a multiple of 4096, at least 64M).
+    /// The scratch disk's size (default 4G, or a persisted disk's size; a multiple
+    /// of 4096, at least 64M).
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     disk: Option<u64>,
+    /// Keep the scratch disk in this file across runs (with a PATH.kiln.json sidecar).
+    #[arg(long, value_name = "PATH")]
+    persist: Option<PathBuf>,
+    /// Recreate the --persist disk.
+    #[arg(long)]
+    persist_reset: bool,
+    /// Reuse the --persist disk although it was used with other layers.
+    #[arg(long)]
+    persist_force: bool,
     /// KEY=VALUE, or KEY to pass kiln's own value (repeatable).
     #[arg(short, long = "env", value_name = "KEY[=VALUE]")]
     env: Vec<String>,
@@ -67,6 +77,9 @@ impl RunArgs {
             interactive: self.interactive,
             tty: self.tty,
             disk: self.disk,
+            persist: self.persist.clone(),
+            persist_reset: self.persist_reset,
+            persist_force: self.persist_force,
             env: self.env.clone(),
             cmd: self.cmd.clone(),
             stop_timeout: self.stop_timeout,
@@ -164,7 +177,9 @@ pub fn run(open_store: impl FnOnce() -> Result<kiln_store::Store>, args: &RunArg
     }
     if let Some((dir, scratch)) = &report.kept {
         eprintln!("kiln: run directory kept: {}", dir.display());
-        eprintln!("kiln: scratch directory kept: {}", scratch.display());
+        if let Some(scratch) = scratch {
+            eprintln!("kiln: scratch directory kept: {}", scratch.display());
+        }
     }
     Ok(u8::try_from(o.exit_code).unwrap_or(EXIT_ERROR))
 }

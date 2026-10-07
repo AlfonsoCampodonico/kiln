@@ -57,8 +57,15 @@ pub struct RunOptions {
     pub interactive: bool,
     /// `-t`: a pseudo-terminal.
     pub tty: bool,
-    /// `--disk`: the scratch disk's size; `None` is the default, 4 GiB.
+    /// `--disk`: the scratch disk's size; `None` is the default, 4 GiB, or a
+    /// persisted disk's own size.
     pub disk: Option<u64>,
+    /// `--persist PATH`: a scratch disk kept across runs (spec §9.4).
+    pub persist: Option<PathBuf>,
+    /// `--persist-reset`: recreate the persisted disk.
+    pub persist_reset: bool,
+    /// `--persist-force`: reuse it although its sidecar names other layers.
+    pub persist_force: bool,
     /// `--env K=V` or `--env K` (taken from kiln's environment, dropped when unset).
     pub env: Vec<String>,
     /// After `--`: replaces the image's cmd (the entrypoint stays), as with `docker run`.
@@ -81,6 +88,9 @@ impl RunOptions {
             interactive: false,
             tty: false,
             disk: None,
+            persist: None,
+            persist_reset: false,
+            persist_force: false,
             env: Vec::new(),
             cmd: Vec::new(),
             stop_timeout: DEFAULT_STOP_TIMEOUT,
@@ -104,6 +114,12 @@ impl RunOptions {
             return Err(Error::refused(
                 "--init boots a kiln-init kiln has not pinned; add --allow-custom-init to accept that",
             ));
+        }
+        if (self.persist_reset || self.persist_force) && self.persist.is_none() {
+            return Err(Error::refused("--persist-reset and --persist-force need --persist"));
+        }
+        if self.persist_reset && self.persist_force {
+            return Err(Error::refused("--persist-reset and --persist-force exclude each other"));
         }
         if let Some(d) = self.disk {
             check_disk(d)?;
@@ -193,6 +209,14 @@ mod tests {
         o.disk = Some(1000);
         assert!(o.check().unwrap_err().to_string().contains("--disk"));
         o.disk = None;
+        o.persist_reset = true;
+        assert!(o.check().unwrap_err().to_string().contains("need --persist"));
+        o.persist = Some("/disk.img".into());
+        o.check().unwrap();
+        o.persist_force = true;
+        assert!(o.check().unwrap_err().to_string().contains("exclude each other"));
+        o.persist_reset = false;
+        o.check().unwrap();
         o.memory_mib = 32;
         assert!(o.check().is_err());
     }

@@ -583,6 +583,23 @@ fn run_refuses_bad_flags_with_125() {
         .assert()
         .code(125)
         .stderr(predicate::str::contains("multiple of 4096"));
+    kiln(home.path())
+        .args(["run", "--persist-reset", "img"])
+        .assert()
+        .code(125)
+        .stderr(predicate::str::contains("need --persist"));
+    kiln(home.path())
+        .args([
+            "run",
+            "--persist",
+            "/d.img",
+            "--persist-reset",
+            "--persist-force",
+            "img",
+        ])
+        .assert()
+        .code(125)
+        .stderr(predicate::str::contains("exclude each other"));
 }
 
 /// Usage errors of `kiln run` exit 125, as `docker run`'s do; help and version
