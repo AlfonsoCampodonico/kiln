@@ -1135,3 +1135,54 @@ fn output_connected_as_the_vm_ends_is_kept() {
         assert_eq!(io.out.bytes(), b"last words\n");
     }
 }
+
+/// A sink that never takes the output (a pager left open) does not hold kiln
+/// once the user asks to stop after the VM's end: the output gets the fixed bound,
+/// the app's code stands, and the cut is warned about.
+#[test]
+fn an_interrupt_after_the_end_stops_waiting_for_a_stuck_sink() {
+    /// Blocks forever (until the test process ends).
+    struct Stuck;
+    impl Write for Stuck {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let vm = fake(|sock, _| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        let (mut out, err) = (connect(&sock, port::STDOUT), connect(&sock, port::STDERR));
+        boot(&mut c);
+        out.write_all(b"never read\n").unwrap();
+        drop((out, err));
+        exited(&mut c, 6);
+    });
+    let (mut st, _) = streams(None);
+    st.stdout = Box::new(Stuck);
+    let mut o = opts();
+    o.drain_timeout = Duration::from_millis(500);
+    let mut s = Session::start(vm, config(), st, o).unwrap();
+    s.pump(Duration::from_secs(20), |s| s.ended());
+    assert!(s.ended());
+    // Still waiting for the sink, however long.
+    s.pump(Duration::from_secs(2), |_| false);
+    s.handle().interrupt();
+    let started = Instant::now();
+    let out = s.finish_within(LIMIT);
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_eq!(
+        (out.exit_code, out.killed, out.violation.as_deref()),
+        (6, false, None),
+        "{out:?}"
+    );
+    assert_eq!(
+        out.warnings,
+        ["the guest's stdout was cut off: kiln was asked to stop while its own output was not taking it"]
+    );
+}

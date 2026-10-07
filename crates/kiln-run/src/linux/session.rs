@@ -31,7 +31,10 @@
 //! stream that brings nothing for the same bound while none of them is writing is
 //! abandoned. When kiln gave up on a VMM it could not see end (the kill did not
 //! take, or waiting failed), the VMM may still be writing, so the output streams
-//! get the fixed bound too. A stream abandoned with bytes pending is warned about.
+//! get the fixed bound too; so do they when the user asks to stop (SIGINT,
+//! SIGTERM, `Ctrl-]`) after the VM's end, since a sink that never takes the
+//! output would otherwise hold kiln. A stream abandoned with bytes pending is
+//! warned about.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Read, Write};
@@ -244,6 +247,9 @@ pub struct Session {
     ended_at: Option<Instant>,
     /// kiln gave up on the VMM ([`lost`]): it may still be running.
     gave_up: bool,
+    /// The user asked to stop after the VM's end (a sink that never takes the
+    /// output would hold kiln otherwise): the output gets the fixed bound.
+    cut: bool,
     started: Instant,
     hello_at: Option<Instant>,
     running_at: Option<Instant>,
@@ -397,6 +403,7 @@ impl Session {
             end: None,
             ended_at: None,
             gave_up: false,
+            cut: false,
             started: now,
             hello_at: None,
             running_at: None,
@@ -488,6 +495,8 @@ impl Session {
                         "kiln stopped waiting for it {:.1}s after it gave up on the VMM",
                         self.opts.drain_timeout.as_secs_f64()
                     )
+                } else if self.cut {
+                    "kiln was asked to stop while its own output was not taking it".to_string()
                 } else {
                     format!(
                         "it brought nothing for {:.1}s after the VM ended",
@@ -503,7 +512,8 @@ impl Session {
     /// and every drained connection is at EOF or past its bound: the control
     /// connection a fixed one from the VM's end; the output streams, after a real
     /// end, one from the last byte they moved that runs only while none of them is
-    /// writing to its sink, and after kiln gave up on the VMM, the fixed one.
+    /// writing to its sink, and after kiln gave up on the VMM or the user asked to
+    /// stop, the fixed one.
     fn done(&self) -> bool {
         let Some(at) = self.ended_at else {
             return false;
@@ -523,7 +533,7 @@ impl Session {
         };
         // Read after the writing flags: a write that just ended has counted its bytes.
         let unmoved = self.drain.moved.load(Ordering::Relaxed) == self.moved.0 && self.moved.1.elapsed() >= bound;
-        let streams_done = if self.gave_up {
+        let streams_done = if self.gave_up || self.cut {
             at.elapsed() >= bound
         } else {
             !writing && unmoved
@@ -657,6 +667,12 @@ impl Session {
             Event::ControlClosed => self.expect_end(now, CONTROL_CLOSED),
             // The drain state is shared; this only wakes the loop.
             Event::Eof => {}
+            // After the VM's end only the output is left, and a sink that never
+            // takes it (a pager left open) could hold kiln forever: an interrupt,
+            // a stop or a kill now ends the wait, within the fixed drain bound.
+            Event::Interrupt | Event::Terminate | Event::Shutdown | Event::Kill if self.end.is_some() => {
+                self.cut = true;
+            }
             Event::Interrupt => {
                 self.interrupts += 1;
                 if self.interrupts >= 2 {
