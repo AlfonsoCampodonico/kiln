@@ -484,3 +484,40 @@ fn pins_are_looked_up_by_profile_version_and_arch() {
     assert!(pins.kernel("custom", "6.18.54", ARCH).is_none());
     assert!(pins.init(ARCH).is_some() && pins.init("amd64").is_none());
 }
+
+/// `KILN_IMPORT_FROM` (spec §10, ruling 4): an image the source store has is
+/// imported (only missing blobs) and tagged again on every run, so the source's
+/// newest convert wins; names the source lacks are left to this store.
+#[test]
+fn images_are_imported_and_retagged_from_another_store() {
+    let mac = setup();
+    let home = tempfile::tempdir().unwrap();
+    let vm = Store::open(home.path()).unwrap();
+    let note = kiln_run::prepare::import_from(&vm, mac.store.root(), "app")
+        .unwrap()
+        .unwrap();
+    assert!(
+        note.starts_with("imported app from ") && note.ends_with(" blobs)"),
+        "{note}"
+    );
+    let first = vm.get_ref("app").unwrap().unwrap();
+    assert_eq!(Some(first.clone()), mac.store.get_ref("app").unwrap());
+    // Nothing new: no note, the same tag.
+    assert_eq!(
+        kiln_run::prepare::import_from(&vm, mac.store.root(), "app").unwrap(),
+        None
+    );
+    // A newer convert on the source wins over the older tag here.
+    mac.with_boot_layers("app", "custom", b"\x7fELF init");
+    let note = kiln_run::prepare::import_from(&vm, mac.store.root(), "app").unwrap();
+    assert!(note.is_some());
+    let second = vm.get_ref("app").unwrap().unwrap();
+    assert_ne!(second, first);
+    assert_eq!(Some(second), mac.store.get_ref("app").unwrap());
+    // A name the source lacks, and a source that is no store.
+    assert_eq!(
+        kiln_run::prepare::import_from(&vm, mac.store.root(), "other").unwrap(),
+        None
+    );
+    assert!(kiln_run::prepare::import_from(&vm, &home.path().join("nowhere"), "app").is_err());
+}

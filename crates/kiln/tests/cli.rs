@@ -659,11 +659,11 @@ fn run_usage_errors_exit_125() {
 #[test]
 fn run_explains_the_lima_vm() {
     let home = tempfile::tempdir().unwrap();
-    kiln(home.path())
-        .args(["run", "img"])
-        .assert()
-        .code(125)
-        .stderr(predicate::str::contains("Linux with KVM").and(predicate::str::contains("Lima VM")));
+    kiln(home.path()).args(["run", "img"]).assert().code(125).stderr(
+        predicate::str::contains("Linux with KVM")
+            .and(predicate::str::contains("Lima VM"))
+            .and(predicate::str::contains("lima/kiln.yaml")),
+    );
 }
 
 /// On Linux the image is resolved before a VMM is needed: an image without a

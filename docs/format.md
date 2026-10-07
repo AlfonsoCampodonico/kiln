@@ -16,8 +16,8 @@ An OCI image manifest (`mediaType` `application/vnd.oci.image.manifest.v1+json`,
 - `artifactType`: `application/vnd.kiln.image.v1`. Readers reject manifests without it.
 - `config`: a descriptor with `mediaType` `application/vnd.kiln.image.config.v1+json`.
 - `layers`, in boot order:
-  1. Kernel, `application/vnd.kiln.kernel.v1` (from M3; absent in schema-1 images built before M3).
-  2. Init layer, `application/vnd.kiln.init.v1.erofs` (from M3; absent likewise).
+  1. Kernel, `application/vnd.kiln.kernel.v1`: the kernel image itself, the blob kiln pins for the `kernel` the config names. Absent in provisional images, converted while kiln pins no kernel for the architecture (and in images built before M3).
+  2. Init layer, `application/vnd.kiln.init.v1.erofs`: the init layer around the `kiln-init` kiln pins (see Init layer below). Absent likewise. `kiln run` never boots it: it boots the init layer of the `kiln-init` it pins itself (or of `--init`), and warns when the image's differs.
   3. App layers, lowest first, `application/vnd.kiln.layer.v1.erofs`: erofs profile images (below), applied as overlayfs lower layers.
 - App layer annotations, **informational only** (never used for caching or verification):
   - `dev.kiln.source.digests`: the comma-separated digests of the OCI layers the erofs layer was built from, in order. A squashed bottom layer lists all of them.
@@ -37,7 +37,7 @@ An OCI image manifest (`mediaType` `application/vnd.oci.image.manifest.v1+json`,
 - `schemaVersion`: 1. Readers reject other values.
 - `architecture`: `amd64` or `arm64`.
 - `process`: copied from the source OCI config. Empty lists and strings are omitted.
-- `kernel` (`{ "profile", "version" }`) and `init` (`{ "version" }`): set from M3, omitted before.
+- `kernel` (`{ "profile", "version" }`) and `init` (`{ "version" }`): set when the image has that boot layer, omitted otherwise. `kiln run` verifies the kernel layer against the digest kiln pins for `kernel` and the image's architecture (a `custom` profile needs `--allow-custom-kernel`); `init` is informational, since the init layer is always replaced.
 - `source.manifestDigest`: the source OCI manifest. `source.reference` is present only for registry inputs. This is unverified provenance.
 - `erofsFormatVersion`: the erofs profile version of every app layer.
 - There is no kernel command line field and no kiln version field.

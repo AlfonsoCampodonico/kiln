@@ -27,7 +27,10 @@ pub use options::{RunOptions, VmmKind};
 /// What `kiln run` prints where it cannot run VMs (spec §9.7, §10).
 pub const LIMA_INSTRUCTIONS: &str = "\
 kiln run needs Linux with KVM. On macOS, run it in a Lima VM with nested
-virtualization (vmType: vz, nestedVirtualization: true; an M3 or later Mac with
-macOS 15 or later) where Firecracker or Cloud Hypervisor and vmkit-sandbox are
-installed as vmkit's README describes. Copy images into the VM's store with
-`kiln import --from-store <this store> <image>`.";
+virtualization (an M3 or later Mac with macOS 15 or later): kiln's lima/kiln.yaml
+sets one up with Firecracker, Cloud Hypervisor and pasta, and mounts this Mac's
+store read-only (limactl start --name kiln lima/kiln.yaml; install kiln and
+vmkit-sandbox in it as the template says). Then run images there with
+limactl shell kiln kiln run <image>: images converted on the Mac are imported
+from its store when they run (KILN_IMPORT_FROM), and ports published with -p
+on 127.0.0.1 reach the Mac's localhost through Lima.";

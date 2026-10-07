@@ -8,6 +8,7 @@ description = "The host runtime of kiln microVMs: boot, the control protocol, st
 [dependencies]
 kiln-image = { path = "../kiln-image" }
 kiln-proto = { path = "../kiln-proto" }
+kiln-registry = { path = "../kiln-registry" }
 kiln-store = { path = "../kiln-store" }
 rustix = { version = "1.1.5", features = ["fs", "process", "system"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -25,5 +26,4 @@ vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "272879ce3c
 [dev-dependencies]
 kiln-erofs = { path = "../kiln-erofs" }
 kiln-oci = { path = "../kiln-oci" }
-kiln-registry = { path = "../kiln-registry" }
 tempfile = "3.27.0"

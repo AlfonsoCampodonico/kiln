@@ -19,6 +19,7 @@ use kiln_image::artifacts::{self, ArtifactKind, Fetcher, Pin};
 use kiln_image::types::{KILN_INIT, KILN_KERNEL, KILN_LAYER, Process};
 use kiln_image::{load, resolve_name};
 use kiln_proto::sanitize::clean_line;
+use kiln_registry::Reference;
 use kiln_store::{Digest, Store};
 
 use crate::error::{Error, Result};
@@ -98,6 +99,33 @@ pub fn host_arch() -> &'static str {
         "x86_64" => "amd64",
         other => other,
     }
+}
+
+/// With `KILN_IMPORT_FROM` (the Lima VM's read-only mount of the macOS store, spec
+/// §10): when that store has `name` (as given, or as its normalised reference),
+/// imports it, copying only the blobs this store lacks, and tags it here: every
+/// time, so the newest convert on macOS wins over an older tag in the VM (ruling 4).
+/// Returns a note for the user when blobs were copied.
+pub fn import_from(store: &Store, from: &Path, name: &str) -> Result<Option<String>> {
+    let src = Store::open_read_only(from)?;
+    let refs = src.refs()?;
+    let normalised = Reference::parse(name).ok().map(|r| r.to_string());
+    let Some(src_name) = refs
+        .keys()
+        .find(|k| *k == name)
+        .or_else(|| refs.keys().find(|k| Some(k.as_str()) == normalised.as_deref()))
+    else {
+        return Ok(None);
+    };
+    let r = kiln_image::import_image(store, &src, src_name, src_name)?;
+    Ok((r.blobs_copied > 0).then(|| {
+        format!(
+            "imported {} from {} ({} blobs)",
+            clean_line(src_name),
+            from.display(),
+            r.blobs_copied
+        )
+    }))
 }
 
 /// Resolves `opts.image` for `arch` and decides the kernel and init (spec §8.1)

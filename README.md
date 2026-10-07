@@ -2,7 +2,7 @@
 
 kiln turns OCI container images into microVM images: one deterministic erofs filesystem per layer, stacked with overlayfs inside the guest. It runs natively on macOS and Linux, without root.
 
-Status: milestone M3b (runtime and CLI). `kiln convert` works on registry images and local inputs, `kiln pull`/`kiln push` move kiln images through registries, and `kiln run` boots an image under Firecracker or Cloud Hypervisor on Linux with KVM. No kernel or kiln-init release is pinned yet, so `kiln run` needs `--kernel` and `--init` (below).
+Status: milestone M3b. `kiln convert` works on registry images and local inputs, `kiln pull`/`kiln push` move kiln images through registries, and `kiln run` boots an image under Firecracker or Cloud Hypervisor on Linux with KVM (on macOS, in a Lima VM), with a persistent disk and networking. No kernel or kiln-init release is pinned yet, so `kiln run` needs `--kernel` and `--init` (below).
 
 ## Quickstart
 
@@ -69,7 +69,21 @@ kiln run $K -t -i alpine:3                      # a terminal: Ctrl-] q stops the
 - Usage errors of `kiln run` exit 125, as `docker run`'s do. An interrupt (SIGINT, SIGTERM, or SIGHUP when the terminal goes away) while kiln is still setting the VM up stops the setup, removes what it made and exits 137; SIGQUIT, SIGUSR1 and SIGUSR2 then are not forwarded once the command runs, and kiln says so.
 - What boots: kiln compiles in a table of the kernels (vmkit's releases) and kiln-init binaries (kiln's) it trusts, by digest. `kiln convert` adds a kernel layer and an init layer for each one the table pins for the image's architecture, fetched once by digest (`kiln inspect` shows them on its `boot:` line; without them the image is provisional, and convert says what `kiln run` will need). `kiln run` boots an image's kernel layer only when it is the pinned one for the profile and version its config names, and always replaces the image's init layer with the pinned kiln-init's; neither needs the network once fetched, and `kiln gc` keeps them. The table is empty until those releases exist: until then `--kernel PATH --allow-custom-kernel --init PATH --allow-custom-init` name them (vmkit builds the kernel; `kiln-init` is built as below). Custom ones are warned about and recorded in the run's `run.json`. An image's own init layer never boots.
 - Per-run state (`run.json`, the VMM's sockets and logs, `console.log`) lives in `$XDG_RUNTIME_DIR/kiln/<id>/` (or `/tmp/kiln-<uid>/<id>/`), mode 0700. The scratch disk is not kept there, since that directory is usually a tmpfs whose pages would hold the guest's disk in memory: it is in `$KILN_HOME/scratch/<id>/` (mode 0700, on the store's filesystem), and goes with the run; `kiln gc` leaves it alone. `KILN_KEEP_RUN_DIR=1` keeps both directories, and `KILN_TIMINGS=1` prints how long booting took. A later run removes the directories of a run whose kiln was killed, once neither kiln nor its VMM runs; a scratch directory records whose it is (`scratch.json`), so it is removed even when a reboot or logout has already emptied the run directory.
-- On macOS, `kiln run` explains how to use a Lima VM.
+- On macOS, `kiln run` explains how to use a Lima VM (below).
+
+### On macOS: the Lima VM
+
+`lima/kiln.yaml` is a Lima VM with nested KVM (an Apple M3 or later, macOS 15 or later) with Firecracker, Cloud Hypervisor, pasta and nftables installed, and the Mac's store (`~/.local/share/kiln`, which `kiln convert` creates) mounted read-only at `/mnt/kiln-store`. Install `kiln` and `vmkit-sandbox` in the VM's `/usr/local/bin` (until releases exist, build them there); the template's AppArmor profile lets that `vmkit-sandbox` create user namespaces.
+
+```bash
+limactl start --name kiln lima/kiln.yaml
+kiln convert php:8.4-cli                                         # on the Mac
+limactl shell kiln kiln run $K php:8.4-cli -- php -v             # in the VM
+limactl shell kiln kiln run $K --net -p 8080:8080 app:1          # then, on the Mac: curl localhost:8080
+```
+
+- The VM keeps its own store (Unix sockets and `flock` are not reliable on shared mounts). `KILN_IMPORT_FROM=/mnt/kiln-store` is set there, so `kiln run` first imports the image from the Mac's store when that store has it, copying only missing blobs and tagging it again every time: the latest convert on the Mac is what runs.
+- A port published on the VM's `127.0.0.1` (the `-p` default) reaches the Mac's `localhost`: Lima forwards the VM's loopback listeners to the Mac's `127.0.0.1` (IPv4; if something on the Mac already listens on that port over IPv6, `localhost` may reach it instead). Nothing else on the Mac's network sees it.
 
 ## The guest
 
@@ -95,7 +109,7 @@ export PATH="$HOME/.local/bin:$PATH"
 KILN_TEST_NET=1 scripts/boot-tests.sh out/vmlinux-*-"$(uname -m)" -- --test-threads=4
 ```
 
-`scripts/boot-tests.sh` builds `kiln-init` and the hostile test guest for the host's musl target and runs the suite; without its environment the tests are skipped. `KILN_TEST_NET=1` adds the networking case (pasta and nft), `KILN_TEST_KEEP=1` keeps each run directory with its console log (the `kiln run` cases' through `KILN_KEEP_RUN_DIR=1`; CI uploads their logs when the job fails), and `KILN_TEST_VCPUS` sets the guests' vCPUs (default 1). Cargo arguments go after the kernel, for example `firecracker::` to run one VMM's boot cases; `KILN_TEST_VMM` (default `firecracker`) picks the VMM of the `kiln run` cases.
+`scripts/boot-tests.sh` builds `kiln-init` and the hostile test guest for the host's musl target and runs the suite; without its environment the tests are skipped. `KILN_TEST_NET=1` adds the networking cases (pasta and nft; the `kiln run` egress case also needs the internet), `KILN_TEST_KEEP=1` keeps each run directory with its console log (the `kiln run` cases' through `KILN_KEEP_RUN_DIR=1`; CI uploads their logs when the job fails), and `KILN_TEST_VCPUS` sets the guests' vCPUs (default 1). Cargo arguments go after the kernel, for example `firecracker::` to run one VMM's boot cases; `KILN_TEST_VMM` (default `firecracker`) picks the VMM of the `kiln run` cases.
 
 The scratch disk starts from an ext4 template embedded in `kiln-image`. `assets/make-ext4-template.sh` regenerates it with Docker, byte for byte; CI checks that it does.
 
