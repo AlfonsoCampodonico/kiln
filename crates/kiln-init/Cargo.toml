@@ -15,13 +15,3 @@ kiln-proto = { path = "../kiln-proto" }
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.5", features = ["fs", "mount", "net", "pipe", "process", "pty", "stdio", "system", "termios", "thread"] }
 signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
-
-# The boot tests (tests/boot.rs) run real guests under vmkit, pinned to the commit that
-# declares Cloud Hypervisor disks raw (otherwise CH refuses writes to the scratch disk's sector 0).
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-kiln-erofs = { path = "../kiln-erofs" }
-kiln-image = { path = "../kiln-image" }
-kiln-oci = { path = "../kiln-oci" }
-kiln-store = { path = "../kiln-store" }
-tempfile = "3.27.0"
-vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "b6958ffa70bda43d332bbf888fbcd3da93f3cfd6" }
