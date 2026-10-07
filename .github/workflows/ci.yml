@@ -41,10 +41,13 @@ jobs:
         run: |
           assets/make-ext4-template.sh "$RUNNER_TEMP/ext4-template.img.zst"
           cmp "$RUNNER_TEMP/ext4-template.img.zst" crates/kiln-image/assets/ext4-template.img.zst
-  # kiln-init's boot suite on x86_64 KVM with both VMMs, set up as vmkit's own contract job is (hosted arm64
-  # runners have no /dev/kvm; aarch64 runs in the Lima VM).
+  # The boot suite (kiln-run) on both VMMs and kiln run end to end on Firecracker, on x86_64 KVM,
+  # set up as vmkit's own contract job is (hosted arm64 runners have no /dev/kvm; aarch64 runs in
+  # the Lima VM).
   boot-x86_64:
     runs-on: ubuntu-24.04
+    # Every kiln run the tests start is bounded; this bounds a stall anywhere else.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -73,12 +76,30 @@ jobs:
         run: |
           cargo build --locked --manifest-path "${{ steps.vmkit.outputs.dir }}/Cargo.toml" --bin vmkit-sandbox --target-dir target
           "${{ steps.vmkit.outputs.dir }}/scripts/install-apparmor.sh" "$PWD/target/debug/vmkit-sandbox"
-      - name: Boot suite, Firecracker and Cloud Hypervisor
-        # About half the CPUs: every test boots its own VMs.
+      - name: Boot suite on Firecracker and Cloud Hypervisor, kiln run end to end on Firecracker
+        # About half the CPUs: every test boots its own VMs. KILN_TEST_KEEP keeps every run
+        # directory, for the logs collected below when something fails.
         run: |
-          export PATH="$HOME/.local/bin:$PATH" KILN_TEST_NET=1
+          export PATH="$HOME/.local/bin:$PATH" KILN_TEST_NET=1 KILN_TEST_KEEP=1
           threads=$(( $(nproc) > 1 ? $(nproc) / 2 : 1 ))
           scripts/boot-tests.sh out/vmlinux-*-x86_64 -- --test-threads=$threads
+      - name: Collect the console and VMM logs of the kept run directories
+        if: failure() || cancelled()
+        run: |
+          logs="$RUNNER_TEMP/kiln-logs"
+          runs=${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/kiln}
+          for dir in "${TMPDIR:-/tmp}"/kiln-run-* "${runs:-/tmp/kiln-$(id -u)}"/*; do
+            [ -d "$dir" ] || continue
+            mkdir -p "$logs/$(basename "$dir")"
+            find "$dir" -maxdepth 2 -type f \( -name '*.log' -o -name run.json \) \
+              -exec cp {} "$logs/$(basename "$dir")/" \;
+          done
+      - uses: actions/upload-artifact@v4
+        if: failure() || cancelled()
+        with:
+          name: boot-x86_64-logs
+          path: ${{ runner.temp }}/kiln-logs
+          if-no-files-found: ignore
   registries:
     runs-on: ubuntu-24.04
     permissions:

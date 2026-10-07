@@ -46,32 +46,38 @@ struct Group<'a> {
     members: Vec<&'a str>,
 }
 
-/// Lines that are not well formed are skipped, as libc does.
+/// Lines are trimmed, as runc trims them. Trailing fields may be missing, as
+/// runc allows (`app:x:1000:1000` has no home, so `/`), but a line without a
+/// name, uid or gid is skipped: runc would read a missing id as 0, root.
 fn users(passwd: &str) -> impl Iterator<Item = User<'_>> {
-    passwd.lines().filter_map(|line| {
+    passwd.lines().map(str::trim).filter_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 7 || f[0].is_empty() {
+        if f.len() < 4 || f[0].is_empty() {
             return None;
         }
         Some(User {
             name: f[0],
             uid: id_number(f[2])?,
             gid: id_number(f[3])?,
-            home: f[5],
+            home: f.get(5).copied().unwrap_or(""),
         })
     })
 }
 
+/// As [`users`]: the member list may be missing (`app:x:1000`), the gid may not.
 fn groups(group: &str) -> impl Iterator<Item = Group<'_>> {
-    group.lines().filter_map(|line| {
+    group.lines().map(str::trim).filter_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 4 || f[0].is_empty() {
+        if f.len() < 3 || f[0].is_empty() {
             return None;
         }
         Some(Group {
             name: f[0],
             gid: id_number(f[2])?,
-            members: f[3].split(',').map(str::trim).filter(|m| !m.is_empty()).collect(),
+            members: f
+                .get(3)
+                .map(|m| m.split(',').map(str::trim).filter(|m| !m.is_empty()).collect())
+                .unwrap_or_default(),
         })
     })
 }
@@ -228,6 +234,29 @@ mod tests {
         let group = "g:x:4294967295:\nok:x:7:\n";
         assert!(resolve(Some("app:g"), PASSWD, group).is_err());
         assert_eq!(resolve(Some("app:ok"), PASSWD, group).unwrap().gid, 7);
+    }
+
+    #[test]
+    fn short_and_padded_lines_are_read_as_runc_reads_them() {
+        // `echo 'app:x:1000' >> /etc/group` in a Dockerfile, then `USER app:app`.
+        let passwd = "  app:x:1000:1000  \nshort:x:1001:1001:Short\n";
+        let group = "app:x:1000\nextra:x:2000:app\n  padded:x:3000:short  \n";
+        assert_eq!(
+            resolve(Some("app:app"), passwd, group).unwrap(),
+            id(1000, 1000, &[1000], "/")
+        );
+        assert_eq!(
+            resolve(Some("app"), passwd, group).unwrap(),
+            id(1000, 1000, &[1000, 2000], "/")
+        );
+        assert_eq!(
+            resolve(Some("short"), passwd, group).unwrap(),
+            id(1001, 1001, &[1001, 3000], "/")
+        );
+        // Without a uid or gid field a line is skipped: runc would make it root.
+        assert!(resolve(Some("noid"), "noid:x\nnogid:x:5\n", "").is_err());
+        assert!(resolve(Some("nogid"), "noid:x\nnogid:x:5\n", "").is_err());
+        assert!(resolve(Some("app:g"), passwd, "g:x\n").is_err());
     }
 
     #[test]

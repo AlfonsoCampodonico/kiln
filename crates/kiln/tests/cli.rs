@@ -560,3 +560,92 @@ fn converting_a_kiln_image_from_a_registry_suggests_kiln_pull() {
                 .and(predicate::str::contains("local path").not()),
         );
 }
+
+/// `kiln run` refuses bad flags before anything else, with Docker's 125.
+#[test]
+fn run_refuses_bad_flags_with_125() {
+    let home = tempfile::tempdir().unwrap();
+    kiln(home.path())
+        .args(["run", "--kernel", "/k", "img"])
+        .assert()
+        .code(125)
+        .stderr(predicate::str::contains("--allow-custom-kernel"));
+    kiln(home.path())
+        .args(["run", "--disk", "1000", "img"])
+        .assert()
+        .code(125)
+        .stderr(predicate::str::contains("multiple of 4096"));
+}
+
+/// Usage errors of `kiln run` exit 125, as `docker run`'s do; help and version
+/// exit 0, and other subcommands keep clap's 2.
+#[test]
+fn run_usage_errors_exit_125() {
+    let home = tempfile::tempdir().unwrap();
+    for (args, needle) in [
+        (&["run", "--disk", "abc", "img"][..], "--disk"),
+        (&["run", "--vmm", "qemu", "img"], "unknown VMM"),
+        (&["run", "--cpus", "300", "img"], "--cpus"),
+        (&["run"], "IMAGE"),
+        (&["run", "--bogus", "img"], "--bogus"),
+        (&["run", "-e"], "-e"),
+    ] {
+        kiln(home.path())
+            .args(args)
+            .assert()
+            .code(125)
+            .stderr(predicate::str::contains(needle));
+    }
+    kiln(home.path())
+        .args(["run", "--help"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("--allow-custom-kernel"));
+    kiln(home.path()).arg("--version").assert().code(0);
+    kiln(home.path()).args(["ls", "--bogus"]).assert().code(2);
+}
+
+/// Where VMs cannot run, `kiln run` says how to use a Lima VM (spec §9.7).
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn run_explains_the_lima_vm() {
+    let home = tempfile::tempdir().unwrap();
+    kiln(home.path())
+        .args(["run", "img"])
+        .assert()
+        .code(125)
+        .stderr(predicate::str::contains("Linux with KVM").and(predicate::str::contains("Lima VM")));
+}
+
+/// On Linux the image is resolved before a VMM is needed: an image without a
+/// kernel layer, run without --kernel, is refused with 125 (no KVM needed).
+#[cfg(target_os = "linux")]
+#[test]
+fn run_refuses_an_image_without_a_kernel_before_booting() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut b = LayoutBuilder::new(&src.path().join("app"));
+    let d = b.image(
+        &Platform::host(),
+        &[TestLayer::tar(simple().remove(0))],
+        ContainerConfig::default(),
+    );
+    let path = b.add(d, None).finish();
+    kiln(home.path())
+        .args(["convert", "--tag", "app"])
+        .arg(&path)
+        .assert()
+        .success();
+    kiln(home.path())
+        .args(["run", "app"])
+        .assert()
+        .code(125)
+        .stderr(predicate::str::contains("has no kernel layer").and(predicate::str::contains("--allow-custom-kernel")));
+    kiln(home.path()).args(["run", "missing"]).assert().code(125);
+    // -t -i puts kiln's terminal in raw mode: without one on stdin, a clear error.
+    kiln(home.path())
+        .args(["run", "-t", "-i", "app"])
+        .assert()
+        .code(125)
+        .stderr(predicate::str::contains("the input device is not a TTY"));
+}

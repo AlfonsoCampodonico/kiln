@@ -22,9 +22,10 @@ use kiln_erofs::testtar::{Opts, TarBuilder};
 use kiln_image::{ConvertOptions, LocalRequest, convert_local, init_layer, scratch};
 use kiln_oci::testlayout::{LayoutBuilder, TestLayer};
 use kiln_oci::{ContainerConfig, Platform};
-use kiln_proto::{Config, ExitMethod, GUEST_CID, Process, Scratch};
+use kiln_proto::{Config, ExitMethod, Process, Scratch};
+use kiln_run::SessionOptions;
 use kiln_store::Store;
-use vmkit::{Backend, Disk, GuestExit, NetSpec, VmSpec, Vmm, VsockSpec};
+use vmkit::{Backend, NetSpec, VmSpec, Vmm};
 
 use driver::{Outcome, Reply, Session};
 
@@ -34,17 +35,6 @@ pub const BOOT: Duration = Duration::from_secs(60);
 pub const END: Duration = Duration::from_secs(120);
 /// The default scratch disk.
 pub const SCRATCH: u64 = 1 << 30;
-
-/// The kernel command line of spec §8.3; vmkit appends the console and backend parameters.
-pub const CMDLINE: [&str; 7] = [
-    "root=/dev/vda",
-    "ro",
-    "rootfstype=erofs",
-    "init=/kiln-init",
-    "panic=-1",
-    "quiet",
-    "loglevel=3",
-];
 
 pub struct Env {
     pub kernel: PathBuf,
@@ -94,6 +84,10 @@ pub struct Fixtures {
     pub deep: Vec<PathBuf>,
     /// `base` plus the `hostile` program, when it was built.
     pub hostile: Option<Vec<PathBuf>>,
+    /// An init layer whose PID 1 is the `hostile` program, when it was built.
+    pub hostile_init: Option<PathBuf>,
+    /// `base` plus a layer that makes `/proc` a symlink to `/dev`.
+    pub proc_link: Vec<PathBuf>,
 }
 
 pub const STACK_LAYERS: usize = 14;
@@ -121,8 +115,17 @@ pub fn fixtures() -> &'static Fixtures {
                 .finish();
             convert(&store, &dir, "hostile", vec![base.clone(), top])
         });
+        let hostile_init = env.hostile.as_ref().map(|path| {
+            let bin = std::fs::read(path).expect("read KILN_TEST_HOSTILE");
+            let p = dir.join("hostile-init.erofs");
+            std::fs::write(&p, init_layer(&bin, &dir).unwrap()).unwrap();
+            p
+        });
+        let link = TarBuilder::new().symlink("proc", "/dev", &Opts::default()).finish();
         Fixtures {
             init,
+            hostile_init,
+            proc_link: convert(&store, &dir, "proc-link", vec![base.clone(), link]),
             base: convert(&store, &dir, "base", vec![base]),
             stack: convert(&store, &dir, "stack", stack),
             deep: convert(&store, &dir, "deep", deep),
@@ -252,6 +255,8 @@ fn vcpus() -> u8 {
 pub struct Case {
     pub dir: tempfile::TempDir,
     pub vmm: Box<dyn Vmm>,
+    /// Another init layer than the fixtures' (a hostile guest as PID 1).
+    pub init: Option<PathBuf>,
 }
 
 impl Case {
@@ -266,14 +271,12 @@ impl Case {
                 .tempdir()
                 .unwrap(),
             vmm: backend.discover().expect("VMM binary"),
+            init: None,
         })
     }
 
     pub fn exit_method(&self) -> ExitMethod {
-        match self.vmm.capabilities().guest_exit {
-            GuestExit::Reboot => ExitMethod::Reboot,
-            GuestExit::Poweroff => ExitMethod::Poweroff,
-        }
+        kiln_run::exit_method(self.vmm.as_ref())
     }
 
     /// A config running `argv` on `layers` layers with the defaults `kiln run` would use.
@@ -298,37 +301,33 @@ impl Case {
         }
     }
 
-    /// The VM: init layer, a fresh scratch disk of `config.scratch` bytes, then `layers`.
+    /// The VM: the init layer (the fixtures' or `init`), a fresh scratch disk of
+    /// `config.scratch` bytes, then `layers`; assembled as `kiln run` assembles it.
     pub fn spec(&self, layers: &[PathBuf], config: &Config, net: Option<NetSpec>) -> VmSpec {
         let env = env().unwrap();
         let scratch_path = self.dir.path().join("scratch.img");
         let _ = std::fs::remove_file(&scratch_path);
         scratch::create_scratch(&scratch_path, config.scratch.size_bytes).unwrap();
-        let mut disks = vec![
-            Disk {
-                path: fixtures().init.clone(),
-                read_only: true,
-            },
-            Disk {
-                path: scratch_path,
-                read_only: false,
-            },
-        ];
-        disks.extend(layers.iter().map(|p| Disk {
-            path: p.clone(),
-            read_only: true,
-        }));
-        VmSpec {
-            kernel: env.kernel.clone(),
-            initramfs: None,
-            cmdline: CMDLINE.map(String::from).to_vec(),
-            disks,
-            vcpus: vcpus(),
-            memory_mib: 256,
-            vsock: Some(VsockSpec { guest_cid: GUEST_CID }),
+        let init = self.init.clone().unwrap_or_else(|| fixtures().init.clone());
+        kiln_run::vm_spec(
+            &env.kernel,
+            &init,
+            &scratch_path,
+            layers,
+            vcpus(),
+            256,
             net,
-            console_log: self.dir.path().join("console.log"),
-            run_dir: self.dir.path().to_path_buf(),
+            &self.dir.path().join("console.log"),
+            self.dir.path(),
+        )
+    }
+
+    /// The session's timeouts for nested virtualization.
+    pub fn options(&self) -> SessionOptions {
+        SessionOptions {
+            boot_timeout: BOOT,
+            end_timeout: Duration::from_secs(30),
+            ..SessionOptions::default()
         }
     }
 
@@ -338,7 +337,7 @@ impl Case {
 
     pub fn start_with(&self, spec: VmSpec, config: Config, reply: Reply, stdin: Vec<u8>) -> Session {
         let vm = self.vmm.create(&spec).expect("create the VM");
-        Session::start(vm, config, reply, stdin)
+        Session::start(vm, config, reply, stdin, self.options())
     }
 
     /// Boots, runs to the end, and returns what happened.
