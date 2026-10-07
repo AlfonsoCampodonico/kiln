@@ -2,6 +2,7 @@
 //! registry convert, pull and push, the init layer and the scratch disk.
 #![forbid(unsafe_code)]
 
+pub mod artifacts;
 mod convert;
 mod ctx;
 mod decompress;

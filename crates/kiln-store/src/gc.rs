@@ -61,8 +61,16 @@ impl Store {
 
     /// Takes the exclusive lock, then removes unreferenced cache entries and blobs.
     pub fn gc(&self) -> Result<GcReport> {
+        self.gc_with_roots(|_| Ok(Vec::new()))
+    }
+
+    /// [`Store::gc`], also keeping the blobs `roots` names (and the cache entries
+    /// naming them) although no ref reaches them: kiln's pinned boot artifacts and
+    /// the init layers built from them (spec §5.2). `roots` runs under the lock.
+    pub fn gc_with_roots(&self, roots: impl FnOnce(&Store) -> Result<Vec<Digest>>) -> Result<GcReport> {
         let _lock = self.lock_exclusive()?;
-        let live = self.live_blobs()?;
+        let mut live = self.live_blobs()?;
+        live.extend(roots(self)?);
         let mut report = GcReport::default();
         for kind in CacheKind::ALL {
             for (path, value) in self.cache_entries(kind)? {
@@ -179,6 +187,40 @@ mod tests {
         fs::write(&disk, b"disk").unwrap();
         s.gc().unwrap();
         assert_eq!(fs::read(&disk).unwrap(), b"disk");
+    }
+
+    /// Pinned artifacts and the cache entries naming them survive GC (ruling 3);
+    /// other cache entries of the same kind do not.
+    #[test]
+    fn roots_are_kept_with_their_cache_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let (kernel, init, layer) = (
+            s.put_bytes(b"a pinned kernel").unwrap(),
+            s.put_bytes(b"a pinned kiln-init").unwrap(),
+            s.put_bytes(b"its init layer").unwrap(),
+        );
+        let old = s.put_bytes(b"an older init layer").unwrap();
+        let key = |d: &Digest| format!("{d}@1");
+        s.cache_put(CacheKind::InitLayers, &key(&init), &layer.to_string())
+            .unwrap();
+        let old_init = Digest::of(b"an older kiln-init");
+        s.cache_put(CacheKind::InitLayers, &key(&old_init), &old.to_string())
+            .unwrap();
+        let roots = vec![kernel.clone(), init.clone(), layer.clone()];
+        let r = s.gc_with_roots(|_| Ok(roots)).unwrap();
+        assert_eq!((r.blobs_removed, r.cache_entries_removed), (1, 1));
+        for d in [&kernel, &init, &layer] {
+            assert!(s.has_blob(d), "{d}");
+        }
+        assert!(!s.has_blob(&old));
+        assert_eq!(
+            s.cache_get_blob(CacheKind::InitLayers, &key(&init)).unwrap(),
+            Some(layer)
+        );
+        assert_eq!(s.cache_get(CacheKind::InitLayers, &key(&old_init)).unwrap(), None);
+        // Without roots, all of it goes.
+        assert_eq!(s.gc().unwrap().blobs_removed, 3);
     }
 
     #[test]
