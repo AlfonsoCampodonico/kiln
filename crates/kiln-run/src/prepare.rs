@@ -129,7 +129,8 @@ pub fn import_from(store: &Store, from: &Path, name: &str) -> Result<Option<Stri
 }
 
 /// Resolves `opts.image` for `arch` and decides the kernel and init (spec §8.1)
-/// against `pins`; a pinned kiln-init missing from the store comes from `fetcher`.
+/// against `pins`; a pinned kernel or kiln-init missing from the store comes from
+/// `fetcher`.
 pub fn prepare(
     store: &Store,
     opts: &RunOptions,
@@ -226,7 +227,11 @@ pub fn prepare(
             warnings.push(format!("booting {shown}'s custom kernel (--allow-custom-kernel)"));
         } else {
             match pins.kernel(&k.profile, &k.version, arch) {
-                Some(pin) if pin.digest()? == *layer => {}
+                // Verified against the pin's size too, and fetched by digest when the
+                // store lacks it (an image pulled without its kernel blob).
+                Some(pin) if pin.digest()? == *layer => {
+                    artifacts::ensure(store, &pin, fetcher)?;
+                }
                 Some(_) => {
                     return Err(Error::refused(format!(
                         "{shown}'s kernel layer {layer} is not the pinned kernel {profile} {version} for {arch}; \
@@ -241,7 +246,7 @@ pub fn prepare(
                 }
             }
         }
-        if !store.has_blob(layer) {
+        if custom && !store.has_blob(layer) {
             return Err(Error::refused(format!(
                 "{shown}: kernel layer {layer} is missing from the store"
             )));

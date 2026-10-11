@@ -447,6 +447,38 @@ fn a_kernel_layer_that_is_not_the_pinned_one_is_refused() {
     kiln_run::prepare::prepare(&s.store, &o, ARCH, &Table(&table), &none).unwrap();
 }
 
+/// The pinned kernel layer is checked like any pinned artifact (`artifacts::ensure`):
+/// a blob missing from the store is fetched by digest from the pin's repository,
+/// and one whose size is not the pin's is refused.
+#[test]
+fn the_pinned_kernel_layer_is_fetched_when_missing_and_its_size_checked() {
+    let s = setup();
+    s.with_boot_layers("booted", "base", b"\x7fELF the image's init");
+    let kernel = b"an image's kernel";
+    let reg = TestRegistry::start(Config::default());
+    reg.put_blob(kernel);
+    let pin = Pin {
+        repository: leak(format!("{}/vmkit-kernels/base", reg.host())),
+        ..kernel_pin(kernel)
+    };
+    let mut o = RunOptions::new("booted");
+    o.init = Some(s.files.join("init"));
+    o.allow_custom_init = true;
+    let fetcher = RegistryFetcher {
+        config: DockerConfig::anonymous(),
+    };
+    std::fs::remove_file(s.store.blob_path(&Digest::of(kernel))).unwrap();
+    let p = kiln_run::prepare::prepare(&s.store, &o, ARCH, &Table(std::slice::from_ref(&pin)), &fetcher).unwrap();
+    assert_eq!(std::fs::read(&p.kernel).unwrap(), kernel);
+    assert_eq!(reg.blob_requests("GET"), 1);
+    // A pin whose size disagrees with the blob is refused, without a fetch.
+    let wrong = Pin { size: 1, ..pin };
+    let none = Offline::default();
+    let e = err(kiln_run::prepare::prepare(&s.store, &o, ARCH, &Table(&[wrong]), &none));
+    assert!(e.contains("size"), "{e}");
+    assert_eq!(none.0.get(), 0);
+}
+
 /// A provisional image converted before the table pinned a kernel: convert it
 /// again (or name a kernel). A pinned kiln-init that cannot be fetched is named.
 #[test]
