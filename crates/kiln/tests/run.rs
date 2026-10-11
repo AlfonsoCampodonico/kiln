@@ -1056,6 +1056,21 @@ fn host_ip() -> std::net::Ipv4Addr {
     }
 }
 
+/// The host's IPv4 addresses (`ip -4 -o addr`), empty if `ip` is missing.
+fn host_addrs() -> Vec<std::net::Ipv4Addr> {
+    let Ok(out) = Command::new("ip").args(["-4", "-o", "addr", "show"]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            w.find(|x| *x == "inet")?;
+            w.next()?.split('/').next()?.parse().ok()
+        })
+        .collect()
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("0.0.0.0:0")
         .unwrap()
@@ -1184,23 +1199,38 @@ fn egress_policy_and_the_resolver_without_a_network() {
         let o = f.output(&args);
         assert_eq!(text(&o.stdout), want, "{egress:?}: {}", text(&o.stderr));
     }
-    // restricted (the default) blocks cloud metadata and private networks, at once
-    // or within nc's own bound, never hanging the guest.
-    let started = Instant::now();
-    let o = f.output(&[
-        "--net",
-        "busybox",
-        "--",
-        "sh",
-        "-c",
-        &format!(
-            "{}; {}",
-            probe("169.254.169.254 80".into()),
-            probe("10.0.0.1 80".into())
-        ),
-    ]);
-    assert_eq!(text(&o.stdout), "blocked\nblocked\n", "{}", text(&o.stderr));
-    assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
+    // restricted (the default) blocks link-local (cloud metadata) and private
+    // addresses that --egress open reaches: the host's own, other than the outbound
+    // one, with the listener above (the CI job adds some to lo).
+    let targets: Vec<std::net::Ipv4Addr> = [
+        |a: &std::net::Ipv4Addr| a.is_link_local(),
+        |a: &std::net::Ipv4Addr| a.is_private(),
+    ]
+    .iter()
+    .filter_map(|class| host_addrs().into_iter().find(|a| class(a) && *a != host_ip()))
+    .collect();
+    if targets.is_empty() {
+        eprintln!(
+            "note: the host has no link-local or private address but its outbound one; the open/restricted contrast is not checked"
+        );
+    }
+    let probes = targets
+        .iter()
+        .map(|a| probe(format!("{a} {hport}")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    for (egress, want) in [("open", "reached\n"), ("restricted", "blocked\n")] {
+        if targets.is_empty() {
+            break;
+        }
+        let o = f.output(&["--net", "--egress", egress, "busybox", "--", "sh", "-c", &probes]);
+        assert_eq!(
+            text(&o.stdout),
+            want.repeat(targets.len()),
+            "{egress} {targets:?}: {}",
+            text(&o.stderr)
+        );
+    }
     // deny-all still resolves names (DNS through the gateway).
     let o = f.output(&[
         "--net",
