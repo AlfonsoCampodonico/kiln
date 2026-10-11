@@ -132,7 +132,11 @@ fn fixture_in(home: tempfile::TempDir, turn: fn() -> Turn) -> Option<Fixture> {
         cfg,
     );
     b.add(d, None).finish();
-    let out = f.kiln().args(["convert", "--tag", "busybox"]).arg(&path).finish();
+    let out = f
+        .kiln()
+        .args(["convert", "--boot-layers", "none", "--tag", "busybox"])
+        .arg(&path)
+        .finish();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     Some(f)
 }
@@ -649,18 +653,14 @@ fn the_boot_timeout_ends_a_stuck_guest() {
     assert!(text(&o.stderr).contains("boot timeout"), "{}", text(&o.stderr));
 }
 
-/// The fixture's image has the pinned kernel layer (kiln convert fetched it) and
-/// no init layer: it needs --init, and --kernel needs its flag.
+/// The fixture's image is provisional (`--boot-layers none`: the default tests
+/// need no network): it needs --kernel and --init, each with its flag.
 #[test]
-fn an_image_without_a_pinned_init_needs_the_custom_flags() {
+fn a_provisional_image_needs_the_custom_kernel_flags() {
     let Some(f) = fixture() else { return };
     let o = f.kiln().args(["run", "busybox"]).finish();
     assert_eq!(code(&o), 125);
-    assert!(
-        text(&o.stderr).contains("no pinned kiln-init") && text(&o.stderr).contains("--allow-custom-init"),
-        "{}",
-        text(&o.stderr)
-    );
+    assert!(text(&o.stderr).contains("has no kernel layer"), "{}", text(&o.stderr));
     let o = f
         .kiln()
         .args(["run", "--kernel"])
@@ -704,7 +704,7 @@ fn with_boot_layers(store: &kiln_store::Store, from: &str, tag: &str, kernel: &P
     manifest.config = Descriptor::new(KILN_CONFIG, store.put_bytes(&config).unwrap(), config.len() as u64);
     let kernel = std::fs::read(kernel).unwrap();
     let init = kiln_image::init_layer(&std::fs::read(init).unwrap(), &store.tmp_dir()).unwrap();
-    // In place of the boot layers `kiln convert` added (the pinned kernel).
+    // In place of any boot layers the image has.
     manifest
         .layers
         .retain(|l| l.media_type == kiln_image::types::KILN_LAYER);
@@ -836,7 +836,15 @@ fn the_device_budget_is_checked_before_boot() {
     b.add(d, None).finish();
     let out = f
         .kiln()
-        .args(["convert", "--max-layers", "64", "--tag", "deep"])
+        .args([
+            "convert",
+            "--boot-layers",
+            "none",
+            "--max-layers",
+            "64",
+            "--tag",
+            "deep",
+        ])
         .arg(&path)
         .finish();
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -862,7 +870,11 @@ fn add_image(f: &Fixture, tag: &str, content: &str, config: ContainerConfig) {
         config,
     );
     b.add(d, None).finish();
-    let out = f.kiln().args(["convert", "--tag", tag]).arg(&path).finish();
+    let out = f
+        .kiln()
+        .args(["convert", "--boot-layers", "none", "--tag", tag])
+        .arg(&path)
+        .finish();
     assert!(out.status.success(), "{}", text(&out.stderr));
 }
 

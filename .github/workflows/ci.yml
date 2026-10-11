@@ -119,6 +119,10 @@ jobs:
       - run: cargo test -p kiln-image --test registries
         env:
           KILN_TEST_REGISTRIES: localhost:5000,localhost:5001
+      # The one test that fetches the pinned kernel from ghcr.io; the default tests need no network.
+      - run: cargo test -p kiln --test cli pinned_boot_layers_are_fetched_from_the_registry
+        env:
+          KILN_TEST_NETWORK: "1"
   golden-immutable:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04

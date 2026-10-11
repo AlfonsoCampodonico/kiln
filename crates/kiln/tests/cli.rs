@@ -44,16 +44,16 @@ fn convert_ls_inspect_gc_import() {
     let home = tempfile::tempdir().unwrap();
     let path = layout(&src.path().join("app"), "php", simple());
     kiln(home.path())
-        .args(["convert", "--platform", "linux/arm64"])
+        .args(["convert", "--boot-layers", "none", "--platform", "linux/arm64"])
         .arg(&path)
         .assert()
         .success()
         .stdout(predicate::str::contains("app:latest → sha256:"))
-        // The table pins the kernel (fetched from ghcr.io by digest) and no kiln-init
-        // yet: what `kiln run` needs for the image.
+        // A provisional image (no network: the pinned fetch has its own test), and
+        // what `kiln run` needs for it.
         .stderr(predicate::str::contains(
-            "note: this kiln pins no kiln-init for arm64 yet, so the image has no kiln-init layer; \
-             `kiln run` needs --init for it",
+            "note: --boot-layers none: a provisional image without kernel or kiln-init layers; \
+             `kiln run` needs --kernel and --init for it",
         ));
     kiln(home.path())
         .args(["ls"])
@@ -69,7 +69,7 @@ fn convert_ls_inspect_gc_import() {
                 .and(predicate::str::contains("env:        A=1"))
                 .and(predicate::str::contains("unverified provenance"))
                 .and(predicate::str::contains(
-                    "boot:       kernel base 6.18.54, no init layer (run it with --init)",
+                    "boot:       none (a provisional image: run it with --kernel and --init)",
                 )),
         );
     let json = kiln(home.path())
@@ -109,7 +109,16 @@ fn json_convert_summary_reports_cache_hits() {
     let path = layout(&src.path().join("app"), "php", simple());
     let run = || {
         let out = kiln(home.path())
-            .args(["convert", "--json", "--platform", "linux/arm64", "--tag", "x:1"])
+            .args([
+                "convert",
+                "--boot-layers",
+                "none",
+                "--json",
+                "--platform",
+                "linux/arm64",
+                "--tag",
+                "x:1",
+            ])
             .arg(&path)
             .output()
             .unwrap();
@@ -134,7 +143,7 @@ fn image_strings_are_sanitised_in_inspect_and_errors() {
     };
     let path = layout_with(&src.path().join("evil"), cfg, simple());
     kiln(home.path())
-        .args(["convert", "--platform", "linux/arm64"])
+        .args(["convert", "--boot-layers", "none", "--platform", "linux/arm64"])
         .arg(&path)
         .assert()
         .success();
@@ -156,7 +165,7 @@ fn image_strings_are_sanitised_in_inspect_and_errors() {
     let bad = vec![TarBuilder::new().hardlink("x", "\x1b[31mmissing").finish()];
     let path = layout(&src.path().join("bad"), "sh", bad);
     let out = kiln(home.path())
-        .args(["convert", "--platform", "linux/arm64"])
+        .args(["convert", "--boot-layers", "none", "--platform", "linux/arm64"])
         .arg(&path)
         .output()
         .unwrap();
@@ -173,7 +182,7 @@ fn missing_platform_lists_available_ones() {
     let home = tempfile::tempdir().unwrap();
     let path = layout(&src.path().join("app"), "php", simple());
     kiln(home.path())
-        .args(["convert", "--platform", "linux/amd64"])
+        .args(["convert", "--boot-layers", "none", "--platform", "linux/amd64"])
         .arg(&path)
         .assert()
         .failure()
@@ -197,7 +206,15 @@ fn bench_emits_json() {
     let home = tempfile::tempdir().unwrap();
     let path = layout(&src.path().join("app"), "php", simple());
     let out = kiln(home.path())
-        .args(["bench", "--platform", "linux/arm64", "--changed-top-bytes", "100000"])
+        .args([
+            "bench",
+            "--boot-layers",
+            "none",
+            "--platform",
+            "linux/arm64",
+            "--changed-top-bytes",
+            "100000",
+        ])
         .arg(&path)
         .output()
         .unwrap();
@@ -233,7 +250,7 @@ fn many_layers_convert_with_a_low_open_file_limit() {
         .arg(assert_cmd::cargo::cargo_bin("kiln"))
         .arg("--store")
         .arg(home.path())
-        .args(["convert", "--platform", "linux/arm64"])
+        .args(["convert", "--boot-layers", "none", "--platform", "linux/arm64"])
         .arg(&path);
     let out = cmd.output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -246,7 +263,15 @@ fn a_bad_tag_fails_before_any_conversion() {
     let home = tempfile::tempdir().unwrap();
     let path = layout(&src.path().join("app"), "php", simple());
     kiln(home.path())
-        .args(["convert", "--platform", "linux/arm64", "--tag", "bad tag"])
+        .args([
+            "convert",
+            "--boot-layers",
+            "none",
+            "--platform",
+            "linux/arm64",
+            "--tag",
+            "bad tag",
+        ])
         .arg(&path)
         .assert()
         .failure()
@@ -270,6 +295,8 @@ fn repeated_platform_flags_convert_once() {
     let out = kiln(home.path())
         .args([
             "convert",
+            "--boot-layers",
+            "none",
             "--json",
             "--platform",
             "linux/arm64",
@@ -291,7 +318,15 @@ fn bench_refuses_more_than_one_platform() {
     let home = tempfile::tempdir().unwrap();
     let path = layout(&src.path().join("app"), "php", simple());
     kiln(home.path())
-        .args(["bench", "--platform", "linux/arm64", "--platform", "linux/amd64"])
+        .args([
+            "bench",
+            "--boot-layers",
+            "none",
+            "--platform",
+            "linux/arm64",
+            "--platform",
+            "linux/amd64",
+        ])
         .arg(&path)
         .assert()
         .failure()
@@ -323,7 +358,7 @@ fn convert_push_and_pull_through_a_registry() {
     let (home, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let source = format!("{}/team/app:v1", reg.host());
     kiln(home.path())
-        .args(["convert", "--platform", "linux/arm64", &source])
+        .args(["convert", "--boot-layers", "none", "--platform", "linux/arm64", &source])
         .assert()
         .success()
         .stdout(
@@ -333,7 +368,15 @@ fn convert_push_and_pull_through_a_registry() {
         );
     let warm = stdout_json(
         kiln(home.path())
-            .args(["convert", "--json", "--platform", "linux/arm64", &source])
+            .args([
+                "convert",
+                "--boot-layers",
+                "none",
+                "--json",
+                "--platform",
+                "linux/arm64",
+                &source,
+            ])
             .output()
             .unwrap(),
     );
@@ -396,7 +439,7 @@ fn registry_credentials_come_from_a_credential_helper_on_path() {
     let empty = tempfile::tempdir().unwrap();
     let out = kiln(home.path())
         .env("DOCKER_CONFIG", empty.path())
-        .args(["convert", "--platform", "linux/arm64", &source])
+        .args(["convert", "--boot-layers", "none", "--platform", "linux/arm64", &source])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -424,7 +467,7 @@ fn registry_credentials_come_from_a_credential_helper_on_path() {
     kiln(home.path())
         .env("DOCKER_CONFIG", config.path())
         .env("PATH", path)
-        .args(["convert", "--platform", "linux/arm64", &source])
+        .args(["convert", "--boot-layers", "none", "--platform", "linux/arm64", &source])
         .assert()
         .success();
     // The password never reaches the registry in the clear (basic auth is base64), nor any output.
@@ -439,8 +482,23 @@ fn registry_credentials_come_from_a_credential_helper_on_path() {
     );
     // Neither the failed nor the successful run printed the password.
     assert!(!stderr.contains("hunter2"));
-    let plain: &[&str] = &["convert", "--platform", "linux/arm64", source.as_str()];
-    let json: &[&str] = &["convert", "--json", "--platform", "linux/arm64", source.as_str()];
+    let plain: &[&str] = &[
+        "convert",
+        "--boot-layers",
+        "none",
+        "--platform",
+        "linux/arm64",
+        source.as_str(),
+    ];
+    let json: &[&str] = &[
+        "convert",
+        "--boot-layers",
+        "none",
+        "--json",
+        "--platform",
+        "linux/arm64",
+        source.as_str(),
+    ];
     for args in [plain, json] {
         let out = kiln(home.path())
             .env("DOCKER_CONFIG", config.path())
@@ -464,14 +522,14 @@ fn registry_credentials_come_from_a_credential_helper_on_path() {
 fn a_source_that_is_neither_a_path_nor_a_reference_is_explained() {
     let home = tempfile::tempdir().unwrap();
     kiln(home.path())
-        .args(["convert", "Not A Reference!"])
+        .args(["convert", "--boot-layers", "none", "Not A Reference!"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
             "Not A Reference! is not an existing path or a valid image reference",
         ));
     kiln(home.path())
-        .args(["convert", "--ref", "x", "localhost:1/app:v1"])
+        .args(["convert", "--boot-layers", "none", "--ref", "x", "localhost:1/app:v1"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--ref selects an image inside a local source"));
@@ -495,7 +553,7 @@ fn a_source_spelled_like_a_path_is_never_looked_up_in_a_registry() {
     ] {
         kiln(home.path())
             .env("DOCKER_CONFIG", empty.path())
-            .args(["convert", src])
+            .args(["convert", "--boot-layers", "none", src])
             .assert()
             .failure()
             .stderr(predicate::str::contains(format!("{src}: no such file or directory")));
@@ -512,7 +570,12 @@ fn a_registry_convert_that_finds_nothing_says_there_was_no_local_path_either() {
     let empty = tempfile::tempdir().unwrap();
     kiln(home.path())
         .env("DOCKER_CONFIG", empty.path())
-        .args(["convert", &format!("{}/app:missing", reg.host())])
+        .args([
+            "convert",
+            "--boot-layers",
+            "none",
+            &format!("{}/app:missing", reg.host()),
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("not found").and(predicate::str::contains("(no such local path either)")));
@@ -533,6 +596,8 @@ fn other_registry_convert_errors_do_not_mention_local_paths() {
         .env("DOCKER_CONFIG", empty.path())
         .args([
             "convert",
+            "--boot-layers",
+            "none",
             "--platform",
             "linux/s390x",
             &format!("{}/app:v1", reg.host()),
@@ -555,12 +620,12 @@ fn converting_a_kiln_image_from_a_registry_suggests_kiln_pull() {
     let source = format!("{}/team/app:v1", reg.host());
     let dest = format!("{}/team/kiln:v1", reg.host());
     kiln(home.path())
-        .args(["convert", "--platform", "linux/arm64", &source])
+        .args(["convert", "--boot-layers", "none", "--platform", "linux/arm64", &source])
         .assert()
         .success();
     kiln(home.path()).args(["push", &source, &dest]).assert().success();
     kiln(home.path())
-        .args(["convert", "--platform", "linux/arm64", &dest])
+        .args(["convert", "--boot-layers", "none", "--platform", "linux/arm64", &dest])
         .assert()
         .failure()
         .stderr(
@@ -667,12 +732,11 @@ fn run_explains_the_lima_vm() {
     );
 }
 
-/// On Linux the image is resolved before a VMM is needed: an image with the pinned
-/// kernel but no pinned kiln-init, run without --init, is refused with 125 (no KVM
-/// needed).
+/// On Linux the image is resolved before a VMM is needed: a provisional image, run
+/// without --kernel, is refused with 125 (no KVM needed).
 #[cfg(target_os = "linux")]
 #[test]
-fn run_refuses_an_image_without_a_pinned_init_before_booting() {
+fn run_refuses_an_image_without_a_kernel_before_booting() {
     let src = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut b = LayoutBuilder::new(&src.path().join("app"));
@@ -683,7 +747,7 @@ fn run_refuses_an_image_without_a_pinned_init_before_booting() {
     );
     let path = b.add(d, None).finish();
     kiln(home.path())
-        .args(["convert", "--tag", "app"])
+        .args(["convert", "--boot-layers", "none", "--tag", "app"])
         .arg(&path)
         .assert()
         .success();
@@ -691,7 +755,7 @@ fn run_refuses_an_image_without_a_pinned_init_before_booting() {
         .args(["run", "app"])
         .assert()
         .code(125)
-        .stderr(predicate::str::contains("no pinned kiln-init").and(predicate::str::contains("--allow-custom-init")));
+        .stderr(predicate::str::contains("has no kernel layer").and(predicate::str::contains("--allow-custom-kernel")));
     kiln(home.path()).args(["run", "missing"]).assert().code(125);
     // An egress exception for the host's outbound address is refused before boot
     // (pasta gives the VM's namespace that address).
@@ -713,4 +777,45 @@ fn run_refuses_an_image_without_a_pinned_init_before_booting() {
         .assert()
         .code(125)
         .stderr(predicate::str::contains("the input device is not a TTY"));
+}
+
+/// The real pinned fetch (spec §6.5, §8.1), from ghcr.io: only with
+/// KILN_TEST_NETWORK=1 (one CI job sets it), so the default tests need no network.
+/// The image gets the pinned kernel layer (no kiln-init is pinned yet), fetched
+/// anonymously by digest, and `kiln gc` keeps the kernel blob.
+#[test]
+fn pinned_boot_layers_are_fetched_from_the_registry() {
+    if std::env::var_os("KILN_TEST_NETWORK").is_none_or(|v| v != "1") {
+        eprintln!("skipped: KILN_TEST_NETWORK=1 fetches the pinned kernel from ghcr.io");
+        return;
+    }
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let docker = tempfile::tempdir().unwrap();
+    let path = layout(&src.path().join("app"), "php", simple());
+    kiln(home.path())
+        .env("DOCKER_CONFIG", docker.path())
+        .args(["convert", "--platform", "linux/arm64"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "note: this kiln pins no kiln-init for arm64 yet, so the image has no kiln-init layer; \
+             `kiln run` needs --init for it",
+        ));
+    kiln(home.path())
+        .args(["inspect", "app:latest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "boot:       kernel base 6.18.54, no init layer (run it with --init)",
+        ));
+    let pin = kiln_image::artifacts::kernel_pin("base", "6.18.54", "arm64").unwrap();
+    let blob = home
+        .path()
+        .join("blobs/sha256")
+        .join(pin.digest.trim_start_matches("sha256:"));
+    assert_eq!(std::fs::metadata(&blob).unwrap().len(), pin.size);
+    kiln(home.path()).arg("gc").assert().success();
+    assert!(blob.exists(), "gc removed the pinned kernel");
 }
