@@ -11,13 +11,19 @@
 //!   other layers anyway, with a warning. The two exclude each other.
 //! - A disk is never truncated: a `--disk` smaller than it is refused, a larger
 //!   one grows the file (the guest grows the filesystem at boot).
-//! - A disk without a readable sidecar is refused unless reset or forced.
-//! - The disk is locked (`flock`) for the run, so two runs never share it. It lives
-//!   where the user put it, outside the store's scratch directories, so no cleanup
-//!   of stale runs ever touches it.
+//! - A disk without a readable sidecar is refused unless reset or forced. A sidecar
+//!   from a newer kiln is refused even when forced (this kiln cannot tell what the
+//!   disk holds, and would downgrade the sidecar); only a reset replaces it.
+//! - The disk is locked (`flock`) first, and what is there is inspected and decided
+//!   on under the lock, so two runs never share it and no decision is made on a
+//!   disk another run is changing. It lives where the user put it, outside the
+//!   store's scratch directories, so no cleanup of stale runs ever touches it.
+//! - The sidecar is written once the guest is running ([`Persisted::record`]): a run
+//!   whose guest never got that far leaves the old sidecar, or none when the disk
+//!   was (re)created, never one naming layers the disk does not hold.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use kiln_store::Digest;
@@ -35,10 +41,12 @@ pub struct Sidecar {
     pub manifest: Digest,
     /// Its app layers, lowest first.
     pub layers: Vec<Digest>,
-    pub size: u64,
 }
 
 pub const SIDECAR_VERSION: u32 = 1;
+
+/// The most of a sidecar read: it is a few hundred bytes.
+const MAX_SIDECAR: u64 = 64 * 1024;
 
 /// The sidecar's path for a disk.
 pub fn sidecar_path(disk: &Path) -> PathBuf {
@@ -47,30 +55,38 @@ pub fn sidecar_path(disk: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// What to do with the disk.
+/// What to do with an existing disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// Create it with this size.
-    Create { size: u64 },
-    /// (Re)create it, removing what is there.
+    /// Recreate it with this size, removing what is there.
     Recreate { size: u64 },
     /// Use it, growing the file to `size` when that is larger.
     Reuse { size: u64 },
+}
+
+/// The sidecar next to a disk, as kiln can read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    /// None, or one kiln cannot read.
+    Unreadable,
+    /// Written by a newer kiln (this version).
+    Newer(u32),
+    Sidecar(Sidecar),
 }
 
 /// What is at the path now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Existing {
     pub size: u64,
-    /// `None`: no sidecar, or one kiln cannot read.
-    pub sidecar: Option<Sidecar>,
+    pub sidecar: Found,
 }
 
-/// Decides, without touching anything. Returns the plan and the lines to print
-/// (each starting `warning: ` or `note: `).
+/// Decides what to do with an existing disk, without touching anything. Returns
+/// the plan and the lines to print once it is applied (each starting `warning: `
+/// or `note: `).
 pub fn decide(
     path: &Path,
-    existing: Option<&Existing>,
+    e: &Existing,
     manifest: &Digest,
     layers: &[Digest],
     disk: Option<u64>,
@@ -78,14 +94,6 @@ pub fn decide(
     force: bool,
 ) -> Result<(Plan, Vec<String>)> {
     let shown = path.display();
-    let Some(e) = existing else {
-        return Ok((
-            Plan::Create {
-                size: disk.unwrap_or(DEFAULT_DISK),
-            },
-            Vec::new(),
-        ));
-    };
     if reset {
         return Ok((
             Plan::Recreate {
@@ -96,18 +104,26 @@ pub fn decide(
     }
     let mut warnings = Vec::new();
     match &e.sidecar {
-        None if force => warnings.push(format!(
+        Found::Newer(v) => {
+            return Err(Error::refused(format!(
+                "{shown} was last used by a newer kiln (its sidecar {} has version {v}); this kiln cannot \
+                 tell what the disk holds, even with --persist-force. Use that kiln, or pass --persist-reset to \
+                 recreate it",
+                sidecar_path(path).display()
+            )));
+        }
+        Found::Unreadable if force => warnings.push(format!(
             "warning: --persist-force: {shown} has no readable {}; using it anyway",
             sidecar_path(path).display()
         )),
-        None => {
+        Found::Unreadable => {
             return Err(Error::refused(format!(
                 "{shown} exists but has no readable kiln sidecar ({}); pass --persist-reset to \
                  recreate it, or --persist-force to use it anyway",
                 sidecar_path(path).display()
             )));
         }
-        Some(s) if s.layers == layers => {
+        Found::Sidecar(s) if s.layers == layers => {
             if s.manifest != *manifest {
                 warnings.push(format!(
                     "note: {shown} was last used with the image {}, which has the same layers; reusing it",
@@ -115,7 +131,7 @@ pub fn decide(
                 ));
             }
         }
-        Some(s) => {
+        Found::Sidecar(s) => {
             if !force {
                 return Err(Error::refused(format!(
                     "{shown} was used with another image ({}) whose layers differ; overlayfs cannot keep its \
@@ -142,72 +158,167 @@ pub fn decide(
     Ok((Plan::Reuse { size }, warnings))
 }
 
-/// Reads what is at `path`: a regular file (never followed through a symlink), and
-/// its sidecar if kiln can parse it.
-pub fn inspect(path: &Path) -> Result<Option<Existing>> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    if !meta.is_file() {
-        return Err(Error::refused(format!(
-            "--persist {} is not a regular file",
-            path.display()
-        )));
-    }
-    let sidecar = std::fs::read(sidecar_path(path))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Sidecar>(&b).ok())
-        .filter(|s| s.version == SIDECAR_VERSION);
-    Ok(Some(Existing {
-        size: meta.len(),
-        sidecar,
-    }))
+/// The disk of a run, locked until this is dropped.
+#[derive(Debug)]
+pub struct Persisted {
+    file: File,
+    path: PathBuf,
+    sidecar: Sidecar,
 }
 
-/// Opens the disk for the run (creating, recreating or growing it per `plan`),
-/// takes an exclusive lock on it so two runs never share it, and writes the sidecar.
-/// A disk in use by another run is refused before anything changes.
-pub fn apply(path: &Path, plan: &Plan, manifest: &Digest, layers: &[Digest]) -> Result<File> {
-    let size = match *plan {
-        Plan::Recreate { size } => {
-            // Held while the old disk is replaced: never under a run using it.
-            let _old = locked(path)?;
-            std::fs::remove_file(path)?;
-            create(path, size)?;
-            size
-        }
-        Plan::Create { size } => {
-            create(path, size)?;
-            size
-        }
-        Plan::Reuse { size } => size,
-    };
-    let file = locked(path)?;
-    if file.metadata()?.len() < size {
-        file.set_len(size)?;
+impl Persisted {
+    pub fn file(&self) -> &File {
+        &self.file
     }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Records the image in the sidecar: once the guest is running, so the disk
+    /// holds what the sidecar says.
+    pub fn record(&self) -> Result<()> {
+        write_sidecar(&self.path, &self.sidecar)
+    }
+
+    /// Keeps the lock for as long as this process lives: kiln gave up on a VMM
+    /// that may still be using the disk.
+    pub fn hold(self) {
+        std::mem::forget(self.file);
+    }
+}
+
+/// Opens the disk at `path` for a run: locks it first (so it is never shared and
+/// never decided on while another run changes it), then inspects it and decides
+/// ([`decide`]) under the lock, and creates, recreates or grows it. A disk in use
+/// by another run is refused before anything changes. Returns the lines to print.
+pub fn open(
+    path: &Path,
+    manifest: &Digest,
+    layers: &[Digest],
+    disk: Option<u64>,
+    reset: bool,
+    force: bool,
+) -> Result<(Persisted, Vec<String>)> {
     let sidecar = Sidecar {
         version: SIDECAR_VERSION,
         manifest: manifest.clone(),
         layers: layers.to_vec(),
-        size: file.metadata()?.len(),
     };
-    write_sidecar(path, &sidecar)?;
+    let (file, lines) = match open_disk(path)? {
+        None => {
+            create(path, disk.unwrap_or(DEFAULT_DISK))?;
+            let file = open_locked(path)?;
+            // Under the new disk's lock: a sidecar left from a disk removed since names
+            // nothing this one holds.
+            remove_sidecar(path)?;
+            (file, Vec::new())
+        }
+        Some(file) => {
+            lock(&file, path)?;
+            check(&file, path)?;
+            let existing = Existing {
+                size: file.metadata()?.len(),
+                sidecar: read_sidecar(path),
+            };
+            let (plan, lines) = decide(path, &existing, manifest, layers, disk, reset, force)?;
+            match plan {
+                Plan::Recreate { size } => {
+                    // The old disk's lock is held until the new one is in place.
+                    remove_sidecar(path)?;
+                    std::fs::remove_file(path)?;
+                    create(path, size)?;
+                    let new = open_locked(path)?;
+                    drop(file);
+                    (new, lines)
+                }
+                Plan::Reuse { size } => {
+                    if file.metadata()?.len() < size {
+                        file.set_len(size)?;
+                    }
+                    (file, lines)
+                }
+            }
+        }
+    };
+    Ok((
+        Persisted {
+            file,
+            path: path.to_path_buf(),
+            sidecar,
+        },
+        lines,
+    ))
+}
+
+/// The disk, opened read-write without following a symlink; `None` when nothing
+/// is there. Anything but a regular file is refused before it is opened.
+fn open_disk(path: &Path) -> Result<Option<File>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => {
+            return Err(Error::refused(format!(
+                "--persist {} is not a regular file",
+                path.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    match open_nofollow(path) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::refused(format!(
+            "--persist {}: {e} (it must be a regular file, not a symlink)",
+            path.display()
+        ))),
+    }
+}
+
+/// The disk kiln just created, opened, locked and checked.
+fn open_locked(path: &Path) -> Result<File> {
+    let file = open_nofollow(path)?;
+    lock(&file, path)?;
+    check(&file, path)?;
     Ok(file)
 }
 
-/// The disk, opened without following a symlink and locked for this run.
-fn locked(path: &Path) -> Result<File> {
-    let file = open_nofollow(path)?;
-    if !try_lock(&file)? {
+fn lock(file: &File, path: &Path) -> Result<()> {
+    if !try_lock(file)? {
         return Err(Error::refused(format!(
             "{} is in use by another kiln run",
             path.display()
         )));
     }
-    Ok(file)
+    Ok(())
+}
+
+/// What was opened is a regular file of this user's, and still the one at `path`
+/// (another run may have recreated it between the open and the lock).
+#[cfg(unix)]
+fn check(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = rustix::process::getuid().as_raw();
+    let m = file.metadata()?;
+    if !m.is_file() || m.uid() != uid {
+        return Err(Error::refused(format!(
+            "--persist {} must be a regular file owned by uid {uid}",
+            path.display()
+        )));
+    }
+    let now = std::fs::symlink_metadata(path).ok();
+    if now.is_none_or(|n| (n.dev(), n.ino()) != (m.dev(), m.ino())) {
+        return Err(Error::refused(format!(
+            "{} changed while kiln opened it (another kiln run?)",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check(_: &File, _: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Creates the disk from the template; never over a file that appeared meanwhile.
@@ -223,15 +334,19 @@ fn create(path: &Path, size: u64) -> Result<()> {
     }
 }
 
-fn open_nofollow(path: &Path) -> Result<File> {
-    let mut o = OpenOptions::new();
-    o.read(true).write(true);
+fn nofollow(o: &mut OpenOptions) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        o.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+        o.custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
     }
-    Ok(o.open(path)?)
+}
+
+fn open_nofollow(path: &Path) -> std::io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.read(true).write(true);
+    nofollow(&mut o);
+    o.open(path)
 }
 
 #[cfg(unix)]
@@ -247,6 +362,43 @@ fn try_lock(file: &File) -> Result<bool> {
 #[cfg(not(unix))]
 fn try_lock(_: &File) -> Result<bool> {
     Ok(true)
+}
+
+/// The sidecar next to `disk`, read without following a symlink: only a regular
+/// file of at most [`MAX_SIDECAR`] bytes holding a sidecar of this version counts;
+/// one of a later version is reported as such.
+pub fn read_sidecar(disk: &Path) -> Found {
+    #[derive(Deserialize)]
+    struct Versioned {
+        version: u32,
+    }
+    let mut o = OpenOptions::new();
+    o.read(true);
+    nofollow(&mut o);
+    let Ok(f) = o.open(sidecar_path(disk)) else {
+        return Found::Unreadable;
+    };
+    if !f.metadata().is_ok_and(|m| m.is_file()) {
+        return Found::Unreadable;
+    }
+    let mut bytes = Vec::new();
+    if f.take(MAX_SIDECAR + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_SIDECAR {
+        return Found::Unreadable;
+    }
+    match serde_json::from_slice::<Versioned>(&bytes) {
+        Ok(v) if v.version > SIDECAR_VERSION => Found::Newer(v.version),
+        Ok(v) if v.version == SIDECAR_VERSION => serde_json::from_slice::<Sidecar>(&bytes)
+            .map(Found::Sidecar)
+            .unwrap_or(Found::Unreadable),
+        _ => Found::Unreadable,
+    }
+}
+
+fn remove_sidecar(disk: &Path) -> Result<()> {
+    match std::fs::remove_file(sidecar_path(disk)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 /// Writes the sidecar atomically (temp file, then rename).
@@ -275,11 +427,10 @@ mod tests {
     fn existing(manifest: &str, layers: &[&str], size: u64) -> Existing {
         Existing {
             size,
-            sidecar: Some(Sidecar {
+            sidecar: Found::Sidecar(Sidecar {
                 version: 1,
                 manifest: d(manifest),
                 layers: layers.iter().map(|l| d(l)).collect(),
-                size,
             }),
         }
     }
@@ -289,34 +440,30 @@ mod tests {
         let p = Path::new("/disk.img");
         let (m, l) = (d("m"), vec![d("a"), d("b")]);
         let g = 1u64 << 30;
-        assert_eq!(
-            decide(p, None, &m, &l, None, false, false).unwrap().0,
-            Plan::Create { size: DEFAULT_DISK }
-        );
         let same = existing("m", &["a", "b"], g);
         assert_eq!(
-            decide(p, Some(&same), &m, &l, None, false, false).unwrap(),
+            decide(p, &same, &m, &l, None, false, false).unwrap(),
             (Plan::Reuse { size: g }, vec![])
         );
         assert_eq!(
-            decide(p, Some(&same), &m, &l, Some(2 * g), false, false).unwrap().0,
+            decide(p, &same, &m, &l, Some(2 * g), false, false).unwrap().0,
             Plan::Reuse { size: 2 * g }
         );
-        let err = decide(p, Some(&same), &m, &l, Some(g / 2), false, false).unwrap_err();
+        let err = decide(p, &same, &m, &l, Some(g / 2), false, false).unwrap_err();
         assert!(err.to_string().contains("never shrunk"), "{err}");
         // A reset recreates, at any size.
         assert_eq!(
-            decide(p, Some(&same), &m, &l, Some(g / 2), true, false).unwrap().0,
+            decide(p, &same, &m, &l, Some(g / 2), true, false).unwrap().0,
             Plan::Recreate { size: g / 2 }
         );
 
         let other = existing("m2", &["a", "c"], g);
-        let err = decide(p, Some(&other), &m, &l, None, false, false).unwrap_err();
+        let err = decide(p, &other, &m, &l, None, false, false).unwrap_err();
         assert!(
             err.to_string().contains("layers differ") && err.to_string().contains("--persist-reset"),
             "{err}"
         );
-        let (plan, warnings) = decide(p, Some(&other), &m, &l, None, false, true).unwrap();
+        let (plan, warnings) = decide(p, &other, &m, &l, None, false, true).unwrap();
         assert_eq!(plan, Plan::Reuse { size: g });
         assert!(
             warnings.len() == 1 && warnings[0].starts_with("warning: --persist-force"),
@@ -324,66 +471,193 @@ mod tests {
         );
         // The same layers in another order are other layers.
         let reordered = existing("m", &["b", "a"], g);
-        assert!(decide(p, Some(&reordered), &m, &l, None, false, false).is_err());
+        assert!(decide(p, &reordered, &m, &l, None, false, false).is_err());
         // Ruling 2: the same layers under another manifest (env or cmd changed) are
         // reused, with one note.
         let same_layers = existing("m2", &["a", "b"], g);
-        let (plan, notes) = decide(p, Some(&same_layers), &m, &l, None, false, false).unwrap();
+        let (plan, notes) = decide(p, &same_layers, &m, &l, None, false, false).unwrap();
         assert_eq!(plan, Plan::Reuse { size: g });
         assert!(
             notes.len() == 1 && notes[0].starts_with("note: ") && notes[0].contains("same layers"),
             "{notes:?}"
         );
 
-        let bare = Existing { size: g, sidecar: None };
-        assert!(decide(p, Some(&bare), &m, &l, None, false, false).is_err());
-        assert!(decide(p, Some(&bare), &m, &l, None, false, true).is_ok());
+        let bare = Existing {
+            size: g,
+            sidecar: Found::Unreadable,
+        };
+        assert!(decide(p, &bare, &m, &l, None, false, false).is_err());
+        assert!(decide(p, &bare, &m, &l, None, false, true).is_ok());
+        // A newer kiln's sidecar: refused even when forced (no downgrade); a reset
+        // recreates the disk.
+        let newer = Existing {
+            size: g,
+            sidecar: Found::Newer(2),
+        };
+        for force in [false, true] {
+            let err = decide(p, &newer, &m, &l, None, false, force).unwrap_err().to_string();
+            assert!(err.contains("newer kiln") && err.contains("version 2"), "{err}");
+        }
+        assert!(matches!(
+            decide(p, &newer, &m, &l, None, true, false).unwrap().0,
+            Plan::Recreate { .. }
+        ));
+    }
+
+    fn sidecar_of(path: &Path) -> Found {
+        read_sidecar(path)
     }
 
     #[test]
-    fn apply_creates_grows_locks_and_records() {
+    fn open_creates_grows_locks_and_records_once_running() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("disk.img");
         let (m, l) = (d("m"), vec![d("a")]);
-        assert_eq!(inspect(&path).unwrap(), None);
-        let f = apply(&path, &Plan::Create { size: 64 << 20 }, &m, &l).unwrap();
-        let e = inspect(&path).unwrap().unwrap();
-        assert_eq!(e.size, 64 << 20);
-        assert_eq!(e.sidecar.as_ref().unwrap().layers, l);
+        let mb = |n: u64| Some(n << 20);
+        let (p, lines) = open(&path, &m, &l, mb(64), false, false).unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 64 << 20);
+        // Not recorded until the guest runs.
+        assert_eq!(sidecar_of(&path), Found::Unreadable);
+        p.record().unwrap();
+        let Found::Sidecar(s) = sidecar_of(&path) else {
+            panic!("{:?}", sidecar_of(&path))
+        };
+        assert_eq!((s.manifest, s.layers), (m.clone(), l.clone()));
         // Locked while in use.
-        let err = apply(&path, &Plan::Reuse { size: 64 << 20 }, &m, &l).unwrap_err();
+        let err = open(&path, &m, &l, None, false, false).unwrap_err();
         assert!(err.to_string().contains("in use"), "{err}");
-        drop(f);
+        drop(p);
         // Grows, never shrinks.
-        drop(apply(&path, &Plan::Reuse { size: 128 << 20 }, &m, &l).unwrap());
+        drop(open(&path, &m, &l, mb(128), false, false).unwrap());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 128 << 20);
-        assert_eq!(inspect(&path).unwrap().unwrap().sidecar.unwrap().size, 128 << 20);
-        drop(apply(&path, &Plan::Reuse { size: 64 << 20 }, &m, &l).unwrap());
+        assert!(open(&path, &m, &l, mb(64), false, false).is_err());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 128 << 20);
         // A symlink is refused, never followed.
         #[cfg(unix)]
         {
             let link = dir.path().join("link.img");
             std::os::unix::fs::symlink(&path, &link).unwrap();
-            assert!(inspect(&link).is_err());
+            let err = open(&link, &m, &l, None, false, true).unwrap_err();
+            assert!(err.to_string().contains("not a regular file"), "{err}");
         }
-        // Ruling 2: reused under another manifest, the sidecar records the new one.
+        // Ruling 2: reused under another manifest, the sidecar records the new one,
+        // and the note comes back to be printed.
         let m2 = d("m2");
-        drop(apply(&path, &Plan::Reuse { size: 128 << 20 }, &m2, &l).unwrap());
-        assert_eq!(inspect(&path).unwrap().unwrap().sidecar.unwrap().manifest, m2);
+        let (p, lines) = open(&path, &m2, &l, None, false, false).unwrap();
+        assert!(lines[0].contains("same layers"), "{lines:?}");
+        p.record().unwrap();
+        drop(p);
+        assert!(matches!(sidecar_of(&path), Found::Sidecar(s) if s.manifest == m2));
         // A disk in use is never recreated under its run.
-        let held = apply(&path, &Plan::Reuse { size: 128 << 20 }, &m, &l).unwrap();
-        let err = apply(&path, &Plan::Recreate { size: 64 << 20 }, &m, &l).unwrap_err();
+        let (held, _) = open(&path, &m, &l, None, false, false).unwrap();
+        let err = open(&path, &m, &l, mb(64), true, false).unwrap_err();
         assert!(err.to_string().contains("in use"), "{err}");
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 128 << 20);
         drop(held);
-        drop(apply(&path, &Plan::Recreate { size: 64 << 20 }, &m, &l).unwrap());
+        // Recreated: the old sidecar goes first, and a run that never gets the guest
+        // running leaves none.
+        let (p, lines) = open(&path, &d("m3"), &[d("z")], mb(64), true, false).unwrap();
+        assert!(lines[0].contains("--persist-reset"), "{lines:?}");
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 64 << 20);
-        // Created only where nothing is.
-        let err = apply(&path, &Plan::Create { size: 64 << 20 }, &m, &l).unwrap_err();
-        assert!(err.to_string().contains("appeared"), "{err}");
-        // A sidecar kiln cannot read counts as missing.
+        assert_eq!(sidecar_of(&path), Found::Unreadable);
+        drop(p);
+        assert!(open(&path, &m, &l, None, false, false).is_err());
+        // A sidecar kiln cannot read counts as missing; one too big, or a symlink, too.
         std::fs::write(sidecar_path(&path), b"{}").unwrap();
-        assert_eq!(inspect(&path).unwrap().unwrap().sidecar, None);
+        assert_eq!(sidecar_of(&path), Found::Unreadable);
+        std::fs::write(sidecar_path(&path), vec![b' '; 70_000]).unwrap();
+        assert_eq!(sidecar_of(&path), Found::Unreadable);
+        #[cfg(unix)]
+        {
+            let real = dir.path().join("real.json");
+            std::fs::write(
+                &real,
+                serde_json::to_vec(&Sidecar {
+                    version: 1,
+                    manifest: m.clone(),
+                    layers: l.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::remove_file(sidecar_path(&path)).unwrap();
+            std::os::unix::fs::symlink(&real, sidecar_path(&path)).unwrap();
+            assert_eq!(sidecar_of(&path), Found::Unreadable);
+        }
+        // A newer kiln's sidecar is named, and --persist-force does not overwrite it.
+        let _ = std::fs::remove_file(sidecar_path(&path));
+        std::fs::write(sidecar_path(&path), br#"{"version": 2, "whatever": true}"#).unwrap();
+        assert_eq!(sidecar_of(&path), Found::Newer(2));
+        let err = open(&path, &m, &l, None, false, true).unwrap_err();
+        assert!(err.to_string().contains("newer kiln"), "{err}");
+        assert_eq!(sidecar_of(&path), Found::Newer(2));
+    }
+
+    /// A disk created where none was clears a sidecar left from an earlier one.
+    #[test]
+    fn a_stale_sidecar_goes_when_the_disk_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.img");
+        std::fs::write(
+            sidecar_path(&path),
+            serde_json::to_vec(&Sidecar {
+                version: 1,
+                manifest: d("old"),
+                layers: vec![d("old")],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let (p, _) = open(&path, &d("m"), &[d("a")], Some(64 << 20), false, false).unwrap();
+        assert_eq!(read_sidecar(&path), Found::Unreadable);
+        drop(p);
+    }
+
+    /// Decisions are made under the disk's lock: a run deciding while another holds
+    /// the disk is refused as "in use", whatever the sidecar would have said, and
+    /// of runs racing to open the same path at most one holds it at a time.
+    #[test]
+    fn decisions_are_made_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.img");
+        let (m, a, b) = (d("m"), vec![d("a")], vec![d("b")]);
+        let (held, _) = open(&path, &m, &a, Some(64 << 20), false, false).unwrap();
+        held.record().unwrap();
+        // Another image's layers: without the lock first this would be "layers differ".
+        let err = open(&path, &d("m2"), &b, None, false, false).unwrap_err().to_string();
+        assert!(err.contains("in use"), "{err}");
+        drop(held);
+
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let inside = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let (gate, inside, path) = (gate.clone(), inside.clone(), path.clone());
+                let layers = if i % 2 == 0 { vec![d("a")] } else { vec![d("b")] };
+                std::thread::spawn(move || {
+                    gate.wait();
+                    let mut opened = 0;
+                    for _ in 0..20 {
+                        if let Ok((p, _)) = open(&path, &d("m"), &layers, None, i % 4 == 1, false) {
+                            assert_eq!(inside.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+                            p.record().unwrap();
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            inside.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            opened += 1;
+                        }
+                    }
+                    opened
+                })
+            })
+            .collect();
+        let opened: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        assert!(opened > 0);
+        // Whoever recorded last, the sidecar names one of the two images (or none,
+        // after a reset whose new disk another run took first).
+        match read_sidecar(&path) {
+            Found::Sidecar(s) => assert!(s.layers == a || s.layers == b, "{s:?}"),
+            other => assert_eq!(other, Found::Unreadable),
+        }
     }
 }

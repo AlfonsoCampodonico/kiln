@@ -141,8 +141,9 @@ pub struct Run {
     /// Dropped before `run_dir`, whose run.json records it; none with `--persist`.
     scratch_dir: Option<ScratchDir>,
     run_dir: RunDir,
-    /// The `--persist` disk, locked until the run ends.
-    _persist: Option<std::fs::File>,
+    /// The `--persist` disk, locked until the VMM is gone; its sidecar is written
+    /// once the guest is running.
+    persist: Option<persist::Persisted>,
     /// `KILN_KEEP_RUN_DIR=1` at the start.
     keep: bool,
     /// For the message when the VM ends without the guest's final message.
@@ -350,10 +351,9 @@ impl Run {
         };
         let (scratch, scratch_bytes, persist_file) = match (&opts.persist, &scratch_dir) {
             (Some(path), _) => {
-                let existing = persist::inspect(path)?;
-                let (plan, lines) = persist::decide(
+                // Locked first, then decided on and applied under the lock.
+                let (disk, lines) = persist::open(
                     path,
-                    existing.as_ref(),
                     &prepared.manifest,
                     &prepared.layers,
                     opts.disk,
@@ -363,9 +363,8 @@ impl Run {
                 for line in lines {
                     notice(&line);
                 }
-                let file = persist::apply(path, &plan, &prepared.manifest, &prepared.layers)?;
-                let size = file.metadata()?.len();
-                (std::fs::canonicalize(path)?, size, Some(file))
+                let size = disk.file().metadata()?.len();
+                (std::fs::canonicalize(path)?, size, Some(disk))
             }
             (None, Some(dir)) => {
                 let path = dir.path.join("scratch.img");
@@ -437,7 +436,7 @@ impl Run {
             console,
             scratch_dir,
             run_dir,
-            _persist: persist_file,
+            persist: persist_file,
             keep,
             vmm: opts.vmm,
             memory_mib: opts.memory_mib,
@@ -460,13 +459,27 @@ impl Run {
             console,
             scratch_dir,
             run_dir,
-            _persist,
+            persist,
             keep,
             vmm,
             memory_mib,
             limited,
         } = self;
-        let outcome = session.finish();
+        let mut session = session;
+        // The sidecar names the image once the guest runs it: a run that fails to
+        // boot leaves the old sidecar (or none, for a disk it created).
+        let mut unrecorded = None;
+        if let Some(p) = &persist
+            && session.wait_running()
+            && let Err(e) = p.record()
+        {
+            unrecorded = Some(format!(
+                "could not record the image in {}: {e}; the next run may refuse the disk",
+                persist::sidecar_path(p.path()).display()
+            ));
+        }
+        let mut outcome = session.finish();
+        outcome.warnings.extend(unrecorded);
         let log = console.log.clone();
         console.finish(Duration::from_secs(2));
         let failed = outcome.violation.is_some()
@@ -476,10 +489,14 @@ impl Run {
         let kept = keep.then(|| (run_dir.path.clone(), scratch_dir.as_ref().map(|d| d.path.clone())));
         let vmm_logs = vmm_logs(vmm, &run_dir.path);
         // The scratch directory first: while run.json lasts, it records it. The
-        // persisted disk's lock goes once the VMM has ended.
+        // persisted disk's lock goes once the VMM has ended, and stays for as long as
+        // kiln runs when kiln gave up on a VMM that may still be using the disk.
         drop(scratch_dir);
         drop(run_dir);
-        drop(_persist);
+        match persist {
+            Some(p) if outcome.vmm_lost => p.hold(),
+            other => drop(other),
+        }
         Report {
             outcome,
             console_tail,
@@ -518,6 +535,7 @@ mod tests {
                 running_after: None,
                 ended_after: None,
                 drained_after: Duration::ZERO,
+                vmm_lost: false,
             },
             console_tail: Vec::new(),
             kept: kept.then(|| (dir.to_path_buf(), Some(PathBuf::from("/s/scratch/abc")))),
