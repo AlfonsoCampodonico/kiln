@@ -372,8 +372,8 @@ impl Run {
 
         let base = rundir::base_dir()?;
         let (boot_id, hostname) = (rundir::boot_id(), rundir::hostname());
-        // Before a --persist disk is opened: a killed VMM that will not die may
-        // still hold it, and refuses the run.
+        // Before a --persist disk is opened: a killed VMM that will not die (or could
+        // not be killed) and used the same disk may still hold it, and refuses the run.
         let reaped = rundir::kill_orphans(
             &base,
             &boot_id,
@@ -382,7 +382,8 @@ impl Run {
             rundir::kill_identity,
             rundir::ORPHAN_WAIT,
         );
-        for line in rundir::reaped_notices(&reaped, opts.persist.is_some())? {
+        let disk = opts.persist.as_deref().and_then(rundir::DiskId::of);
+        for line in rundir::reaped_notices(&reaped, disk.as_ref())? {
             notice(&line);
         }
         let cleanup = rundir::clean_stale(&base, &boot_id, &hostname, rundir::alive);
@@ -423,6 +424,7 @@ impl Run {
             custom_init: prepared.custom_init.as_ref().map(|p| p.display().to_string()),
             keep,
             scratch_dir: scratch_path.as_ref().map(|p| p.display().to_string()),
+            persist: None,
         };
         // Recorded before it exists, so a stale cleanup always knows of it.
         run_dir.write_info(&info)?;
@@ -459,6 +461,9 @@ impl Run {
                     notice(&line);
                 }
                 let size = disk.file().metadata()?.len();
+                // Recorded with the VMM's identity below: a later run's reaper tells
+                // whether a VMM that will not die holds this disk.
+                info.persist = rundir::DiskId::of(path);
                 (std::fs::canonicalize(path)?, size, Some(disk))
             }
             (None, Some(dir)) => {
@@ -696,6 +701,7 @@ mod tests {
                 custom_init: None,
                 keep: false,
                 scratch_dir: None,
+                persist: None,
             })
             .unwrap();
             d

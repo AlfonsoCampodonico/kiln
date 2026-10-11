@@ -45,7 +45,7 @@ struct ConvertArgs {
     jobs: Option<usize>,
     /// The kernel and kiln-init layers: `pinned` adds those this kiln pins, fetched
     /// once by digest; `none` makes a provisional image without them (offline, or
-    /// behind a proxy kiln cannot use; `kiln run` then needs --kernel and --init).
+    /// behind a proxy kiln cannot use; `kiln run` then needs --kernel with --allow-custom-kernel).
     #[arg(long, value_enum, default_value_t = BootChoice::Pinned, value_name = "pinned|none")]
     boot_layers: BootChoice,
 }
@@ -420,7 +420,8 @@ fn run(cli: Cli) -> Result<()> {
             if args.boot_layers == BootChoice::None {
                 eprintln!(
                     "note: --boot-layers none: a provisional image without kernel or kiln-init layers; \
-                     `kiln run` needs --kernel and --init for it"
+                     `kiln run` needs --kernel PATH --allow-custom-kernel for it (kiln-init comes from the pin, \
+                     or --init)"
                 );
             } else {
                 for c in &out.images {

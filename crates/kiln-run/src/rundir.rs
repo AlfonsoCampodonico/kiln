@@ -65,6 +65,44 @@ pub struct RunInfo {
     /// The run's scratch directory ([`ScratchDir`]), removed with the run directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratch_dir: Option<String>,
+    /// The `--persist` disk, so a later run can tell whether a VMM that will not
+    /// die holds the disk it is about to use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist: Option<DiskId>,
+}
+
+/// A file by its canonical path and its device and inode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiskId {
+    pub path: String,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl DiskId {
+    /// The file at `path` now; `None` if it is not there.
+    #[cfg(unix)]
+    pub fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let canonical = std::fs::canonicalize(path).ok()?;
+        let m = std::fs::metadata(&canonical).ok()?;
+        Some(Self {
+            path: canonical.display().to_string(),
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub fn of(_: &Path) -> Option<Self> {
+        None
+    }
+
+    /// The same file: the same device and inode, or the same canonical path.
+    pub fn same(&self, other: &Self) -> bool {
+        (self.dev, self.ino) == (other.dev, other.ino) || self.path == other.path
+    }
 }
 
 pub const RUN_INFO_VERSION: u32 = 1;
@@ -321,6 +359,17 @@ fn zombie(stat: &str) -> bool {
         == Some("Z")
 }
 
+/// `Threads:` in `<dir>/status` is at most 1 (the zombie leader itself). Anything
+/// unreadable counts as more threads, so the process counts as alive.
+fn no_other_threads(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("status")).is_ok_and(|s| {
+        s.lines()
+            .find_map(|l| l.strip_prefix("Threads:"))
+            .and_then(|n| n.trim().parse::<u32>().ok())
+            .is_some_and(|n| n <= 1)
+    })
+}
+
 /// Whether `id` still names a running process. Only a process that is gone
 /// (`/proc/<pid>` missing: ENOENT or ESRCH) or a different start time (the pid was
 /// reused) counts as dead; anything that cannot be read (EMFILE, `hidepid`, another
@@ -330,10 +379,14 @@ pub fn alive(id: &Identity) -> bool {
 }
 
 fn alive_in(proc_root: &Path, id: &Identity) -> bool {
-    match std::fs::read_to_string(proc_root.join(id.pid.to_string()).join("stat")) {
+    let dir = proc_root.join(id.pid.to_string());
+    match std::fs::read_to_string(dir.join("stat")) {
         // A zombie has exited and closed its files (a VMM's disks): only its parent
-        // has yet to reap it.
-        Ok(stat) => parse_start_time(&stat).is_none_or(|t| t == id.start_time) && !zombie(&stat),
+        // has yet to reap it. A zombie thread-group leader whose other threads still
+        // run is not one: they keep its files.
+        Ok(stat) => {
+            parse_start_time(&stat).is_none_or(|t| t == id.start_time) && !(zombie(&stat) && no_other_threads(&dir))
+        }
         Err(e) => {
             !(e.kind() == std::io::ErrorKind::NotFound
                 || e.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()))
@@ -348,8 +401,23 @@ pub struct Reaped {
     pub run: String,
     pub vmm: Identity,
     /// It exited within the wait; false: it outlived its SIGKILL (stuck in the
-    /// kernel, say) and may still hold its disks.
+    /// kernel, say) or could not be killed, and may still hold its disks.
     pub gone: bool,
+    /// Why it could not be killed, when it could not.
+    pub failed: Option<String>,
+    /// Its run's `--persist` disk.
+    pub disk: Option<DiskId>,
+}
+
+/// What [`kill_identity`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kill {
+    /// SIGKILL was sent to that process.
+    Sent,
+    /// The process is not there (any more): nothing to kill.
+    Gone,
+    /// It may be there, and could not be killed (a kernel without pidfds, say).
+    Failed(String),
 }
 
 /// How long [`kill_orphans`] waits for a killed VMM to exit.
@@ -366,7 +434,7 @@ pub fn kill_orphans(
     boot_id: &str,
     hostname: &str,
     alive: impl Fn(&Identity) -> bool,
-    kill: impl Fn(&Identity) -> bool,
+    kill: impl Fn(&Identity) -> Kill,
     wait: std::time::Duration,
 ) -> Vec<Reaped> {
     let mut killed = Vec::new();
@@ -386,24 +454,30 @@ pub fn kill_orphans(
         else {
             continue;
         };
-        if let Some(vmm) = &info.vmm
-            && !alive(&info.kiln)
-            && alive(vmm)
-            && kill(vmm)
-        {
-            killed.push(Reaped {
-                run: entry.file_name().to_string_lossy().into_owned(),
-                vmm: *vmm,
-                gone: false,
-            });
+        let Some(vmm) = &info.vmm else { continue };
+        if alive(&info.kiln) || !alive(vmm) {
+            continue;
         }
+        let failed = match kill(vmm) {
+            Kill::Sent => None,
+            Kill::Gone => continue,
+            Kill::Failed(why) => Some(why),
+        };
+        killed.push(Reaped {
+            run: entry.file_name().to_string_lossy().into_owned(),
+            vmm: *vmm,
+            gone: false,
+            failed,
+            disk: info.persist.clone(),
+        });
     }
     let until = std::time::Instant::now() + wait;
     loop {
-        for r in killed.iter_mut().filter(|r| !r.gone) {
+        // One that could not be killed is not waited for: it counts as alive.
+        for r in killed.iter_mut().filter(|r| !r.gone && r.failed.is_none()) {
             r.gone = !alive(&r.vmm);
         }
-        if killed.iter().all(|r| r.gone) || std::time::Instant::now() >= until {
+        if killed.iter().all(|r| r.gone || r.failed.is_some()) || std::time::Instant::now() >= until {
             return killed;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -411,54 +485,65 @@ pub fn kill_orphans(
 }
 
 /// What the reaped VMMs mean for a run: notes and warnings to print, or, for a
-/// `--persist` run, a refusal while a killed VMM may still hold a disk (which disk
-/// is not recorded, so any such VMM refuses it).
-pub fn reaped_notices(reaped: &[Reaped], persist: bool) -> Result<Vec<String>> {
+/// `--persist` run on `disk`, a refusal while a VMM that may still be alive used
+/// that same disk (one that would not die, or could not be killed).
+pub fn reaped_notices(reaped: &[Reaped], disk: Option<&DiskId>) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for r in reaped {
         let run = kiln_proto::sanitize::clean_line(&r.run);
+        let why = match &r.failed {
+            Some(f) => format!("could not be killed ({})", kiln_proto::sanitize::clean_line(f)),
+            None => format!("did not die within {}s of SIGKILL", ORPHAN_WAIT.as_secs()),
+        };
         if r.gone {
             out.push(format!("note: killed the VMM of run {run}, whose kiln is gone"));
-        } else if persist {
+        } else if let (Some(d), Some(theirs)) = (disk, &r.disk)
+            && d.same(theirs)
+        {
             return Err(Error::refused(format!(
-                "the persisted disk may still be in use by a VMM that won't die: pid {} (run {run}); retry later \
-                 or reboot",
+                "the persisted disk is still in use by a VMM that won't die: pid {} (run {run}, which {why}); retry \
+                 later or reboot",
                 r.vmm.pid
             )));
         } else {
             out.push(format!(
-                "warning: the VMM of run {run} (pid {}), whose kiln is gone, did not die within {}s of SIGKILL",
-                r.vmm.pid,
-                ORPHAN_WAIT.as_secs()
+                "warning: the VMM of run {run} (pid {}), whose kiln is gone, {why}",
+                r.vmm.pid
             ));
         }
     }
     Ok(out)
 }
 
-/// Sends SIGKILL to the process `id` names, only when it is that process; true
-/// when the signal was sent. A pidfd pins
+/// Sends SIGKILL to the process `id` names, only when it is that process. A pidfd pins
 /// the process first, then `/proc` confirms its start time, and the signal goes
 /// through the pidfd: a pid reused at any point is never signalled (Linux).
 #[cfg(target_os = "linux")]
-pub fn kill_identity(id: &Identity) -> bool {
+pub fn kill_identity(id: &Identity) -> Kill {
+    use rustix::io::Errno;
     use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
     let Some(pid) = i32::try_from(id.pid).ok().and_then(Pid::from_raw) else {
-        return false;
+        return Kill::Gone;
     };
-    let Ok(fd) = pidfd_open(pid, PidfdFlags::empty()) else {
-        return false;
+    let fd = match pidfd_open(pid, PidfdFlags::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::SRCH) => return Kill::Gone,
+        Err(e) => return Kill::Failed(format!("pidfd_open: {}", std::io::Error::from(e))),
     };
-    if identity(id.pid) != Some(*id) || pidfd_send_signal(&fd, Signal::KILL).is_err() {
-        return false;
+    if identity(id.pid) != Some(*id) {
+        return Kill::Gone;
     }
-    true
+    match pidfd_send_signal(&fd, Signal::KILL) {
+        Ok(()) => Kill::Sent,
+        Err(Errno::SRCH) => Kill::Gone,
+        Err(e) => Kill::Failed(format!("pidfd_send_signal: {}", std::io::Error::from(e))),
+    }
 }
 
 /// [`kill_identity`] elsewhere: there is no `/proc` to confirm an identity with.
 #[cfg(not(target_os = "linux"))]
-pub fn kill_identity(_: &Identity) -> bool {
-    false
+pub fn kill_identity(_: &Identity) -> Kill {
+    Kill::Failed("no /proc to confirm the process with".into())
 }
 
 /// What [`clean_stale`] did.
@@ -676,6 +761,7 @@ mod tests {
             custom_init: None,
             keep: false,
             scratch_dir: None,
+            persist: None,
         }
     }
 
@@ -724,64 +810,154 @@ mod tests {
             }
         }
         // A process that is not the one named (another start time) is never killed.
-        assert!(!kill_identity(&gone));
+        assert_eq!(kill_identity(&gone), Kill::Gone);
+    }
+
+    fn stuck_run(base: &Path, id: &str, vmm: Identity, disk: Option<DiskId>) {
+        let d = base.join(id);
+        std::fs::create_dir(&d).unwrap();
+        let i = RunInfo {
+            kiln: Identity { pid: 1, start_time: 1 },
+            vmm: Some(vmm),
+            persist: disk,
+            ..info(id, "b", "h", 0)
+        };
+        std::fs::write(d.join("run.json"), serde_json::to_vec(&i).unwrap()).unwrap();
+    }
+
+    fn disk(path: &str, ino: u64) -> DiskId {
+        DiskId {
+            path: path.into(),
+            dev: 1,
+            ino,
+        }
     }
 
     /// A killed VMM that does not exit within the wait (an `alive` that stays true
     /// stands in for one stuck in the kernel) is reported as not gone: a
-    /// `--persist` run is refused with its pid, any other run only warned.
+    /// `--persist` run on the disk it used is refused with its pid; a run on
+    /// another disk, or without one, is only warned.
     #[test]
-    fn a_vmm_that_outlives_its_kill_refuses_persisted_runs() {
+    fn a_vmm_that_outlives_its_kill_refuses_runs_on_its_disk() {
         let base = tempfile::tempdir().unwrap();
-        let (kiln, vmm) = (
-            Identity { pid: 1, start_time: 1 },
-            Identity {
-                pid: 4242,
-                start_time: 7,
-            },
-        );
-        let d = base.path().join("stuck");
-        std::fs::create_dir(&d).unwrap();
-        let i = RunInfo {
-            kiln,
-            vmm: Some(vmm),
-            ..info("stuck", "b", "h", 0)
+        let vmm = Identity {
+            pid: 4242,
+            start_time: 7,
         };
-        std::fs::write(d.join("run.json"), serde_json::to_vec(&i).unwrap()).unwrap();
+        stuck_run(base.path(), "stuck", vmm, Some(disk("/data/a.img", 10)));
         let started = std::time::Instant::now();
         let reaped = kill_orphans(
             base.path(),
             "b",
             "h",
             |id| *id == vmm,
-            |_| true,
+            |_| Kill::Sent,
             std::time::Duration::from_millis(200),
         );
         assert!(started.elapsed() >= std::time::Duration::from_millis(200));
-        assert_eq!(
-            reaped,
-            [Reaped {
-                run: "stuck".into(),
-                vmm,
-                gone: false
-            }]
-        );
-        let err = reaped_notices(&reaped, true).unwrap_err().to_string();
         assert!(
-            err.contains("won't die: pid 4242") && err.contains("retry later or reboot"),
-            "{err}"
+            reaped.len() == 1 && !reaped[0].gone && reaped[0].failed.is_none(),
+            "{reaped:?}"
         );
-        let w = reaped_notices(&reaped, false).unwrap();
-        assert!(
-            w.len() == 1 && w[0].starts_with("warning:") && w[0].contains("4242"),
-            "{w:?}"
-        );
+        // The same disk, by inode or by path.
+        for same in [
+            disk("/elsewhere/a.img", 10),
+            DiskId {
+                dev: 2,
+                ..disk("/data/a.img", 99)
+            },
+        ] {
+            let err = reaped_notices(&reaped, Some(&same)).unwrap_err().to_string();
+            assert!(
+                err.contains("won't die: pid 4242") && err.contains("retry later or reboot"),
+                "{err}"
+            );
+        }
+        for other in [Some(disk("/data/b.img", 11)), None] {
+            let w = reaped_notices(&reaped, other.as_ref()).unwrap();
+            assert!(
+                w.len() == 1 && w[0].starts_with("warning:") && w[0].contains("4242"),
+                "{w:?}"
+            );
+        }
         // Gone in time: a note, for any run.
         let gone = [Reaped {
             gone: true,
             ..reaped[0].clone()
         }];
-        assert!(reaped_notices(&gone, true).unwrap()[0].starts_with("note: killed the VMM of run stuck"));
+        assert!(reaped_notices(&gone, Some(&disk("/data/a.img", 10))).unwrap()[0].starts_with("note: killed the VMM"));
+    }
+
+    /// A VMM that could not be killed (no pidfds on this kernel, say) counts as
+    /// alive at once, without a wait, and refuses a run on its disk naming why.
+    #[test]
+    fn a_vmm_that_cannot_be_killed_counts_as_alive() {
+        let base = tempfile::tempdir().unwrap();
+        let vmm = Identity {
+            pid: 4343,
+            start_time: 7,
+        };
+        stuck_run(base.path(), "unkillable", vmm, Some(disk("/data/a.img", 10)));
+        let started = std::time::Instant::now();
+        let reaped = kill_orphans(
+            base.path(),
+            "b",
+            "h",
+            |id| *id == vmm,
+            |_| Kill::Failed("pidfd_open: Function not implemented".into()),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        assert!(!reaped[0].gone, "{reaped:?}");
+        let err = reaped_notices(&reaped, Some(&disk("/data/a.img", 10)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("could not be killed (pidfd_open: Function not implemented)"),
+            "{err}"
+        );
+        // A process that is not there any more is not reported at all.
+        stuck_run(
+            base.path(),
+            "vanished",
+            Identity {
+                pid: 4444,
+                start_time: 7,
+            },
+            None,
+        );
+        let reaped = kill_orphans(base.path(), "b", "h", |id| id.pid != 1, |_| Kill::Gone, ORPHAN_WAIT);
+        assert!(reaped.iter().all(|r| r.run != "vanished"), "{reaped:?}");
+    }
+
+    /// A zombie is gone only when no other thread of it lives: a zombie
+    /// thread-group leader whose other threads run still holds its files.
+    #[test]
+    fn a_zombie_leader_with_live_threads_is_alive() {
+        let root = tempfile::tempdir().unwrap();
+        let id = Identity { pid: 77, start_time: 5 };
+        let dir = root.path().join("77");
+        std::fs::create_dir(&dir).unwrap();
+        let stat = |state: &str| format!("77 (vmm (x)) {state} 1 77 77 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 3 0 5 0 0");
+        let set = |state: &str, threads: u32| {
+            std::fs::write(dir.join("stat"), stat(state)).unwrap();
+            std::fs::write(
+                dir.join("status"),
+                format!("Name:\tvmm\nState:\t{state}\nThreads:\t{threads}\n"),
+            )
+            .unwrap();
+        };
+        set("S", 3);
+        assert!(alive_in(root.path(), &id));
+        set("Z", 3);
+        assert!(alive_in(root.path(), &id), "a zombie leader with live threads");
+        set("Z", 1);
+        assert!(!alive_in(root.path(), &id), "a zombie with no other thread");
+        std::fs::remove_file(dir.join("status")).unwrap();
+        assert!(alive_in(root.path(), &id), "unreadable status counts as alive");
+        // Another start time: another process.
+        set("S", 1);
+        assert!(!alive_in(root.path(), &Identity { start_time: 6, ..id }));
     }
 
     #[test]
