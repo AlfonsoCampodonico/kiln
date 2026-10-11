@@ -43,14 +43,29 @@ struct ConvertArgs {
     /// Layers converted in parallel (default: available CPUs).
     #[arg(long)]
     jobs: Option<usize>,
+    /// The kernel and kiln-init layers: `pinned` adds those this kiln pins, fetched
+    /// once by digest; `none` makes a provisional image without them (offline, or
+    /// behind a proxy kiln cannot use; `kiln run` then needs --kernel and --init).
+    #[arg(long, value_enum, default_value_t = BootChoice::Pinned, value_name = "pinned|none")]
+    boot_layers: BootChoice,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum BootChoice {
+    Pinned,
+    None,
 }
 
 impl ConvertArgs {
     fn options(&self) -> ConvertOptions {
         let mut o = ConvertOptions {
             max_layers: self.max_layers,
-            // The pinned kernel and kiln-init (spec §6.5), fetched by digest.
-            boot: BootLayers::Pinned,
+            // The pinned kernel and kiln-init (spec §6.5), fetched by digest, unless
+            // asked for a provisional image.
+            boot: match self.boot_layers {
+                BootChoice::Pinned => BootLayers::Pinned,
+                BootChoice::None => BootLayers::Provisional,
+            },
             ..Default::default()
         };
         if let Some(j) = self.jobs {
@@ -402,9 +417,16 @@ fn run(cli: Cli) -> Result<()> {
                     })?
                 }
             };
-            for c in &out.images {
-                if let Some(note) = boot_note(c) {
-                    eprintln!("note: {note}");
+            if args.boot_layers == BootChoice::None {
+                eprintln!(
+                    "note: --boot-layers none: a provisional image without kernel or kiln-init layers; \
+                     `kiln run` needs --kernel and --init for it"
+                );
+            } else {
+                for c in &out.images {
+                    if let Some(note) = boot_note(c) {
+                        eprintln!("note: {note}");
+                    }
                 }
             }
             if *json {
