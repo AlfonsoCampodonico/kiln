@@ -83,11 +83,11 @@ pub struct SessionOptions {
     pub boot_timeout: Duration,
     /// The grace period sent with `Shutdown`.
     pub stop_timeout: u32,
-    /// How long past the grace period the host waits before killing the VM itself.
-    pub stop_margin: Duration,
     /// After `Exited`, `InitFailed` or the control connection closing: how long the
     /// guest has to end the VM (D-3). The scratch disk was synced and made read-only
-    /// before `Exited`, so a kill after it loses no writes.
+    /// before `Exited`, so a kill after it loses no writes. After a stop request the
+    /// host waits as long past the grace period before killing the VM itself: the
+    /// guest syncs the disk between its grace kill and `Exited`.
     pub end_timeout: Duration,
     /// After the VM ended: how long the control connection has to reach EOF, and
     /// how long the output streams may go without reading a byte (while none is
@@ -109,7 +109,6 @@ impl Default for SessionOptions {
         Self {
             boot_timeout: crate::options::DEFAULT_BOOT_TIMEOUT,
             stop_timeout: crate::options::DEFAULT_STOP_TIMEOUT,
-            stop_margin: Duration::from_secs(5),
             end_timeout: Duration::from_secs(10),
             drain_timeout: Duration::from_secs(2),
             kill_wait: Duration::from_secs(5),
@@ -709,7 +708,10 @@ impl Session {
         let grace = self.opts.stop_timeout;
         self.handle
             .queue(Out::Msg(HostMessage::Shutdown(Shutdown { grace_secs: grace })), true);
-        let at = Instant::now() + Duration::from_secs(u64::from(grace)) + self.opts.stop_margin;
+        // The grace, then as long as the guest has to end the VM after `Exited`: init
+        // kills the app when the grace ends, then syncs the scratch disk before
+        // `Exited`, and that sync must not be cut short (60 s with `--persist`).
+        let at = Instant::now() + Duration::from_secs(u64::from(grace)) + self.opts.end_timeout;
         self.stop_deadline = Some(self.stop_deadline.map_or(at, |d| d.min(at)));
     }
 
