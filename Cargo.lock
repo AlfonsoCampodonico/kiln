@@ -1500,6 +1500,7 @@ dependencies = [
 name = "kiln-init"
 version = "0.1.0"
 dependencies = [
+ "kiln-erofs",
  "kiln-proto",
  "rustix 1.1.5",
  "signal-hook 0.4.5",

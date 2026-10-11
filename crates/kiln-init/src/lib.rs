@@ -8,6 +8,7 @@
 #![deny(unsafe_code)]
 
 pub mod atomic;
+pub mod diff;
 pub mod disks;
 pub mod env;
 pub mod error;
