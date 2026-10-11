@@ -350,6 +350,9 @@ impl Run {
 
         let base = rundir::base_dir()?;
         let (boot_id, hostname) = (rundir::boot_id(), rundir::hostname());
+        for id in rundir::kill_orphans(&base, &boot_id, &hostname, rundir::alive, rundir::kill_identity) {
+            notice(&format!("note: killed the VMM of run {id}, whose kiln is gone"));
+        }
         let cleanup = rundir::clean_stale(&base, &boot_id, &hostname, rundir::alive);
         if let Some(note) = cleanup.notice(&base) {
             notice(&note);

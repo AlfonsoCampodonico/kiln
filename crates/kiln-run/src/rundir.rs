@@ -11,8 +11,11 @@
 //! A run's directories are cleaned up by the run that made them. Those left
 //! behind (kiln was killed) are removed by a later run only when the `run.json`
 //! names this host's boot and hostname and neither kiln nor the VMM it names is
-//! alive: entries from other boots or hosts (a shared `/tmp`) are never touched
-//! ([`Cleanup::foreign`] lists them). Scratch directories also carry their own
+//! alive. A VMM whose kiln is gone is an orphan nobody can use (kiln's session
+//! was its only peer, and vmkit's sandbox helper is not tied to its caller's
+//! life): a later run kills it first ([`kill_orphans`]), once its identity is
+//! confirmed by its start time. Entries from other boots or hosts (a shared
+//! `/tmp`) are never touched ([`Cleanup::foreign`] lists them). Scratch directories also carry their own
 //! identity (`scratch.json`), so one whose run directory is gone (a reboot or a
 //! logout emptied the tmpfs) is still removed once its run is over
 //! ([`clean_stale_scratch`]). `kiln gc` never touches scratch directories.
@@ -316,6 +319,67 @@ fn alive_in(proc_root: &Path, id: &Identity) -> bool {
     }
 }
 
+/// Kills the VMMs of this host's current boot whose kiln is gone (killed with
+/// SIGKILL, say: nothing in kiln ran to stop its VMM), as `run.json` names them;
+/// returns their runs' ids. `kill` must kill only the process `Identity` names
+/// ([`kill_identity`]). Runs of other boots or hosts, kept runs included, are left
+/// alone, and so is every run whose kiln is alive. The directories are left to
+/// [`clean_stale`] once the VMMs are gone.
+pub fn kill_orphans(
+    base: &Path,
+    boot_id: &str,
+    hostname: &str,
+    alive: impl Fn(&Identity) -> bool,
+    kill: impl Fn(&Identity) -> bool,
+) -> Vec<String> {
+    let mut killed = Vec::new();
+    if boot_id.is_empty() {
+        return killed;
+    }
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return killed;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Some(info) = read_run_json(&entry.path().join("run.json"))
+            .and_then(|b| serde_json::from_slice::<RunInfo>(&b).ok())
+            .filter(|i| i.version == RUN_INFO_VERSION && i.boot_id == boot_id && i.hostname == hostname)
+        else {
+            continue;
+        };
+        if let Some(vmm) = &info.vmm
+            && !alive(&info.kiln)
+            && alive(vmm)
+            && kill(vmm)
+        {
+            killed.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    killed
+}
+
+/// Sends SIGKILL to the process `id` names, only when `/proc` confirms it is that
+/// process (the same start time), and waits up to a second for it to be gone; true
+/// when it was killed.
+pub fn kill_identity(id: &Identity) -> bool {
+    if identity(id.pid) != Some(*id) {
+        return false;
+    }
+    let Some(pid) = rustix::process::Pid::from_raw(id.pid as i32) else {
+        return false;
+    };
+    if rustix::process::kill_process(pid, rustix::process::Signal::KILL).is_err() {
+        return false;
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while identity(id.pid) == Some(*id) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
 /// What [`clean_stale`] did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Cleanup {
@@ -532,6 +596,53 @@ mod tests {
             keep: false,
             scratch_dir: None,
         }
+    }
+
+    /// A VMM whose kiln is gone is killed (here a `sleep` stands in for it); one
+    /// whose kiln runs, and those of other boots or hosts, are not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn orphaned_vmms_are_killed_and_others_left_alone() {
+        use std::os::unix::process::ExitStatusExt;
+        let base = tempfile::tempdir().unwrap();
+        let spawn = || std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let me = identity(std::process::id()).unwrap();
+        let gone = Identity {
+            start_time: me.start_time + 1,
+            ..me
+        };
+        let mut runs = Vec::new();
+        for (id, kiln, boot, host) in [
+            ("orphan", gone, "b", "h"),
+            ("owned", me, "b", "h"),
+            ("other-boot", gone, "b2", "h"),
+            ("other-host", gone, "b", "h2"),
+        ] {
+            let child = spawn();
+            let vmm = identity(child.id()).unwrap();
+            let d = base.path().join(id);
+            std::fs::create_dir(&d).unwrap();
+            let i = RunInfo {
+                kiln,
+                vmm: Some(vmm),
+                ..info(id, boot, host, 0)
+            };
+            std::fs::write(d.join("run.json"), serde_json::to_vec(&i).unwrap()).unwrap();
+            runs.push((id, child));
+        }
+        let killed = kill_orphans(base.path(), "b", "h", alive, kill_identity);
+        assert_eq!(killed, ["orphan"]);
+        for (id, mut child) in runs {
+            if id == "orphan" {
+                assert_eq!(child.wait().unwrap().signal(), Some(9));
+            } else {
+                assert!(child.try_wait().unwrap().is_none(), "{id}");
+                child.kill().unwrap();
+                child.wait().unwrap();
+            }
+        }
+        // A process that is not the one named (another start time) is never killed.
+        assert!(!kill_identity(&gone));
     }
 
     #[test]
