@@ -16,7 +16,7 @@
 use std::fmt;
 
 use kiln_erofs::FORMAT_VERSION;
-use kiln_registry::{Client, DockerConfig, Reference};
+use kiln_registry::{Client, DockerConfig, Reference, RegistryError};
 use kiln_store::{CacheKind, Digest, Store};
 
 use crate::error::{ImageError, Result};
@@ -131,9 +131,11 @@ pub trait Fetcher {
     fn fetch(&self, pin: &Pin, store: &Store) -> Result<()>;
 }
 
-/// Fetches from the pin's registry with the Docker config's credentials. The
-/// client is built per fetch, so a run that finds everything in the store never
-/// resolves a registry name.
+/// Fetches from the pin's registry: anonymously first (the digest is what is
+/// trusted, so credentials add only failure modes: a helper's prompt, a stale
+/// token, a corrupt config), and with the Docker config's credentials only when
+/// the registry demands them. The client is built per fetch, so a run that finds
+/// everything in the store never resolves a registry name.
 #[derive(Debug, Clone)]
 pub struct RegistryFetcher {
     pub config: DockerConfig,
@@ -150,9 +152,15 @@ impl RegistryFetcher {
 impl Fetcher for RegistryFetcher {
     fn fetch(&self, pin: &Pin, store: &Store) -> Result<()> {
         let r = Reference::parse(&format!("{}@{}", pin.repository, pin.digest))?;
-        let client = Client::new(r.registry(), self.config.clone())?;
-        client.fetch_blob(r.repository(), &pin.digest()?, pin.size, store)?;
-        Ok(())
+        let get = |config: DockerConfig| -> Result<()> {
+            let client = Client::new(r.registry(), config)?;
+            client.fetch_blob(r.repository(), &pin.digest()?, pin.size, store)?;
+            Ok(())
+        };
+        match get(DockerConfig::anonymous()) {
+            Err(ImageError::Registry(RegistryError::Unauthorized { .. })) => get(self.config.clone()),
+            other => other,
+        }
     }
 }
 

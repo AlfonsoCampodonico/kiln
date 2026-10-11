@@ -266,3 +266,55 @@ mod convert {
         assert_eq!(BootLayers::Pinned.for_arch("riscv64"), None);
     }
 }
+
+/// Pinned blobs are fetched anonymously first: a public registry that answers
+/// with a bearer challenge (as ghcr.io does) gets an anonymous token, without
+/// reading the user's Docker config (here a corrupt one, an error if read), so
+/// credentials never stand between kiln and a public artifact.
+#[test]
+fn pinned_blobs_are_fetched_anonymously_first() {
+    let reg = TestRegistry::start(Config {
+        bearer: Some(kiln_registry::testregistry::Bearer {
+            credentials: None,
+            refresh_token: None,
+        }),
+        ..Config::default()
+    });
+    let bin = b"\x7fELF public".repeat(10);
+    reg.put_blob(&bin);
+    let docker = tempfile::tempdir().unwrap();
+    std::fs::write(docker.path().join("config.json"), b"{ not json").unwrap();
+    let f = RegistryFetcher {
+        config: DockerConfig::from_dir(docker.path()),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    ensure(&store, &pin(&reg, &bin), &f).unwrap();
+}
+
+/// A registry that demands credentials gets the Docker config's after the
+/// anonymous attempt is refused.
+#[test]
+fn credentials_are_used_only_when_the_registry_demands_them() {
+    let reg = TestRegistry::start(Config {
+        basic: Some(("alice".into(), "s3cret".into())),
+        ..Config::default()
+    });
+    let bin = b"\x7fELF private".repeat(10);
+    reg.put_blob(&bin);
+    let docker = tempfile::tempdir().unwrap();
+    std::fs::write(
+        docker.path().join("config.json"),
+        format!(r#"{{"auths": {{"{}": {{"auth": "YWxpY2U6czNjcmV0"}}}}}}"#, reg.host()),
+    )
+    .unwrap();
+    let f = RegistryFetcher {
+        config: DockerConfig::from_dir(docker.path()),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    ensure(&store, &pin(&reg, &bin), &f).unwrap();
+    let log = reg.log();
+    assert!(log.first().is_some_and(|l| l.authorization.is_none()), "{log:?}");
+    assert!(log.iter().any(|l| l.authorization.is_some()), "{log:?}");
+}
