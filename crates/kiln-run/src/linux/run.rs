@@ -253,10 +253,20 @@ impl Run {
                 }
             }
         }
-        // The Lima VM's dev loop (spec §10): the macOS store's latest convert of the image.
+        // The Lima VM's dev loop (spec §10): the macOS store's latest convert of the
+        // image, resolved by the tag the import set.
+        let mut imported = None;
         if let Some(from) = std::env::var_os("KILN_IMPORT_FROM").filter(|v| !v.is_empty()) {
             match prepare::import_from(store, Path::new(&from), &opts.image) {
-                Ok(Some(note)) => notice(&note),
+                Ok(Some(i)) => {
+                    if let Some(note) = &i.note {
+                        notice(note);
+                    }
+                    imported = Some(RunOptions {
+                        image: i.image,
+                        ..opts.clone()
+                    });
+                }
                 Ok(None) => {}
                 Err(e) => notice(&format!("warning: importing from KILN_IMPORT_FROM: {e}")),
             }
@@ -266,7 +276,7 @@ impl Run {
         let lock = store.lock_shared()?;
         let prepared = prepare::prepare(
             store,
-            opts,
+            imported.as_ref().unwrap_or(opts),
             prepare::host_arch(),
             &prepare::CompiledPins,
             &RegistryFetcher::from_env(),

@@ -27,6 +27,18 @@ fn copy(dst: &Store, src: &Store, d: &Digest, size: Option<u64>, report: &mut Im
 /// never enter the conversion caches (spec §6.2).
 pub fn import_image(dst: &Store, src: &Store, name: &str, as_name: &str) -> Result<ImportReport> {
     let _lock = dst.lock_shared()?;
+    let report = copy_image(dst, src, name)?;
+    dst.set_ref(as_name, &report.digest)?;
+    Ok(report)
+}
+
+/// Like [`import_image`], without tagging: for an image named by its digest.
+pub fn import_untagged(dst: &Store, src: &Store, name: &str) -> Result<ImportReport> {
+    let _lock = dst.lock_shared()?;
+    copy_image(dst, src, name)
+}
+
+fn copy_image(dst: &Store, src: &Store, name: &str) -> Result<ImportReport> {
     let top = match Digest::parse(name) {
         Ok(d) => d,
         Err(_) => src
@@ -66,8 +78,7 @@ pub fn import_image(dst: &Store, src: &Store, name: &str, as_name: &str) -> Resu
             copy(dst, src, &l.digest, Some(l.size), &mut report)?;
         }
     }
-    // Refuses to tag anything but a kiln image; copied blobs stay unreferenced for GC.
+    // Refuses anything but a kiln image; copied blobs stay unreferenced for GC.
     load(dst, &top)?;
-    dst.set_ref(as_name, &top)?;
     Ok(report)
 }

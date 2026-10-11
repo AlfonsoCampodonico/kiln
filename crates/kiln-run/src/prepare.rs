@@ -101,13 +101,37 @@ pub fn host_arch() -> &'static str {
     }
 }
 
+/// What [`import_from`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Imported {
+    /// What the run resolves: the tag the import set (or the digest it imported),
+    /// which wins over another local tag the name would otherwise find.
+    pub image: String,
+    /// For the user: blobs were copied, or a tag now names another image.
+    pub note: Option<String>,
+}
+
 /// With `KILN_IMPORT_FROM` (the Lima VM's read-only mount of the macOS store, spec
 /// §10): when that store has `name` (as given, or as its normalised reference),
-/// imports it, copying only the blobs this store lacks, and tags it here: every
-/// time, so the newest convert on macOS wins over an older tag in the VM (ruling 4).
-/// Returns a note for the user when blobs were copied.
-pub fn import_from(store: &Store, from: &Path, name: &str) -> Result<Option<String>> {
+/// imports it, copying only the blobs this store lacks, and tags it here as it is
+/// tagged there: every time, so the newest convert on macOS wins over an older tag
+/// in the VM (ruling 4). A digest this store lacks is imported untagged.
+pub fn import_from(store: &Store, from: &Path, name: &str) -> Result<Option<Imported>> {
     let src = Store::open_read_only(from)?;
+    if let Ok(d) = Digest::parse(name) {
+        if store.has_blob(&d) || !src.has_blob(&d) {
+            return Ok(None);
+        }
+        let r = kiln_image::import_untagged(store, &src, name)?;
+        return Ok(Some(Imported {
+            image: d.to_string(),
+            note: Some(format!(
+                "imported {d} from {} ({} blobs)",
+                from.display(),
+                r.blobs_copied
+            )),
+        }));
+    }
     let refs = src.refs()?;
     let normalised = Reference::parse(name).ok().map(|r| r.to_string());
     let Some(src_name) = refs
@@ -117,14 +141,28 @@ pub fn import_from(store: &Store, from: &Path, name: &str) -> Result<Option<Stri
     else {
         return Ok(None);
     };
+    let before = store.get_ref(src_name)?;
     let r = kiln_image::import_image(store, &src, src_name, src_name)?;
-    Ok((r.blobs_copied > 0).then(|| {
-        format!(
+    let note = if r.blobs_copied > 0 {
+        Some(format!(
             "imported {} from {} ({} blobs)",
             clean_line(src_name),
             from.display(),
             r.blobs_copied
-        )
+        ))
+    } else if before.as_ref() != Some(&r.digest) {
+        Some(format!(
+            "{} now names {} from {} (its blobs were here already)",
+            clean_line(src_name),
+            r.digest,
+            from.display()
+        ))
+    } else {
+        None
+    };
+    Ok(Some(Imported {
+        image: src_name.clone(),
+        note,
     }))
 }
 

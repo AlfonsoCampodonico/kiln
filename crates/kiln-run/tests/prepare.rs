@@ -525,31 +525,84 @@ fn images_are_imported_and_retagged_from_another_store() {
     let mac = setup();
     let home = tempfile::tempdir().unwrap();
     let vm = Store::open(home.path()).unwrap();
-    let note = kiln_run::prepare::import_from(&vm, mac.store.root(), "app")
-        .unwrap()
-        .unwrap();
+    let import = |name: &str| kiln_run::prepare::import_from(&vm, mac.store.root(), name);
+    let i = import("app").unwrap().unwrap();
+    let note = i.note.unwrap();
     assert!(
         note.starts_with("imported app from ") && note.ends_with(" blobs)"),
         "{note}"
     );
+    assert_eq!(i.image, "app");
     let first = vm.get_ref("app").unwrap().unwrap();
     assert_eq!(Some(first.clone()), mac.store.get_ref("app").unwrap());
     // Nothing new: no note, the same tag.
-    assert_eq!(
-        kiln_run::prepare::import_from(&vm, mac.store.root(), "app").unwrap(),
-        None
-    );
+    assert_eq!(import("app").unwrap().unwrap().note, None);
     // A newer convert on the source wins over the older tag here.
     mac.with_boot_layers("app", "custom", b"\x7fELF init");
-    let note = kiln_run::prepare::import_from(&vm, mac.store.root(), "app").unwrap();
-    assert!(note.is_some());
+    assert!(import("app").unwrap().unwrap().note.is_some());
     let second = vm.get_ref("app").unwrap().unwrap();
     assert_ne!(second, first);
     assert_eq!(Some(second), mac.store.get_ref("app").unwrap());
     // A name the source lacks, and a source that is no store.
-    assert_eq!(
-        kiln_run::prepare::import_from(&vm, mac.store.root(), "other").unwrap(),
-        None
-    );
+    assert_eq!(import("other").unwrap(), None);
     assert!(kiln_run::prepare::import_from(&vm, &home.path().join("nowhere"), "app").is_err());
+}
+
+/// The run resolves the tag the import set: a source image tagged under its
+/// normalised reference wins over a stale exact tag of the name here. A tag moved
+/// to an image whose blobs were all here already is noted.
+#[test]
+fn an_import_wins_over_a_stale_local_tag_and_a_moved_tag_is_noted() {
+    let mac = setup();
+    let home = tempfile::tempdir().unwrap();
+    let vm = Store::open(home.path()).unwrap();
+    let full = "docker.io/library/app:latest";
+    mac.store
+        .set_ref(full, &mac.store.get_ref("app").unwrap().unwrap())
+        .unwrap();
+    // An older image under the exact name here.
+    kiln_run::prepare::import_from(&vm, mac.store.root(), "app").unwrap();
+    mac.with_boot_layers("newer", "custom", b"\x7fELF init");
+    let newer = mac.store.get_ref("newer").unwrap().unwrap();
+    mac.store.set_ref(full, &newer).unwrap();
+    mac.store.remove_ref("app").unwrap();
+    let i = kiln_run::prepare::import_from(&vm, mac.store.root(), "app")
+        .unwrap()
+        .unwrap();
+    assert_eq!(i.image, full);
+    assert_eq!(resolve_name(&vm, &i.image).unwrap(), newer);
+    assert_ne!(
+        resolve_name(&vm, "app").unwrap(),
+        newer,
+        "the stale exact tag is still here"
+    );
+    // The same image again, under a tag here that named another: noted.
+    vm.set_ref(full, &vm.get_ref("app").unwrap().unwrap()).unwrap();
+    let i = kiln_run::prepare::import_from(&vm, mac.store.root(), "app")
+        .unwrap()
+        .unwrap();
+    let note = i.note.unwrap();
+    assert!(
+        note.starts_with(&format!("{full} now names {newer} from ")) && note.contains("were here already"),
+        "{note}"
+    );
+}
+
+/// `kiln run sha256:...` imports the image by digest when this store lacks it,
+/// without tagging it.
+#[test]
+fn a_digest_is_imported_untagged_when_missing() {
+    let mac = setup();
+    let home = tempfile::tempdir().unwrap();
+    let vm = Store::open(home.path()).unwrap();
+    let d = mac.store.get_ref("app").unwrap().unwrap().to_string();
+    let i = kiln_run::prepare::import_from(&vm, mac.store.root(), &d)
+        .unwrap()
+        .unwrap();
+    assert_eq!(i.image, d);
+    assert!(i.note.unwrap().starts_with(&format!("imported {d} from ")));
+    assert!(vm.refs().unwrap().is_empty());
+    load(&vm, &resolve_name(&vm, &d).unwrap()).unwrap();
+    // Present now: nothing to do.
+    assert_eq!(kiln_run::prepare::import_from(&vm, mac.store.root(), &d).unwrap(), None);
 }
