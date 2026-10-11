@@ -313,6 +313,14 @@ fn parse_start_time(stat: &str) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
+/// Field 3 of `/proc/<pid>/stat` is `Z`.
+fn zombie(stat: &str) -> bool {
+    stat.rfind(')')
+        .and_then(|i| stat.get(i + 1..))
+        .and_then(|rest| rest.split_whitespace().next())
+        == Some("Z")
+}
+
 /// Whether `id` still names a running process. Only a process that is gone
 /// (`/proc/<pid>` missing: ENOENT or ESRCH) or a different start time (the pid was
 /// reused) counts as dead; anything that cannot be read (EMFILE, `hidepid`, another
@@ -323,7 +331,9 @@ pub fn alive(id: &Identity) -> bool {
 
 fn alive_in(proc_root: &Path, id: &Identity) -> bool {
     match std::fs::read_to_string(proc_root.join(id.pid.to_string()).join("stat")) {
-        Ok(stat) => parse_start_time(&stat).is_none_or(|t| t == id.start_time),
+        // A zombie has exited and closed its files (a VMM's disks): only its parent
+        // has yet to reap it.
+        Ok(stat) => parse_start_time(&stat).is_none_or(|t| t == id.start_time) && !zombie(&stat),
         Err(e) => {
             !(e.kind() == std::io::ErrorKind::NotFound
                 || e.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()))
@@ -331,19 +341,34 @@ fn alive_in(proc_root: &Path, id: &Identity) -> bool {
     }
 }
 
+/// A VMM [`kill_orphans`] killed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reaped {
+    /// Its run's id.
+    pub run: String,
+    pub vmm: Identity,
+    /// It exited within the wait; false: it outlived its SIGKILL (stuck in the
+    /// kernel, say) and may still hold its disks.
+    pub gone: bool,
+}
+
+/// How long [`kill_orphans`] waits for a killed VMM to exit.
+pub const ORPHAN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Kills the VMMs of this host's current boot whose kiln is gone (killed with
-/// SIGKILL, say: nothing in kiln ran to stop its VMM), as `run.json` names them;
-/// returns their runs' ids. `kill` must kill only the process `Identity` names
-/// ([`kill_identity`]). Runs of other boots or hosts, kept runs included, are left
-/// alone, and so is every run whose kiln is alive. The directories are left to
-/// [`clean_stale`] once the VMMs are gone.
+/// SIGKILL, say: nothing in kiln ran to stop its VMM), as `run.json` names them,
+/// and waits up to `wait` for each to exit (`alive` turning false). `kill` must
+/// kill only the process `Identity` names ([`kill_identity`]). Runs of other boots
+/// or hosts, kept runs included, are left alone, and so is every run whose kiln is
+/// alive. The directories are left to [`clean_stale`] once the VMMs are gone.
 pub fn kill_orphans(
     base: &Path,
     boot_id: &str,
     hostname: &str,
     alive: impl Fn(&Identity) -> bool,
     kill: impl Fn(&Identity) -> bool,
-) -> Vec<String> {
+    wait: std::time::Duration,
+) -> Vec<Reaped> {
     let mut killed = Vec::new();
     if boot_id.is_empty() {
         return killed;
@@ -366,14 +391,53 @@ pub fn kill_orphans(
             && alive(vmm)
             && kill(vmm)
         {
-            killed.push(entry.file_name().to_string_lossy().into_owned());
+            killed.push(Reaped {
+                run: entry.file_name().to_string_lossy().into_owned(),
+                vmm: *vmm,
+                gone: false,
+            });
         }
     }
-    killed
+    let until = std::time::Instant::now() + wait;
+    loop {
+        for r in killed.iter_mut().filter(|r| !r.gone) {
+            r.gone = !alive(&r.vmm);
+        }
+        if killed.iter().all(|r| r.gone) || std::time::Instant::now() >= until {
+            return killed;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
-/// Sends SIGKILL to the process `id` names, only when it is that process, and
-/// waits up to a second for it to be gone; true when it was killed. A pidfd pins
+/// What the reaped VMMs mean for a run: notes and warnings to print, or, for a
+/// `--persist` run, a refusal while a killed VMM may still hold a disk (which disk
+/// is not recorded, so any such VMM refuses it).
+pub fn reaped_notices(reaped: &[Reaped], persist: bool) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for r in reaped {
+        let run = kiln_proto::sanitize::clean_line(&r.run);
+        if r.gone {
+            out.push(format!("note: killed the VMM of run {run}, whose kiln is gone"));
+        } else if persist {
+            return Err(Error::refused(format!(
+                "the persisted disk may still be in use by a VMM that won't die: pid {} (run {run}); retry later \
+                 or reboot",
+                r.vmm.pid
+            )));
+        } else {
+            out.push(format!(
+                "warning: the VMM of run {run} (pid {}), whose kiln is gone, did not die within {}s of SIGKILL",
+                r.vmm.pid,
+                ORPHAN_WAIT.as_secs()
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Sends SIGKILL to the process `id` names, only when it is that process; true
+/// when the signal was sent. A pidfd pins
 /// the process first, then `/proc` confirms its start time, and the signal goes
 /// through the pidfd: a pid reused at any point is never signalled (Linux).
 #[cfg(target_os = "linux")]
@@ -387,10 +451,6 @@ pub fn kill_identity(id: &Identity) -> bool {
     };
     if identity(id.pid) != Some(*id) || pidfd_send_signal(&fd, Signal::KILL).is_err() {
         return false;
-    }
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while identity(id.pid) == Some(*id) && std::time::Instant::now() < until {
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     true
 }
@@ -651,8 +711,9 @@ mod tests {
             std::fs::write(d.join("run.json"), serde_json::to_vec(&i).unwrap()).unwrap();
             runs.push((id, child));
         }
-        let killed = kill_orphans(base.path(), "b", "h", alive, kill_identity);
-        assert_eq!(killed, ["orphan"]);
+        let killed = kill_orphans(base.path(), "b", "h", alive, kill_identity, ORPHAN_WAIT);
+        assert_eq!(killed.len(), 1);
+        assert!(killed[0].run == "orphan" && killed[0].gone, "{killed:?}");
         for (id, mut child) in runs {
             if id == "orphan" {
                 assert_eq!(child.wait().unwrap().signal(), Some(9));
@@ -664,6 +725,63 @@ mod tests {
         }
         // A process that is not the one named (another start time) is never killed.
         assert!(!kill_identity(&gone));
+    }
+
+    /// A killed VMM that does not exit within the wait (an `alive` that stays true
+    /// stands in for one stuck in the kernel) is reported as not gone: a
+    /// `--persist` run is refused with its pid, any other run only warned.
+    #[test]
+    fn a_vmm_that_outlives_its_kill_refuses_persisted_runs() {
+        let base = tempfile::tempdir().unwrap();
+        let (kiln, vmm) = (
+            Identity { pid: 1, start_time: 1 },
+            Identity {
+                pid: 4242,
+                start_time: 7,
+            },
+        );
+        let d = base.path().join("stuck");
+        std::fs::create_dir(&d).unwrap();
+        let i = RunInfo {
+            kiln,
+            vmm: Some(vmm),
+            ..info("stuck", "b", "h", 0)
+        };
+        std::fs::write(d.join("run.json"), serde_json::to_vec(&i).unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        let reaped = kill_orphans(
+            base.path(),
+            "b",
+            "h",
+            |id| *id == vmm,
+            |_| true,
+            std::time::Duration::from_millis(200),
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        assert_eq!(
+            reaped,
+            [Reaped {
+                run: "stuck".into(),
+                vmm,
+                gone: false
+            }]
+        );
+        let err = reaped_notices(&reaped, true).unwrap_err().to_string();
+        assert!(
+            err.contains("won't die: pid 4242") && err.contains("retry later or reboot"),
+            "{err}"
+        );
+        let w = reaped_notices(&reaped, false).unwrap();
+        assert!(
+            w.len() == 1 && w[0].starts_with("warning:") && w[0].contains("4242"),
+            "{w:?}"
+        );
+        // Gone in time: a note, for any run.
+        let gone = [Reaped {
+            gone: true,
+            ..reaped[0].clone()
+        }];
+        assert!(reaped_notices(&gone, true).unwrap()[0].starts_with("note: killed the VMM of run stuck"));
     }
 
     #[test]
