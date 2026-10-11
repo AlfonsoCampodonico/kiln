@@ -49,10 +49,11 @@ fn convert_ls_inspect_gc_import() {
         .assert()
         .success()
         .stdout(predicate::str::contains("app:latest → sha256:"))
-        // The table pins nothing yet: a provisional image, and what `kiln run` needs for it.
+        // The table pins the kernel (fetched from ghcr.io by digest) and no kiln-init
+        // yet: what `kiln run` needs for the image.
         .stderr(predicate::str::contains(
-            "note: this kiln pins no kernel or kiln-init for arm64 yet, so the image has no kernel or \
-             kiln-init layers; `kiln run` needs --kernel and --init for it",
+            "note: this kiln pins no kiln-init for arm64 yet, so the image has no kiln-init layer; \
+             `kiln run` needs --init for it",
         ));
     kiln(home.path())
         .args(["ls"])
@@ -68,7 +69,7 @@ fn convert_ls_inspect_gc_import() {
                 .and(predicate::str::contains("env:        A=1"))
                 .and(predicate::str::contains("unverified provenance"))
                 .and(predicate::str::contains(
-                    "boot:       none (a provisional image: run it with --kernel and --init)",
+                    "boot:       kernel base 6.18.54, no init layer (run it with --init)",
                 )),
         );
     let json = kiln(home.path())
@@ -666,11 +667,12 @@ fn run_explains_the_lima_vm() {
     );
 }
 
-/// On Linux the image is resolved before a VMM is needed: an image without a
-/// kernel layer, run without --kernel, is refused with 125 (no KVM needed).
+/// On Linux the image is resolved before a VMM is needed: an image with the pinned
+/// kernel but no pinned kiln-init, run without --init, is refused with 125 (no KVM
+/// needed).
 #[cfg(target_os = "linux")]
 #[test]
-fn run_refuses_an_image_without_a_kernel_before_booting() {
+fn run_refuses_an_image_without_a_pinned_init_before_booting() {
     let src = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let mut b = LayoutBuilder::new(&src.path().join("app"));
@@ -689,7 +691,7 @@ fn run_refuses_an_image_without_a_kernel_before_booting() {
         .args(["run", "app"])
         .assert()
         .code(125)
-        .stderr(predicate::str::contains("has no kernel layer").and(predicate::str::contains("--allow-custom-kernel")));
+        .stderr(predicate::str::contains("no pinned kiln-init").and(predicate::str::contains("--allow-custom-init")));
     kiln(home.path()).args(["run", "missing"]).assert().code(125);
     // An egress exception for the host's outbound address is refused before boot
     // (pasta gives the VM's namespace that address).

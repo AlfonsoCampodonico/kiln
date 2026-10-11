@@ -81,17 +81,32 @@ pub const CUSTOM_PROFILE: &str = "custom";
 
 /// The compiled-in table (ruling 7).
 ///
-/// Empty until the artifacts are released; until then images are converted without
-/// boot layers and `kiln run` needs `--kernel` and `--init`.
-/// - **Kernels:** vmkit's `kernels-6.18.54` release. Each arch gets one entry, from
-///   that release's OCI artifact `KERNEL_REPOSITORY:6.18.54-<arch>`: the digest and
-///   size of its kernel blob (the artifact's layer, not its manifest). For example:
-///   `Pin { kind: ArtifactKind::Kernel, name: KERNEL_PROFILE, version: KERNEL_VERSION,
-///   arch: "arm64", repository: KERNEL_REPOSITORY, digest: "sha256:<hex>", size: <bytes> },`
+/// - **Kernels:** vmkit's `kernels-6.18.54` release. Each arch has one entry, from
+///   that release's OCI artifact `KERNEL_REPOSITORY:6.18.54-<arch>` (`aarch64`,
+///   `x86_64`): the digest and size of its kernel blob, the artifact's
+///   `application/vnd.vmkit.kernel.v1.binary` layer (not its manifest; kiln fetches
+///   the blob by digest). Images are converted with the kernel layer.
 /// - **kiln-init:** kiln's own releases (milestone M3c), `name: "kiln-init"`,
-///   `version: INIT_VERSION`.
+///   `version: INIT_VERSION`. None yet: until then `kiln run` needs `--init`.
 pub const PINS: &[Pin] = &[
-    // The kernel entries (vmkit `kernels-6.18.54`, arm64 and amd64) go here.
+    Pin {
+        kind: ArtifactKind::Kernel,
+        name: KERNEL_PROFILE,
+        version: KERNEL_VERSION,
+        arch: "arm64",
+        repository: KERNEL_REPOSITORY,
+        digest: "sha256:51f858cd17d9ff8b7554e8759a211001885f86bee91b3f571120c3dc77c4f759",
+        size: 18536960,
+    },
+    Pin {
+        kind: ArtifactKind::Kernel,
+        name: KERNEL_PROFILE,
+        version: KERNEL_VERSION,
+        arch: "amd64",
+        repository: KERNEL_REPOSITORY,
+        digest: "sha256:a11bd39ddca13b1ee9c756abc6d6af0237085e9b53bb67c760cea30f668ec7ad",
+        size: 27597048,
+    },
 ];
 
 /// The pinned kernel `profile`/`version` for `arch`.
@@ -212,6 +227,8 @@ mod tests {
             p.digest().unwrap();
             assert!(p.arch == "arm64" || p.arch == "amd64", "{p:?}");
             assert!(p.size > 0, "{p:?}");
+            // A kernel the user supplies is `custom`, and never pinned (spec §8.1).
+            assert!(!(p.kind == ArtifactKind::Kernel && p.name == CUSTOM_PROFILE), "{p:?}");
             assert!(
                 PINS[..i]
                     .iter()

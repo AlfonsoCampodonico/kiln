@@ -9,8 +9,8 @@
 //!   `--allow-custom-init`). An image's own init layer never boots: it is replaced,
 //!   with a warning when it differs.
 //!
-//! The table ([`kiln_image::artifacts::PINS`]) is empty until vmkit's kernel and
-//! kiln's kiln-init releases exist (ruling 7); until then both flags are needed.
+//! The table ([`kiln_image::artifacts::PINS`]) pins vmkit's `base` kernels; no
+//! kiln-init is released yet (M3c), so until then `--init` is needed.
 
 use std::path::{Path, PathBuf};
 

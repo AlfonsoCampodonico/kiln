@@ -61,7 +61,7 @@ pub struct RunArgs {
     /// Seconds from starting the VM to the command running.
     #[arg(long, default_value_t = 30, value_name = "SECS")]
     boot_timeout: u64,
-    /// Boot this kernel (needs --allow-custom-kernel; kiln pins no kernel yet).
+    /// Boot this kernel instead of the image's pinned one (needs --allow-custom-kernel).
     #[arg(long, value_name = "PATH")]
     kernel: Option<PathBuf>,
     #[arg(long)]
