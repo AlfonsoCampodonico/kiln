@@ -1172,6 +1172,35 @@ fn egress_policy_and_the_resolver_without_a_network() {
         let o = f.output(&args);
         assert_eq!(text(&o.stdout), want, "{egress:?}: {}", text(&o.stderr));
     }
+    // restricted (the default) blocks cloud metadata and private networks, at once
+    // or within nc's own bound, never hanging the guest.
+    let started = Instant::now();
+    let o = f.output(&[
+        "--net",
+        "busybox",
+        "--",
+        "sh",
+        "-c",
+        &format!(
+            "{}; {}",
+            probe("169.254.169.254 80".into()),
+            probe("10.0.0.1 80".into())
+        ),
+    ]);
+    assert_eq!(text(&o.stdout), "blocked\nblocked\n", "{}", text(&o.stderr));
+    assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
+    // deny-all still resolves names (DNS through the gateway).
+    let o = f.output(&[
+        "--net",
+        "--egress",
+        "deny-all",
+        "busybox",
+        "--",
+        "sh",
+        "-c",
+        "nslookup example.com >/dev/null 2>&1; echo rc=$?",
+    ]);
+    assert_eq!(text(&o.stdout), "rc=0\n", "{}", text(&o.stderr));
     let o = f.output(&["--net", "--egress", "open", "busybox", "--", "true"]);
     assert!(
         text(&o.stderr).contains("warning: --egress open"),
