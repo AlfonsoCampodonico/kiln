@@ -2,7 +2,8 @@
 //! pty on `WindowSize`; on `Shutdown`, SIGINT or SIGTERM send `stopSignal` to the
 //! main process and SIGKILL everything when the grace period ends. When the main
 //! process exits, every other process is killed (as when a container's PID 1
-//! exits), its output is drained to EOF, and `Exited` is returned.
+//! exits), its output is drained to EOF, and `Exited` is returned (the caller then
+//! syncs the scratch disk and sends it).
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};

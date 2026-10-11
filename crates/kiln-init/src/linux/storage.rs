@@ -66,8 +66,9 @@ fn grow(rw: &OwnedFd, size: u64) -> Result<()> {
     sys::ext4_resize(rw, size / BLOCK).context(format!("grow the scratch filesystem to {size} bytes"))
 }
 
-/// After the workload: flush the scratch filesystem and, best effort, make it
-/// read-only so it is clean when the VM ends (spec §9.6 stage 7). Its mount was
+/// After the workload and before `Exited`: flush the scratch filesystem and,
+/// best effort, make it read-only, so it is clean and complete even if the VM is
+/// killed the moment `Exited` arrives (spec §9.6 stage 7). Its mount was
 /// detached by the pivot, so it is reconfigured through its descriptor.
 pub fn finish(rw: &OwnedFd) {
     let _ = rustix::fs::syncfs(rw);

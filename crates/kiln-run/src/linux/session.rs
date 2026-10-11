@@ -86,7 +86,8 @@ pub struct SessionOptions {
     /// How long past the grace period the host waits before killing the VM itself.
     pub stop_margin: Duration,
     /// After `Exited`, `InitFailed` or the control connection closing: how long the
-    /// guest has to end the VM (it syncs and remounts the scratch disk first, D-3).
+    /// guest has to end the VM (D-3). The scratch disk was synced and made read-only
+    /// before `Exited`, so a kill after it loses no writes.
     pub end_timeout: Duration,
     /// After the VM ended: how long the control connection has to reach EOF, and
     /// how long the output streams may go without reading a byte (while none is

@@ -30,8 +30,8 @@ pub const CMDLINE: [&str; 7] = [
     "loglevel=3",
 ];
 
-/// How long the guest has to end the VM after its final message (it syncs and
-/// remounts the scratch disk first, D-3); longer with `--persist`, whose disk
+/// How long the guest has to end the VM after its final message (D-3; the
+/// scratch disk was synced before `Exited`); longer with `--persist`, whose disk
 /// outlives the run.
 const END_TIMEOUT: Duration = Duration::from_secs(10);
 const END_TIMEOUT_PERSIST: Duration = Duration::from_secs(60);

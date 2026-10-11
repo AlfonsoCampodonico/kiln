@@ -248,7 +248,7 @@ Growing online to 64 GiB works on Firecracker. On Cloud Hypervisor 53 the resize
 **Supervision** (stage 7):
 - `Signal { sig }` is sent to the main process. `WindowSize` resizes the pseudo-terminal (ignored without `tty`).
 - `Shutdown { graceSecs }`, or SIGINT or SIGTERM to init (with `Config.shutdownGraceSecs`): `stopSignal` is sent to the main process (once), and when the grace period ends every process but init gets SIGKILL. A later request can shorten the deadline, never extend it.
-- When the main process exits, every other process gets SIGKILL and is reaped; then stdout and stderr (or the terminal) are relayed to EOF; then `Exited` is sent. The scratch filesystem is then synced and, on a best-effort basis, made read-only (EBUSY is ignored), and init ends the VM with `Config.exitMethod`.
+- When the main process exits, every other process gets SIGKILL and is reaped; then stdout and stderr (or the terminal) are relayed to EOF; then the scratch filesystem is synced and, on a best-effort basis, made read-only (EBUSY is ignored); then `Exited` is sent, and init ends the VM with `Config.exitMethod`. `Exited` therefore means the scratch disk is safe: the host never kills the VM on `Exited` itself, but a VM killed after it keeps every write (`--persist` relies on this). `InitFailed` paths do not sync first.
 
 **Failure:** a failing stage prints `kiln-init: <stage name>: <error>` on the console, sends `InitFailed` when the control connection is up, sends SIGKILL to every other process, and ends the VM with `Config.exitMethod`, or with a reboot before `Config` arrived. A panic does the same. A protocol error from the host, a second `Config`, or the host closing the control connection, is a failure too: it is detected by a reader thread once `Config` has arrived and acted on when init enters its next stage (and at the end of stage 6, before `Running`), or at once during stage 7; the failure names it rather than a send that failed because of it.
 
@@ -280,7 +280,7 @@ A frame is a `u32` little-endian length, then a `u8` message type, then the payl
 | 2 | `Config` | host → guest | The run's configuration (below). |
 | 3 | `Stage` | guest → host | `{"n": 3}`: init entered stage `n` (1–7). Sent for stages 3 to 7; stages 1 and 2 precede it. |
 | 4 | `Running` | guest → host | `{}`: the main process started. |
-| 5 | `Exited` | guest → host | `{"signaled": false, "code": 0}`: the main process ended, and its output reached EOF. `code` is the exit status (0–255), or with `signaled` the signal that killed it (1–64). |
+| 5 | `Exited` | guest → host | `{"signaled": false, "code": 0}`: the main process ended, its output reached EOF, and the scratch disk was synced and remounted read-only (best effort). `code` is the exit status (0–255), or with `signaled` the signal that killed it (1–64). |
 | 6 | `InitFailed` | guest → host | `{"stage": 6, "errno": 2, "message": "…"}`: init failed at `stage` (1–7). `errno` (1–4095) is present at stage 6 only when executing the entrypoint failed; it may be present at other stages. `message` has at most 4096 bytes and is untrusted text. |
 | 7 | `Shutdown` | host → guest | `{"graceSecs": 10}`. |
 | 8 | `Signal` | host → guest | `{"sig": 1}`: a signal number from 1 to 31. |
