@@ -207,8 +207,7 @@ pub fn open(
     };
     let (file, lines) = match open_disk(path)? {
         None => {
-            create(path, disk.unwrap_or(DEFAULT_DISK))?;
-            let file = open_locked(path)?;
+            let file = create_locked(path, disk.unwrap_or(DEFAULT_DISK))?;
             // Under the new disk's lock: a sidecar left from a disk removed since names
             // nothing this one holds.
             remove_sidecar(path)?;
@@ -227,8 +226,7 @@ pub fn open(
                     // The old disk's lock is held until the new one is in place.
                     remove_sidecar(path)?;
                     std::fs::remove_file(path)?;
-                    create(path, size)?;
-                    let new = open_locked(path)?;
+                    let new = create_locked(path, size)?;
                     drop(file);
                     (new, lines)
                 }
@@ -275,10 +273,30 @@ fn open_disk(path: &Path) -> Result<Option<File>> {
     }
 }
 
-/// The disk kiln just created, opened, locked and checked.
-fn open_locked(path: &Path) -> Result<File> {
-    let file = open_nofollow(path)?;
-    lock(&file, path)?;
+/// A new disk at `path`, locked before anyone can see it: the template is written
+/// to a temporary sibling, which is locked, then linked into place (never over a
+/// file that appeared meanwhile) and its temporary name removed. Another run thus
+/// never opens a half-written disk, nor one it could lock first.
+fn create_locked(path: &Path, size: u64) -> Result<File> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".kiln-new-{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let made = (|| -> Result<File> {
+        kiln_image::scratch::create_scratch(&tmp, size)?;
+        let file = open_nofollow(&tmp)?;
+        lock(&file, &tmp)?;
+        match std::fs::hard_link(&tmp, path) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::refused(format!(
+                "{} appeared while kiln was creating it (another kiln run?)",
+                path.display()
+            ))),
+            r => Ok(r?),
+        }?;
+        Ok(file)
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    let file = made?;
     check(&file, path)?;
     Ok(file)
 }
@@ -319,19 +337,6 @@ fn check(file: &File, path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn check(_: &File, _: &Path) -> Result<()> {
     Ok(())
-}
-
-/// Creates the disk from the template; never over a file that appeared meanwhile.
-fn create(path: &Path, size: u64) -> Result<()> {
-    match kiln_image::scratch::create_scratch(path, size) {
-        Err(kiln_image::ImageError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(Error::refused(format!(
-                "{} appeared while kiln was creating it (another kiln run?)",
-                path.display()
-            )))
-        }
-        r => Ok(r?),
-    }
 }
 
 fn nofollow(o: &mut OpenOptions) {
@@ -592,6 +597,31 @@ mod tests {
         let err = open(&path, &m, &l, None, false, true).unwrap_err();
         assert!(err.to_string().contains("newer kiln"), "{err}");
         assert_eq!(sidecar_of(&path), Found::Newer(2));
+    }
+
+    /// A new disk is locked before it appears at its path: it is linked into place
+    /// from a locked temporary sibling, which is gone afterwards; a file that
+    /// appeared at the path meanwhile is never replaced.
+    #[test]
+    fn a_new_disk_appears_locked_and_never_replaces_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.img");
+        let held = create_locked(&path, 64 << 20).unwrap();
+        // Whoever opens it now finds it locked.
+        let other = open_nofollow(&path).unwrap();
+        assert!(!try_lock(&other).unwrap());
+        drop(held);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("disk.img")]);
+        std::fs::write(&path, b"theirs").unwrap();
+        let err = create_locked(&path, 64 << 20).unwrap_err();
+        assert!(err.to_string().contains("appeared"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     /// A disk created where none was clears a sidecar left from an earlier one.
