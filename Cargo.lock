@@ -1503,6 +1503,7 @@ dependencies = [
  "kiln-erofs",
  "kiln-proto",
  "rustix 1.1.5",
+ "sha2 0.11.0",
  "signal-hook 0.4.5",
  "tempfile",
 ]

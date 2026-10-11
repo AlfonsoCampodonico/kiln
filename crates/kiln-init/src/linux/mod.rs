@@ -3,11 +3,13 @@
 //! `kiln-init: <stage>: <error>` on the console, sends `InitFailed` when the
 //! channel is up, and ends the VM with `exitMethod`, or `reboot()` before `Config`.
 
+mod build;
 mod control;
 mod identity;
 mod process;
 mod relay;
 mod root;
+mod seal;
 mod storage;
 mod supervise;
 pub mod sys;
@@ -67,6 +69,11 @@ fn boot() -> Result<()> {
     let (events, rx) = channel();
     enter(2)?;
     let (config, config_at, files) = control::connect(events.clone())?;
+    if config.mode == kiln_proto::Mode::Build {
+        // `Config::validate` refuses volumes in build mode, so `files` is empty.
+        drop(files);
+        return build::run(&config, events, &rx);
+    }
     enter(3)?;
     let scratch = storage::mount_all(&config)?;
     let mut volumes = volumes::Volumes::prepare(&config, &files)?;

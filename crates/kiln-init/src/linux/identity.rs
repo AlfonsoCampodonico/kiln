@@ -13,11 +13,18 @@ use crate::error::{Context, Failure, Result};
 use crate::{etc, netlink};
 
 pub fn configure(config: &Config) -> Result<()> {
-    rustix::system::sethostname(config.hostname.as_bytes()).context("sethostname")?;
     let net = config.network.as_ref();
     write_etc("/etc/hostname", &etc::hostname(&config.hostname))?;
     write_etc("/etc/hosts", &etc::hosts(&config.hostname, net))?;
     write_etc("/etc/resolv.conf", &etc::resolv_conf(net))?;
+    network(config)
+}
+
+/// The hostname, `lo` and `eth0`, without the `/etc` files (build mode mounts
+/// them per step instead, so that they never reach a step's diff).
+pub fn network(config: &Config) -> Result<()> {
+    rustix::system::sethostname(config.hostname.as_bytes()).context("sethostname")?;
+    let net = config.network.as_ref();
     let mut rtnl = Rtnl::open()?;
     let lo = rtnl.index("lo")?;
     rtnl.request("bring up lo", |seq| netlink::link_up(seq, lo))?;
