@@ -53,7 +53,7 @@ fn convert_ls_inspect_gc_import() {
         // what `kiln run` needs for it.
         .stderr(predicate::str::contains(
             "note: --boot-layers none: a provisional image without kernel or kiln-init layers; \
-             `kiln run` needs --kernel and --init for it",
+             `kiln run` needs --kernel PATH --allow-custom-kernel for it (kiln-init comes from the pin, or --init)",
         ));
     kiln(home.path())
         .args(["ls"])
