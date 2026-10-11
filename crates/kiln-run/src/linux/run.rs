@@ -372,11 +372,18 @@ impl Run {
 
         let base = rundir::base_dir()?;
         let (boot_id, hostname) = (rundir::boot_id(), rundir::hostname());
-        for id in rundir::kill_orphans(&base, &boot_id, &hostname, rundir::alive, rundir::kill_identity) {
-            notice(&format!(
-                "note: killed the VMM of run {}, whose kiln is gone",
-                kiln_proto::sanitize::clean_line(&id)
-            ));
+        // Before a --persist disk is opened: a killed VMM that will not die may
+        // still hold it, and refuses the run.
+        let reaped = rundir::kill_orphans(
+            &base,
+            &boot_id,
+            &hostname,
+            rundir::alive,
+            rundir::kill_identity,
+            rundir::ORPHAN_WAIT,
+        );
+        for line in rundir::reaped_notices(&reaped, opts.persist.is_some())? {
+            notice(&line);
         }
         let cleanup = rundir::clean_stale(&base, &boot_id, &hostname, rundir::alive);
         if let Some(note) = cleanup.notice(&base) {
@@ -704,8 +711,18 @@ mod tests {
         // The next run's reaper finds the VMM and kills it; then the sweep collects
         // the directory.
         assert_eq!(
-            rundir::kill_orphans(base.path(), &boot, &host, rundir::alive, rundir::kill_identity),
-            [id]
+            rundir::kill_orphans(
+                base.path(),
+                &boot,
+                &host,
+                rundir::alive,
+                rundir::kill_identity,
+                rundir::ORPHAN_WAIT
+            )
+            .into_iter()
+            .map(|r| (r.run, r.gone))
+            .collect::<Vec<_>>(),
+            [(id, true)]
         );
         child.wait().unwrap();
         rundir::clean_stale(base.path(), &boot, &host, rundir::alive);
