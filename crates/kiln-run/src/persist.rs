@@ -301,8 +301,18 @@ fn create_locked(path: &Path, size: u64) -> Result<File> {
     Ok(file)
 }
 
+/// Locks the disk, retrying for up to 100 ms: a process this one is spawning
+/// (any thread's) holds a copy of every descriptor until it execs, which closes
+/// them, so a lock just released can look held for a moment. Another run's lock
+/// is still held after that.
 fn lock(file: &File, path: &Path) -> Result<()> {
-    if !try_lock(file)? {
+    let mut tries = 0;
+    while !try_lock(file)? {
+        tries += 1;
+        if tries < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
         return Err(Error::refused(format!(
             "{} is in use by another kiln run",
             path.display()
