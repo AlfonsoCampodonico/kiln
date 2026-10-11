@@ -7,6 +7,7 @@
 //!   KILN_TEST_KERNEL=<vmkit kernel>   KILN_TEST_INIT=<static kiln-init>
 //!   KILN_TEST_HOSTILE=<static `hostile` from kiln-testguest>   KILN_TEST_BUSYBOX=<static busybox, default /bin/busybox>
 //!   KILN_TEST_INIT_V1=<a static kiln-init speaking protocol version 1> (optional: the mixed-install tests)
+//!   KILN_TEST_INIT_V2=<a static kiln-init speaking protocol version 2> (optional: build mode's mixed-install test)
 //! Without the kernel and init each test is skipped, unless KILN_REQUIRE_KVM_TESTS=1.
 //! KILN_TEST_KEEP=1 keeps every run directory (console and VMM logs); KILN_TEST_VCPUS
 //! sets the guests' vCPUs (default 1).
@@ -43,6 +44,7 @@ pub struct Env {
     pub hostile: Option<PathBuf>,
     pub busybox: PathBuf,
     pub init_v1: Option<PathBuf>,
+    pub init_v2: Option<PathBuf>,
 }
 
 pub fn require() -> bool {
@@ -60,6 +62,7 @@ pub fn env() -> Option<&'static Env> {
                 hostile: get("KILN_TEST_HOSTILE"),
                 busybox: get("KILN_TEST_BUSYBOX").unwrap_or_else(|| "/bin/busybox".into()),
                 init_v1: get("KILN_TEST_INIT_V1"),
+                init_v2: get("KILN_TEST_INIT_V2"),
             }),
             _ => {
                 assert!(
@@ -181,6 +184,63 @@ const APPLETS: [&str; 30] = [
     "mount", "nc", "printf", "pwd", "readlink", "seq", "sh", "sleep", "stat", "stty", "test", "tr", "true", "tty",
     "wc",
 ];
+
+/// Each entry's path and mtime in a ustar/PAX archive (PAX `path` and `mtime`
+/// records apply to the next entry; PAX headers are not entries).
+pub fn tar_mtimes(tar: &[u8]) -> Vec<(String, u64)> {
+    let field = |h: &[u8], a: usize, b: usize| {
+        let s: String = h[a..b].iter().take_while(|&&c| c != 0).map(|&c| c as char).collect();
+        u64::from_str_radix(s.trim(), 8).unwrap_or(0)
+    };
+    let mut out = Vec::new();
+    let (mut at, mut pax_path, mut pax_mtime) = (0, None, None);
+    while at + 512 <= tar.len() && tar[at..at + 512].iter().any(|&b| b != 0) {
+        let h = &tar[at..at + 512];
+        let size = field(h, 124, 136) as usize;
+        let data = &tar[at + 512..at + 512 + size];
+        if h[156] == b'x' {
+            for rec in String::from_utf8_lossy(data).lines() {
+                if let Some((_, kv)) = rec.split_once(' ')
+                    && let Some((k, v)) = kv.split_once('=')
+                {
+                    match k {
+                        "path" => pax_path = Some(v.to_string()),
+                        "mtime" => pax_mtime = v.split('.').next().and_then(|t| t.parse().ok()),
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            let name: String = h[..100].iter().take_while(|&&c| c != 0).map(|&c| c as char).collect();
+            let prefix: String = h[345..500]
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as char)
+                .collect();
+            let path = pax_path.take().unwrap_or(if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            });
+            out.push((path, pax_mtime.take().unwrap_or(field(h, 136, 148))));
+        }
+        at += 512 + size.div_ceil(512) * 512;
+    }
+    out
+}
+
+/// The base layer's tar (busybox, users, `/etc` symlinks), as the fixtures convert it.
+pub fn base_tar() -> Vec<u8> {
+    base_layer(&std::fs::read(&env().expect("checked by Case::new").busybox).expect("read the static busybox"))
+}
+
+/// Converts layer tars with kiln, as `kiln convert` would, into erofs layers in
+/// the fixtures' store, lowest first.
+pub fn convert_tars(name: &str, tars: Vec<Vec<u8>>) -> Vec<PathBuf> {
+    let dir = &fixtures().dir;
+    let store = Store::open(dir.join("store")).unwrap();
+    convert(&store, dir, name, tars)
+}
 
 fn base_layer(busybox: &[u8]) -> Vec<u8> {
     let dir = Opts::default().mode(0o755);

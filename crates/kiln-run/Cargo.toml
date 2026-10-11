@@ -24,4 +24,5 @@ vmkit.workspace = true
 [dev-dependencies]
 kiln-erofs = { path = "../kiln-erofs" }
 kiln-oci = { path = "../kiln-oci" }
+sha2 = "0.11.0"
 tempfile = "3.27.0"
