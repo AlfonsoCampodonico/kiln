@@ -134,6 +134,63 @@ pub fn vmm_identity(run_dir: &Path) -> Option<Identity> {
     (poll(&mut fds, Some(&zero)).ok()? == 0).then_some(id)
 }
 
+/// What `restricted` blocks that an `allow=` exception can open whole, by name.
+const RESTRICTED: [(&str, [u8; 4], u8); 6] = [
+    ("everything (0.0.0.0/0)", [0, 0, 0, 0], 0),
+    ("the private network 10.0.0.0/8", [10, 0, 0, 0], 8),
+    ("the private network 172.16.0.0/12", [172, 16, 0, 0], 12),
+    ("the private network 192.168.0.0/16", [192, 168, 0, 0], 16),
+    ("the shared (CGNAT) network 100.64.0.0/10", [100, 64, 0, 0], 10),
+    ("the link-local network 169.254.0.0/16", [169, 254, 0, 0], 16),
+];
+
+/// The cloud metadata service most clouds answer on.
+const METADATA: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
+
+/// The warnings `--egress` gets before boot: `open`, and `allow=` exceptions that
+/// are ignored under it; under `restricted` (or `deny-all`), exceptions that open
+/// cloud metadata or a whole range `restricted` exists to block (as `open` does), and those that
+/// include the host's outbound address, which the guest can never reach (finding
+/// 4.1).
+fn egress_warnings(n: &NetSpec, outbound: Option<std::net::Ipv4Addr>) -> Vec<String> {
+    use vmkit::net::{Cidr, Egress};
+    let mut out = Vec::new();
+    if n.egress == Egress::Open {
+        out.push("warning: --egress open: the guest can reach private networks, the host and cloud metadata".into());
+        out.extend(
+            n.allow
+                .iter()
+                .map(|c| format!("warning: --egress allow={c} is ignored: --egress open allows everything")),
+        );
+        return out;
+    }
+    for c in &n.allow {
+        let covers = |x: &Cidr| c.prefix() <= x.prefix() && c.contains(x.addr());
+        let mut opens: Vec<String> = Vec::new();
+        if c.contains(METADATA) {
+            opens.push(format!("cloud metadata ({METADATA})"));
+        }
+        opens.extend(
+            RESTRICTED
+                .iter()
+                .filter(|(_, a, p)| Cidr::new((*a).into(), *p).is_some_and(|x| covers(&x)))
+                .map(|(name, _, _)| name.to_string()),
+        );
+        if !opens.is_empty() {
+            out.push(format!(
+                "warning: --egress allow={c} opens {}: the guest can reach it, as with --egress open",
+                opens.join(", ")
+            ));
+        }
+        if let Some(a) = outbound.filter(|a| c.contains(*a)) {
+            out.push(format!(
+                "warning: --egress allow={c} includes the host's own address {a}, which the guest can never reach"
+            ));
+        }
+    }
+    out
+}
+
 /// A run in progress.
 pub struct Run {
     session: Session,
@@ -242,15 +299,8 @@ impl Run {
             let outbound = vmkit::net::outbound_address();
             n.check_allow(outbound.as_slice())
                 .map_err(|e| Error::refused(format!("--egress: {e}")))?;
-            if n.egress == vmkit::net::Egress::Open {
-                notice("warning: --egress open: the guest can reach private networks, the host and cloud metadata");
-            } else if let Some(a) = outbound {
-                for c in n.allow.iter().filter(|c| c.contains(a)) {
-                    notice(&format!(
-                        "warning: --egress allow={c} includes the host's own address {a}, which the guest can never \
-                         reach"
-                    ));
-                }
+            for w in egress_warnings(n, outbound) {
+                notice(&w);
             }
         }
         // The Lima VM's dev loop (spec §10): the macOS store's latest convert of the
@@ -589,6 +639,54 @@ mod tests {
         // one that includes it still reaches its other addresses.
         assert!(spec.check_allow(&[Ipv4Addr::new(192, 0, 2, 7)]).is_err());
         assert!(spec.check_allow(&[Ipv4Addr::new(10, 1, 9, 9)]).is_ok());
+    }
+
+    #[test]
+    fn egress_warnings_name_what_an_exception_opens() {
+        use std::net::Ipv4Addr;
+        let warnings = |egress: &str, allow: &[&str], outbound: Option<Ipv4Addr>| {
+            let mut n = NetOptions::default();
+            let mut set = false;
+            n.add_egress(egress, &mut set).unwrap();
+            for a in allow {
+                n.add_egress(&format!("allow={a}"), &mut set).unwrap();
+            }
+            egress_warnings(&net_spec(&n), outbound)
+        };
+        // Narrow exceptions under restricted: nothing to say.
+        assert!(warnings("restricted", &["10.1.0.0/16", "203.0.113.7"], None).is_empty());
+        // Whole ranges restricted blocks, and cloud metadata, are named.
+        let w = warnings("restricted", &["0.0.0.0/0"], None);
+        assert!(
+            w.len() == 1 && w[0].contains("everything (0.0.0.0/0)") && w[0].contains("cloud metadata"),
+            "{w:?}"
+        );
+        assert!(w[0].contains("as with --egress open"), "{w:?}");
+        for (a, want) in [
+            ("10.0.0.0/8", "10.0.0.0/8"),
+            ("172.16.0.0/12", "172.16.0.0/12"),
+            ("192.168.0.0/16", "192.168.0.0/16"),
+            ("100.64.0.0/10", "CGNAT"),
+            ("169.254.0.0/16", "169.254.0.0/16"),
+            ("169.254.169.254", "cloud metadata (169.254.169.254)"),
+        ] {
+            let w = warnings("restricted", &[a], None);
+            assert!(w.len() == 1 && w[0].contains(want), "{a}: {w:?}");
+        }
+        // The same under deny-all; under open the exceptions are ignored.
+        let w = warnings("deny-all", &["10.0.0.0/8"], None);
+        assert!(w.len() == 1 && w[0].contains("10.0.0.0/8"), "{w:?}");
+        let w = warnings("open", &["10.0.0.0/8"], None);
+        assert!(
+            w.len() == 2 && w[0].starts_with("warning: --egress open:") && w[1].contains("is ignored"),
+            "{w:?}"
+        );
+        // An exception wider than the host's outbound address: its other addresses work.
+        let w = warnings("restricted", &["192.0.2.0/24"], Some(Ipv4Addr::new(192, 0, 2, 7)));
+        assert!(
+            w.len() == 1 && w[0].contains("includes the host's own address 192.0.2.7"),
+            "{w:?}"
+        );
     }
 
     /// The VM ended without the guest's final message: the likely causes, and
