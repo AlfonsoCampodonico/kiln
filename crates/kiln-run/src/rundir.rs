@@ -91,6 +91,13 @@ impl RunDir {
         self.keep = true;
     }
 
+    /// Leaves the directory to a later run's sweep, which still collects it (its
+    /// `run.json` is not marked kept): the VMM may still be running, and its
+    /// `run.json` is how [`kill_orphans`] finds it.
+    pub fn leave(mut self) {
+        self.keep = true;
+    }
+
     /// Replaces `run.json` atomically: written and synced to a temporary file,
     /// then renamed over it.
     pub fn write_info(&self, info: &RunInfo) -> Result<()> {
@@ -185,6 +192,11 @@ impl ScratchDir {
 
     /// Leaves the directory in place (`KILN_KEEP_RUN_DIR=1`).
     pub fn keep(&mut self) {
+        self.keep = true;
+    }
+
+    /// Leaves the directory to a later run's sweep (see [`RunDir::leave`]).
+    pub fn leave(mut self) {
         self.keep = true;
     }
 }
@@ -360,17 +372,20 @@ pub fn kill_orphans(
     killed
 }
 
-/// Sends SIGKILL to the process `id` names, only when `/proc` confirms it is that
-/// process (the same start time), and waits up to a second for it to be gone; true
-/// when it was killed.
+/// Sends SIGKILL to the process `id` names, only when it is that process, and
+/// waits up to a second for it to be gone; true when it was killed. A pidfd pins
+/// the process first, then `/proc` confirms its start time, and the signal goes
+/// through the pidfd: a pid reused at any point is never signalled (Linux).
+#[cfg(target_os = "linux")]
 pub fn kill_identity(id: &Identity) -> bool {
-    if identity(id.pid) != Some(*id) {
-        return false;
-    }
-    let Some(pid) = rustix::process::Pid::from_raw(id.pid as i32) else {
+    use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+    let Some(pid) = i32::try_from(id.pid).ok().and_then(Pid::from_raw) else {
         return false;
     };
-    if rustix::process::kill_process(pid, rustix::process::Signal::KILL).is_err() {
+    let Ok(fd) = pidfd_open(pid, PidfdFlags::empty()) else {
+        return false;
+    };
+    if identity(id.pid) != Some(*id) || pidfd_send_signal(&fd, Signal::KILL).is_err() {
         return false;
     }
     let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -378,6 +393,12 @@ pub fn kill_identity(id: &Identity) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     true
+}
+
+/// [`kill_identity`] elsewhere: there is no `/proc` to confirm an identity with.
+#[cfg(not(target_os = "linux"))]
+pub fn kill_identity(_: &Identity) -> bool {
+    false
 }
 
 /// What [`clean_stale`] did.
