@@ -141,6 +141,9 @@ impl Protocol {
                 }
                 self.failed = Some(f.clone());
             }
+            GuestMessage::StepExited(_) | GuestMessage::StepSealed(_) => {
+                return v(format!("{} outside build mode", name(msg)));
+            }
         }
         Ok(Accepted::Recorded)
     }
@@ -191,8 +194,13 @@ impl Protocol {
 pub fn version_refusal(guest: u32, config: &Config) -> Option<String> {
     let needed = config.required_version();
     (guest < needed).then(|| {
+        let what = if needed >= 3 {
+            "build mode needs"
+        } else {
+            "the image's services need"
+        };
         format!(
-            "the image's services need guest protocol version {needed}, and the guest's kiln-init speaks \
+            "{what} guest protocol version {needed}, and the guest's kiln-init speaks \
              version {guest}: boot it with a kiln-init from this kiln release"
         )
     })
@@ -208,6 +216,8 @@ fn name(msg: &GuestMessage) -> &'static str {
         GuestMessage::ExecStarted(_) => "ExecStarted",
         GuestMessage::ExecExited(_) => "ExecExited",
         GuestMessage::ExecFailed(_) => "ExecFailed",
+        GuestMessage::StepExited(_) => "StepExited",
+        GuestMessage::StepSealed(_) => "StepSealed",
     }
 }
 
@@ -238,6 +248,9 @@ mod tests {
             volumes: Vec::new(),
             pod_disk: None,
             ready_timeout_ms: (!services.is_empty()).then_some(1000),
+            mode: kiln_proto::Mode::Run,
+            disks: Vec::new(),
+            source_date_epoch: None,
             services: services
                 .iter()
                 .map(|n| Service {
@@ -271,9 +284,9 @@ mod tests {
             assert_eq!(p.version(), v);
         }
         let mut p = Protocol::default();
-        let why = p.accept(&GuestMessage::Hello(Hello { protocol: 3 })).unwrap_err();
+        let why = p.accept(&GuestMessage::Hello(Hello { protocol: 4 })).unwrap_err();
         assert!(
-            why.0.contains("unsupported guest protocol 3 (this kiln speaks 1 to 2)"),
+            why.0.contains("unsupported guest protocol 4 (this kiln speaks 1 to 3)"),
             "{why}"
         );
         assert_eq!(version_refusal(1, &config(&[])), None);
@@ -449,8 +462,8 @@ mod tests {
             let (at, why) = run(msgs).unwrap_err();
             assert_eq!(at, msgs.len() - 1, "{msgs:?}: {why}");
         }
-        let (_, why) = run(&[GuestMessage::Hello(Hello { protocol: 3 })]).unwrap_err();
-        assert!(why.0.contains("unsupported guest protocol 3"), "{why}");
+        let (_, why) = run(&[GuestMessage::Hello(Hello { protocol: 4 })]).unwrap_err();
+        assert!(why.0.contains("unsupported guest protocol 4"), "{why}");
     }
 
     #[test]

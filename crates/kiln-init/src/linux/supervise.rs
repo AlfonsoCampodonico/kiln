@@ -181,6 +181,9 @@ pub fn run(config: &Config, started: Started, events: &Receiver<Event>, volumes:
             Some(Event::Host(HostMessage::Config(_))) => {
                 return Err(Failure::msg("protocol violation: a second Config"));
             }
+            Some(Event::Host(HostMessage::RunStep(_) | HostMessage::Finish)) => {
+                return Err(Failure::msg("protocol violation: a build message outside build mode"));
+            }
             Some(Event::HostError(e)) => return Err(Failure::msg(format!("protocol violation: {e}"))),
             Some(Event::HostClosed) => return Err(Failure::msg("the host closed the control connection")),
         }

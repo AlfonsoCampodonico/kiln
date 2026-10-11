@@ -4,6 +4,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::build::{RunStep, StepExited, StepSealed};
 use crate::config::Config;
 use crate::error::{ProtoError, Result};
 use crate::exec::{ExecExited, ExecFailed, ExecSignal, ExecStart, ExecStarted, ExecWindowSize, check_code, check_id};
@@ -135,6 +136,10 @@ pub enum GuestMessage {
     ExecStarted(ExecStarted),
     ExecExited(ExecExited),
     ExecFailed(ExecFailed),
+    /// Version 3: the build step's command ended.
+    StepExited(StepExited),
+    /// Version 3: the build step's diff is on the output disk.
+    StepSealed(StepSealed),
 }
 
 /// Messages from the host.
@@ -148,6 +153,10 @@ pub enum HostMessage {
     ExecSignal(ExecSignal),
     ExecWindowSize(ExecWindowSize),
     FileUpdate(FileUpdate),
+    /// Version 3: run a build step.
+    RunStep(Box<RunStep>),
+    /// Version 3: the build is over; sync and end the VM.
+    Finish,
 }
 
 const HELLO: u8 = 1;
@@ -166,6 +175,10 @@ const FILE_UPDATE: u8 = 13;
 const EXEC_STARTED: u8 = 14;
 const EXEC_EXITED: u8 = 15;
 const EXEC_FAILED: u8 = 16;
+const RUN_STEP: u8 = 17;
+const FINISH: u8 = 18;
+const STEP_EXITED: u8 = 19;
+const STEP_SEALED: u8 = 20;
 
 fn type_name(ty: u8) -> Option<&'static str> {
     Some(match ty {
@@ -185,6 +198,10 @@ fn type_name(ty: u8) -> Option<&'static str> {
         EXEC_STARTED => "ExecStarted",
         EXEC_EXITED => "ExecExited",
         EXEC_FAILED => "ExecFailed",
+        RUN_STEP => "RunStep",
+        FINISH => "Finish",
+        STEP_EXITED => "StepExited",
+        STEP_SEALED => "StepSealed",
         _ => return None,
     })
 }
@@ -272,6 +289,8 @@ impl Message for GuestMessage {
             GuestMessage::ExecStarted(_) => EXEC_STARTED,
             GuestMessage::ExecExited(_) => EXEC_EXITED,
             GuestMessage::ExecFailed(_) => EXEC_FAILED,
+            GuestMessage::StepExited(_) => STEP_EXITED,
+            GuestMessage::StepSealed(_) => STEP_SEALED,
         }
     }
 
@@ -304,6 +323,8 @@ impl Message for GuestMessage {
                 check_errno("InitFailed", f.errno)?;
                 check_text("InitFailed", &f.message)
             }
+            GuestMessage::StepExited(e) => e.validate(),
+            GuestMessage::StepSealed(s) => s.validate(),
         }
     }
 
@@ -317,6 +338,8 @@ impl Message for GuestMessage {
             GuestMessage::ExecStarted(e) => json(e),
             GuestMessage::ExecExited(e) => json(e),
             GuestMessage::ExecFailed(f) => json(f),
+            GuestMessage::StepExited(e) => json(e),
+            GuestMessage::StepSealed(s) => json(s),
         }
     }
 
@@ -333,6 +356,8 @@ impl Message for GuestMessage {
             EXEC_STARTED => GuestMessage::ExecStarted(parse(ty, payload)?),
             EXEC_EXITED => GuestMessage::ExecExited(parse(ty, payload)?),
             EXEC_FAILED => GuestMessage::ExecFailed(parse(ty, payload)?),
+            STEP_EXITED => GuestMessage::StepExited(parse(ty, payload)?),
+            STEP_SEALED => GuestMessage::StepSealed(parse(ty, payload)?),
             _ => return Err(wrong_direction(ty)),
         };
         msg.validate()?;
@@ -351,6 +376,8 @@ impl Message for HostMessage {
             HostMessage::ExecSignal(_) => EXEC_SIGNAL,
             HostMessage::ExecWindowSize(_) => EXEC_WINDOW_SIZE,
             HostMessage::FileUpdate(_) => FILE_UPDATE,
+            HostMessage::RunStep(_) => RUN_STEP,
+            HostMessage::Finish => FINISH,
         }
     }
 
@@ -360,7 +387,6 @@ impl Message for HostMessage {
             HostMessage::Signal(s) if crate::signal::name(s.sig).is_none() => {
                 Err(ProtoError::invalid("Signal", format!("signal {}", s.sig)))
             }
-            HostMessage::Signal(_) | HostMessage::Shutdown(_) | HostMessage::WindowSize(_) => Ok(()),
             HostMessage::ExecStart(e) => e.validate(),
             HostMessage::ExecSignal(s) => {
                 check_id("ExecSignal", s.id)?;
@@ -371,6 +397,10 @@ impl Message for HostMessage {
             }
             HostMessage::ExecWindowSize(w) => check_id("ExecWindowSize", w.id),
             HostMessage::FileUpdate(u) => u.validate(),
+            HostMessage::RunStep(s) => s.validate(),
+            HostMessage::Signal(_) | HostMessage::Shutdown(_) | HostMessage::WindowSize(_) | HostMessage::Finish => {
+                Ok(())
+            }
         }
     }
 
@@ -384,6 +414,8 @@ impl Message for HostMessage {
             HostMessage::ExecSignal(s) => json(s),
             HostMessage::ExecWindowSize(w) => json(w),
             HostMessage::FileUpdate(u) => json(u),
+            HostMessage::RunStep(s) => json(s),
+            HostMessage::Finish => json(&Empty {}),
         }
     }
 
@@ -397,6 +429,11 @@ impl Message for HostMessage {
             EXEC_SIGNAL => HostMessage::ExecSignal(parse(ty, payload)?),
             EXEC_WINDOW_SIZE => HostMessage::ExecWindowSize(parse(ty, payload)?),
             FILE_UPDATE => HostMessage::FileUpdate(parse(ty, payload)?),
+            RUN_STEP => HostMessage::RunStep(Box::new(parse(ty, payload)?)),
+            FINISH => {
+                parse::<Empty>(ty, payload)?;
+                HostMessage::Finish
+            }
             _ => return Err(wrong_direction(ty)),
         };
         msg.validate()?;
@@ -501,6 +538,29 @@ mod tests {
             "{} chars",
             reason.chars().count()
         );
+    }
+
+    #[test]
+    fn build_messages_have_their_own_types_and_directions() {
+        let sealed = GuestMessage::StepSealed(StepSealed {
+            id: 2,
+            offset: 4096,
+            len: 2048,
+            sha256: "0".repeat(64),
+            entries: 3,
+        });
+        assert_eq!(sealed.message_type(), 20);
+        assert_eq!(GuestMessage::decode(20, &sealed.payload()).unwrap(), sealed);
+        let exited = GuestMessage::StepExited(StepExited {
+            id: 2,
+            code: None,
+            signal: Some(9),
+        });
+        assert_eq!(exited.payload(), br#"{"id":2,"signal":9}"#);
+        assert_eq!(HostMessage::decode(18, b"{}").unwrap(), HostMessage::Finish);
+        assert!(HostMessage::decode(19, br#"{"id":2,"code":0}"#).is_err());
+        assert!(GuestMessage::decode(17, b"{}").is_err());
+        assert!(GuestMessage::decode(19, br#"{"id":2}"#).is_err());
     }
 
     #[test]

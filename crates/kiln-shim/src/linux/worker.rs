@@ -267,6 +267,10 @@ fn prepare(plan: &WorkerPlan) -> Result<Prepared, Fail> {
         // kiln-shim does not support services (recorded known gap): a pod's Config is version 1.
         services: Vec::new(),
         ready_timeout_ms: None,
+        // A pod is always run mode: kiln-shim never boots a build VM (protocol version 3).
+        mode: kiln_proto::Mode::Run,
+        disks: Vec::new(),
+        source_date_epoch: None,
     };
     ctx(config.validate(), "the guest's configuration")?;
     ctx(kiln_run::config::check_size(&config), "the guest's configuration")?;

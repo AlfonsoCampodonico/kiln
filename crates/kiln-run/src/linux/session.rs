@@ -789,6 +789,8 @@ impl Session {
                         self.expect_end(now, FINAL_MESSAGE);
                     }
                     GuestMessage::ExecStarted(_) | GuestMessage::ExecExited(_) | GuestMessage::ExecFailed(_) => {}
+                    // Refused by the protocol outside build mode.
+                    GuestMessage::StepExited(_) | GuestMessage::StepSealed(_) => {}
                 }
             }
             Event::Violation(why) => self.violate(why),

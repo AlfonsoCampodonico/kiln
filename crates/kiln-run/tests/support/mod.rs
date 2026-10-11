@@ -314,6 +314,9 @@ impl Case {
             pod_disk: None,
             services: Vec::new(),
             ready_timeout_ms: None,
+            mode: kiln_proto::Mode::Run,
+            disks: Vec::new(),
+            source_date_epoch: None,
         }
     }
 

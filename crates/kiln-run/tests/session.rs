@@ -37,6 +37,9 @@ fn config() -> Config {
         pod_disk: None,
         services: Vec::new(),
         ready_timeout_ms: None,
+        mode: kiln_proto::Mode::Run,
+        disks: Vec::new(),
+        source_date_epoch: None,
     }
 }
 
@@ -856,14 +859,14 @@ fn bad_frames_are_violations() {
     }
     let vm = fake(|sock, killed| {
         let mut c = connect(&sock, port::CONTROL);
-        send(&mut c, GuestMessage::Hello(Hello { protocol: 3 }));
+        send(&mut c, GuestMessage::Hello(Hello { protocol: 4 }));
         wait_killed(&killed);
     });
     let (st, _) = streams(None);
     let o = Session::start(vm, config(), st, opts()).unwrap().finish_within(LIMIT);
     assert_eq!(
         o.violation.as_deref(),
-        Some("unsupported guest protocol 3 (this kiln speaks 1 to 2)")
+        Some("unsupported guest protocol 4 (this kiln speaks 1 to 3)")
     );
 }
 

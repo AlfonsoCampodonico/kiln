@@ -10,6 +10,7 @@
 //! The other ports carry raw stdio bytes, where EOF is a half-close.
 #![forbid(unsafe_code)]
 
+mod build;
 mod config;
 mod error;
 mod exec;
@@ -20,6 +21,10 @@ pub mod sanitize;
 pub mod signal;
 mod volume;
 
+pub use build::{
+    BuildDisk, Command, DIFF_ALIGN, DiskKind, MAX_BUILD_LOWERS, MAX_STEP_MOUNTS, MAX_STEP_SECRETS, Mode, RunStep,
+    Secret, StepExited, StepMount, StepSealed, base64,
+};
 pub use config::{
     Config, ExitMethod, Ipv6Network, MAX_LAYERS, MAX_SERVICE_NAME, MAX_SERVICES, MAX_SOCKET_PATH, MIN_SCRATCH_BYTES,
     Network, Process, Ready, Scratch, Service, valid_service_name, validate_services,
@@ -41,8 +46,10 @@ pub use volume::{
 
 /// The highest protocol version this crate implements: what a guest announces in
 /// [`Hello`], and the highest a host accepts (spec §9.8). Version 2 adds
-/// `Config.services`, `Config.readyTimeoutMs` and `Exited.service`.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// `Config.services`, `Config.readyTimeoutMs` and `Exited.service`; version 3
+/// adds build mode (`Config.mode`, `Config.disks`, `RunStep`, `Finish`,
+/// `StepExited`, `StepSealed`).
+pub const PROTOCOL_VERSION: u32 = 3;
 /// The host's vsock CID; the guest connects to it.
 pub const HOST_CID: u32 = 2;
 /// The guest's vsock CID (spec §9.1).

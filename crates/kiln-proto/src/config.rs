@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 
+use crate::build::{BuildDisk, Mode};
 use crate::error::{ProtoError, Result};
 use crate::message::WindowSize;
 use crate::volume::{MAX_VOLUMES, Volume, VolumeKind};
@@ -68,6 +69,19 @@ pub struct Config {
     /// before the host's own boot timeout ends the VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_timeout_ms: Option<u32>,
+    /// Protocol version 3: `build` runs `RunStep`s instead of `process` (which
+    /// is then empty). Omitted when `run`.
+    #[serde(default, skip_serializing_if = "Mode::is_run")]
+    pub mode: Mode,
+    /// Protocol version 3, build mode only: the disks after the output disk
+    /// (`vdc`) and the `layers` base layers, in disk order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<BuildDisk>,
+    /// Protocol version 3, build mode only: when set, a sealed diff's entries
+    /// have mtimes of at most this many seconds since the epoch (copied-up
+    /// parent directories included), for reproducible diffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_date_epoch: Option<u64>,
 }
 
 /// A process kiln-init starts before the main process and stops after it
@@ -337,7 +351,32 @@ fn valid_hostname(h: &str) -> bool {
 impl Config {
     /// Checks every field; both sides call it (on encode and on decode).
     pub fn validate(&self) -> Result<()> {
-        self.process.validate("Config")?;
+        match self.mode {
+            Mode::Run if !self.disks.is_empty() || self.source_date_epoch.is_some() => {
+                return Err(invalid("disks or sourceDateEpoch outside build mode"));
+            }
+            Mode::Run => self.process.validate("Config")?,
+            Mode::Build => {
+                if self.process != Process::default()
+                    || self.tty.is_some()
+                    || self.interactive
+                    || !self.services.is_empty()
+                    || !self.volumes.is_empty()
+                    || self.pod_disk.is_some()
+                {
+                    return Err(invalid(
+                        "build mode with a process, a terminal, stdin, services, volumes or a pod disk",
+                    ));
+                }
+                if self.layers as usize + self.disks.len() > MAX_LAYERS as usize {
+                    return Err(invalid(format!(
+                        "{} layers and {} disks (at most {MAX_LAYERS} together)",
+                        self.layers,
+                        self.disks.len()
+                    )));
+                }
+            }
+        }
         if crate::signal::name(self.stop_signal).is_none() {
             return Err(invalid(format!(
                 "stopSignal {} (signals 1-31 only; real-time signals are not supported)",
@@ -387,10 +426,32 @@ impl Config {
     }
 
     /// The lowest protocol version that defines everything this `Config` uses
-    /// (spec §9.8 rule 3): 2 with services, else 1. Everything before version 2
-    /// counts as version 1.
+    /// (spec §9.8 rule 3): 3 in build mode, 2 with services, else 1. Everything
+    /// before version 2 counts as version 1.
     pub fn required_version(&self) -> u32 {
-        if self.services.is_empty() { 1 } else { 2 }
+        if self.mode == Mode::Build {
+            3
+        } else if self.services.is_empty() {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// The disk index of the build mode output disk (`vdc`).
+    pub const OUTPUT_DISK: u32 = 2;
+
+    /// The disk index of `Config.disks[i]`, in build mode.
+    pub fn build_disk_index(&self, i: usize) -> u32 {
+        Self::OUTPUT_DISK + 1 + self.layers + i as u32
+    }
+
+    /// The `Config.disks` entry at disk index `disk`, in build mode.
+    pub fn build_disk(&self, disk: u32) -> Option<BuildDisk> {
+        let first = Self::OUTPUT_DISK + 1 + self.layers;
+        disk.checked_sub(first)
+            .and_then(|i| self.disks.get(i as usize))
+            .copied()
     }
 }
 
@@ -527,7 +588,84 @@ mod tests {
             pod_disk: None,
             services: Vec::new(),
             ready_timeout_ms: None,
+            mode: Mode::Run,
+            disks: Vec::new(),
+            source_date_epoch: None,
         }
+    }
+
+    #[test]
+    fn build_mode_needs_version_3_and_no_process() {
+        use crate::build::DiskKind;
+        let mut c = Config {
+            process: Process::default(),
+            mode: Mode::Build,
+            disks: vec![
+                BuildDisk {
+                    kind: DiskKind::Erofs,
+                    read_only: true,
+                },
+                BuildDisk {
+                    kind: DiskKind::Ext4,
+                    read_only: false,
+                },
+            ],
+            ..config()
+        };
+        c.validate().unwrap();
+        assert_eq!(c.required_version(), 3);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(
+            json.contains(r#""mode":"build","disks":[{"kind":"erofs","readOnly":true},"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), c);
+        assert_eq!(c.build_disk_index(0), 6);
+        assert_eq!(c.build_disk(7).unwrap().kind, DiskKind::Ext4);
+        assert_eq!(c.build_disk(5), None);
+        assert_eq!(c.build_disk(8), None);
+        assert!(!serde_json::to_string(&config()).unwrap().contains("mode"));
+        c.process = config().process;
+        assert!(c.validate().is_err());
+        let mut r = config();
+        r.disks = vec![BuildDisk {
+            kind: DiskKind::Ext4,
+            read_only: true,
+        }];
+        assert!(r.validate().is_err());
+        let r = Config {
+            source_date_epoch: Some(0),
+            ..config()
+        };
+        assert!(r.validate().is_err(), "sourceDateEpoch is build mode's");
+    }
+
+    /// kiln-shim's pod fields and services are run mode's: a build VM has none.
+    #[test]
+    fn build_mode_refuses_services_volumes_and_a_pod_disk() {
+        let build = Config {
+            process: Process::default(),
+            mode: Mode::Build,
+            source_date_epoch: Some(1_700_000_000),
+            ..config()
+        };
+        build.validate().unwrap();
+        let json = serde_json::to_string(&build).unwrap();
+        assert!(
+            json.ends_with(r#","mode":"build","sourceDateEpoch":1700000000}"#),
+            "{json}"
+        );
+        let pod = Config {
+            pod_disk: Some(Scratch { size_bytes: 1 << 30 }),
+            ..build.clone()
+        };
+        assert!(pod.validate().is_err());
+        let services = Config {
+            services: vec![fpm()],
+            ready_timeout_ms: Some(1000),
+            ..build
+        };
+        assert!(services.validate().is_err());
     }
 
     fn fpm() -> Service {
