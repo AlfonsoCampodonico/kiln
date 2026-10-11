@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use kiln_proto::{Config, GuestMessage, HostMessage, Signal, port, read_message, write_message};
 use kiln_store::Store;
 use rustix::event::{PollFd, PollFlags, poll};
-use vmkit::{Disk, NetSpec, Vm, VmSpec, VsockSpec};
+use vmkit::{Disk, EgressGate, NetSpec, Vm, VmSpec, VsockSpec};
 
 use super::console::ConsoleRelay;
 use super::run::{CMDLINE, backend, exit_method, vmm_identity};
@@ -80,6 +80,9 @@ pub struct BuildVm {
     stacked: BTreeSet<usize>,
     /// Steps sealed so far: each sealed upper is one more lower.
     sealed: usize,
+    /// The VM's egress gate (with `network`): closed from boot, opened for the
+    /// steps that ask for the network (vmkit's `Vm::set_egress`).
+    gate: EgressGate,
     /// Why the VM is unusable, once it is.
     dead: Option<String>,
     wake: OwnedFd,
@@ -185,6 +188,11 @@ impl BuildVm {
         let config = spec.config(exit_method(vmm.as_ref()));
         config.validate()?;
         let mut vm = vmm.create(&vm_spec)?;
+        // Boot closed: no step has asked for the network yet.
+        let spec_network = spec.network;
+        if spec_network {
+            vm.set_egress(EgressGate::Closed)?;
+        }
         info.vmm = vmm_identity(&run_dir.path);
         run_dir.write_info(&info)?;
         scratch_dir.write_info(&ScratchInfo::from(&info))?;
@@ -220,6 +228,11 @@ impl BuildVm {
             proto: BuildProtocol::default(),
             stacked: BTreeSet::new(),
             sealed: 0,
+            gate: if spec_network {
+                EgressGate::Closed
+            } else {
+                EgressGate::Policy
+            },
             dead: None,
             wake,
             listener: Some(listener),
@@ -264,12 +277,28 @@ impl BuildVm {
         if let Some(why) = &self.dead {
             return Err(Error::refused(format!("the build VM has ended: {why}")));
         }
+        // The deadline counts from here: the egress change is part of the step's time.
+        let start = Instant::now();
         // A refusal here (the lowers cap included) sends nothing: the VM stays usable.
         let msg = self.spec.proto_step(&step, &self.stacked, self.sealed)?;
+        if self.spec.network {
+            let gate = if step.network {
+                EgressGate::Policy
+            } else {
+                EgressGate::Closed
+            };
+            if gate != self.gate {
+                // A failure leaves the gate as it was; the VM is not used again.
+                if let Err(e) = self.vm.set_egress(gate) {
+                    self.kill(format!("setting step {}'s egress: {e}", step.id));
+                    return Err(e.into());
+                }
+                self.gate = gate;
+            }
+        }
         self.proto.start_step(step.id).map_err(Error::refused)?;
         self.stacked.extend(step.lowers_added.iter().copied());
         self.send(HostMessage::RunStep(Box::new(msg)));
-        let start = Instant::now();
         let deadline = start + step.timeout;
         let kill_at = deadline + STEP_GRACE;
         let mut timed_out = false;

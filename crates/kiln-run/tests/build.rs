@@ -454,6 +454,31 @@ fn a_seal_outside_the_disk_is_passed_through(backend: Backend) {
     );
 }
 
+/// Egress is per step in a VM with a network: off, on, off again, through
+/// vmkit's `Vm::set_egress` (needs pasta, nft and the internet: KILN_TEST_NET=1).
+/// Closed means no DNS either, and no packet of a connection an earlier step
+/// opened.
+fn egress_follows_each_step(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    if std::env::var_os("KILN_TEST_NET").is_none_or(|v| v != "1") {
+        assert!(!support::require(), "KILN_REQUIRE_KVM_TESTS=1 but KILN_TEST_NET is not");
+        return;
+    }
+    let mut spec = spec(&c, backend, vec![fixtures().base[0].clone()], 1);
+    spec.network = true;
+    let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
+    let probe = "printf 'HEAD / HTTP/1.0\\r\\n\\r\\n' | nc -w 5 1.1.1.1 80 | head -c 8; echo";
+    let mut got = Vec::new();
+    for (id, network) in [(1, false), (2, true), (3, false)] {
+        let mut s = sh(id, probe);
+        s.network = network;
+        let (o, out, err) = run(&mut vm, s);
+        assert_eq!(o.exit, Exit::Code(0), "{out}\n{err}");
+        got.push(out);
+    }
+    assert_eq!(got, ["\n", "HTTP/1.1\n", "\n"], "egress off, on, off");
+}
+
 macro_rules! boot_tests {
     ($($name:ident),* $(,)?) => {
         mod firecracker {
@@ -472,4 +497,5 @@ boot_tests!(
     a_version_2_guest_is_refused_build_mode,
     a_step_past_its_timeout_is_killed,
     a_seal_outside_the_disk_is_passed_through,
+    egress_follows_each_step,
 );

@@ -3,10 +3,11 @@ resolver = "3"
 members = ["crates/*"]
 
 # The VMMs run on Linux only; elsewhere `kiln run` explains how to use a Lima VM. Pinned to
-# vmkit with TapAttach (vmkit PR #13, kiln's containerd shim), on vmkit main after guest
-# IPv6 egress (vmkit PR #12) and snapshot, restore and lazy restore (vmkit PR #11).
+# vmkit with the runtime egress gate (`Vm::set_egress`, build mode's per-step egress), on vmkit
+# main after TapAttach (vmkit PR #13, kiln's containerd shim), guest IPv6 egress (vmkit PR #12)
+# and snapshot, restore and lazy restore (vmkit PR #11).
 [workspace.dependencies]
-vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "b1baf3a0712209dbe7c7659186ad02b702524d3e" }
+vmkit = { git = "file:///Users/alfonso/Github/Personal/playground/vmkit-egress", rev = "7a680a40f6520ec63afca0a883ee916bf798eac1" }
 
 [workspace.package]
 edition = "2024"

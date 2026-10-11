@@ -3184,7 +3184,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vmkit"
 version = "0.1.0"
-source = "git+https://github.com/AlfonsoCampodonico/vmkit?rev=b1baf3a0712209dbe7c7659186ad02b702524d3e#b1baf3a0712209dbe7c7659186ad02b702524d3e"
+source = "git+file:///Users/alfonso/Github/Personal/playground/vmkit-egress?rev=7a680a40f6520ec63afca0a883ee916bf798eac1#7a680a40f6520ec63afca0a883ee916bf798eac1"
 dependencies = [
  "libc",
  "rustix 1.1.5",
