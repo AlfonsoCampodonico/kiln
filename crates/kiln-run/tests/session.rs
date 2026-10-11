@@ -440,7 +440,7 @@ fn a_guest_ending_its_vm_within_the_bound_is_not_killed() {
         boot(&mut c);
         drop((connect(&sock, port::STDOUT), connect(&sock, port::STDERR)));
         exited(&mut c, 5);
-        // Syncing the scratch disk.
+        // Ending the VM (the scratch disk was synced before `Exited`).
         std::thread::sleep(Duration::from_millis(500));
     });
     let (st, _) = streams(None);
@@ -451,9 +451,9 @@ fn a_guest_ending_its_vm_within_the_bound_is_not_killed() {
 }
 
 /// A stop request ends with the guest's final message: init's grace kill makes
-/// the app exit, the guest reports it and then syncs for longer than the host's
-/// margin. The host does not kill it at grace + margin or warn that it did not
-/// stop; only the end bound applies.
+/// the app exit, the guest syncs the scratch disk and reports it, and then does
+/// not end the VM. After `Exited` the stop's bound no longer applies (no "did not
+/// stop" warning); only the end bound does.
 #[test]
 fn a_stop_request_ends_at_the_guests_final_message() {
     let vm = fake(|sock, killed| {
@@ -476,7 +476,7 @@ fn a_stop_request_ends_at_the_guests_final_message() {
     });
     let (st, _) = streams(None);
     let mut o = opts();
-    (o.stop_timeout, o.stop_margin) = (1, Duration::from_secs(1));
+    o.stop_timeout = 1;
     o.end_timeout = Duration::from_secs(3);
     let mut s = Session::start(vm, config(), st, o).unwrap();
     assert!(s.wait_running());
@@ -568,7 +568,7 @@ fn the_kill_key_kills_the_vm_with_137() {
     );
 }
 
-/// A guest that ignores `Shutdown` is killed after the grace period and a margin.
+/// A guest that ignores `Shutdown` is killed after the grace period and the end bound.
 #[test]
 fn a_guest_that_ignores_shutdown_is_killed_after_the_grace() {
     let vm = fake(|sock, killed| {
@@ -580,13 +580,47 @@ fn a_guest_that_ignores_shutdown_is_killed_after_the_grace() {
     });
     let (st, _) = streams(None);
     let mut o = opts();
-    (o.stop_timeout, o.stop_margin) = (0, Duration::from_millis(300));
+    (o.stop_timeout, o.end_timeout) = (0, Duration::from_millis(300));
     let mut s = Session::start(vm, config(), st, o).unwrap();
     assert!(s.wait_running());
     s.handle().terminate();
     let out = s.finish_within(LIMIT);
     assert_eq!(out.exit_code, EXIT_INFRA, "{out:?}");
     assert!(out.warnings[0].contains("did not stop"), "{:?}", out.warnings);
+}
+
+/// The stop's kill comes at the grace plus the end bound, not a fixed margin: a
+/// guest whose sync before `Exited` takes more than 5 s past the grace (a large
+/// `--persist` disk) is not killed in the middle of it, and its exit code stands.
+#[test]
+fn the_stop_bound_leaves_the_guest_its_sync_before_exited() {
+    let vm = fake(|sock, _| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        boot(&mut c);
+        drop((connect(&sock, port::STDOUT), connect(&sock, port::STDERR)));
+        let shutdown = read_message::<_, HostMessage>(&mut c).unwrap();
+        assert!(matches!(shutdown, Some(HostMessage::Shutdown(_))), "{shutdown:?}");
+        // The grace (0 s) ends: init kills the app, then syncs for 6 s.
+        std::thread::sleep(Duration::from_secs(6));
+        send(
+            &mut c,
+            GuestMessage::Exited(Exited {
+                signaled: true,
+                code: 9,
+            }),
+        );
+    });
+    let (st, _) = streams(None);
+    let mut o = opts();
+    (o.stop_timeout, o.end_timeout) = (0, Duration::from_secs(10));
+    let mut s = Session::start(vm, config(), st, o).unwrap();
+    assert!(s.wait_running());
+    s.handle().terminate();
+    let out = s.finish_within(LIMIT);
+    assert_eq!((out.exit_code, out.violation.as_deref()), (137, None), "{out:?}");
+    assert_eq!(out.end.reason, EndReason::Exited, "{out:?}");
+    assert!(!out.killed && out.warnings.is_empty(), "{out:?}");
 }
 
 /// Before `Hello` nothing can stop gracefully: an interrupt kills.
