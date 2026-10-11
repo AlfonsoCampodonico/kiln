@@ -76,6 +76,8 @@ jobs:
         run: |
           cargo build --locked --manifest-path "${{ steps.vmkit.outputs.dir }}/Cargo.toml" --bin vmkit-sandbox --target-dir target
           "${{ steps.vmkit.outputs.dir }}/scripts/install-apparmor.sh" "$PWD/target/debug/vmkit-sandbox"
+      - name: Host addresses the egress case contrasts (link-local and private, on lo)
+        run: sudo ip addr add 169.254.77.1/32 dev lo && sudo ip addr add 10.250.0.1/32 dev lo
       - name: Boot suite on Firecracker and Cloud Hypervisor, kiln run end to end on Firecracker
         # About half the CPUs: every test boots its own VMs. KILN_TEST_KEEP keeps every run
         # directory, for the logs collected below when something fails.
