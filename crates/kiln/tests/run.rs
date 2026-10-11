@@ -896,7 +896,7 @@ fn persisted_disks_are_reused_and_guarded() {
     assert_eq!(std::fs::metadata(&disk).unwrap().len(), 128 << 20);
     let sidecar: serde_json::Value =
         serde_json::from_slice(&std::fs::read(f._dirs[0].path().join("data.img.kiln.json")).unwrap()).unwrap();
-    assert_eq!(sidecar["size"], 128 << 20);
+    assert_eq!(sidecar["layers"].as_array().map(Vec::len), Some(1), "{sidecar}");
     // No scratch directory was made for the run, and none is left.
     let scratch: Vec<_> = std::fs::read_dir(f.store.join("scratch")).unwrap().flatten().collect();
     assert!(scratch.is_empty(), "{scratch:?}");
@@ -988,6 +988,18 @@ fn persisted_disks_are_reused_and_guarded() {
     ]);
     assert_eq!(code(&o), 1, "a reset disk is empty: {}", text(&o.stderr));
     assert_eq!(std::fs::metadata(&disk).unwrap().len(), 64 << 20);
+    // A reset whose guest never runs its command leaves no sidecar, so the disk's
+    // next run is refused rather than trusting one for layers the disk never held.
+    let o = f.output(&["--persist", d, "--persist-reset", "other", "--", "/missing"]);
+    assert_eq!(code(&o), 127, "{}", text(&o.stderr));
+    assert!(!f._dirs[0].path().join("data.img.kiln.json").exists());
+    let o = f.output(&["--persist", d, "other", "--", "true"]);
+    assert_eq!(code(&o), 125);
+    assert!(
+        text(&o.stderr).contains("no readable kiln sidecar"),
+        "{}",
+        text(&o.stderr)
+    );
 }
 
 /// `KILN_IMPORT_FROM` (spec §10, the Lima template's dev loop): a run in an empty

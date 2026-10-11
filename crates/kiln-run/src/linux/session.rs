@@ -228,6 +228,8 @@ pub struct Outcome {
     /// From starting the VM to the VMM's exit, and to the end of its output.
     pub ended_after: Option<Duration>,
     pub drained_after: Duration,
+    /// kiln gave up on a VMM it could not see end: it may still be running.
+    pub vmm_lost: bool,
 }
 
 /// One running guest and the host side of its protocol.
@@ -765,6 +767,7 @@ impl Session {
             running_after: self.running_at.map(|t| t - self.started),
             ended_after: self.ended_at.map(|t| t - self.started),
             drained_after: self.started.elapsed(),
+            vmm_lost: self.gave_up,
         }
     }
 }
