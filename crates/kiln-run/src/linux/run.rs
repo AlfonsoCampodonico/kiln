@@ -191,6 +191,28 @@ fn egress_warnings(n: &NetSpec, outbound: Option<std::net::Ipv4Addr>) -> Vec<Str
     out
 }
 
+/// The end of a run's state. The scratch directory goes first: while run.json
+/// lasts, it records it. When kiln gave up on a VMM that may still run (and use
+/// the disks), both directories are left for a later run, whose orphan reaper
+/// finds the VMM by its run.json and kills it before anything (a `--persist` disk
+/// above all) is reused; the persisted disk's lock is held while this process
+/// lives.
+fn release(scratch_dir: Option<ScratchDir>, run_dir: RunDir, persist: Option<persist::Persisted>, vmm_lost: bool) {
+    if vmm_lost {
+        if let Some(d) = scratch_dir {
+            d.leave();
+        }
+        run_dir.leave();
+        if let Some(p) = persist {
+            p.hold();
+        }
+    } else {
+        drop(scratch_dir);
+        drop(run_dir);
+        drop(persist);
+    }
+}
+
 /// A run in progress.
 pub struct Run {
     session: Session,
@@ -351,7 +373,10 @@ impl Run {
         let base = rundir::base_dir()?;
         let (boot_id, hostname) = (rundir::boot_id(), rundir::hostname());
         for id in rundir::kill_orphans(&base, &boot_id, &hostname, rundir::alive, rundir::kill_identity) {
-            notice(&format!("note: killed the VMM of run {id}, whose kiln is gone"));
+            notice(&format!(
+                "note: killed the VMM of run {}, whose kiln is gone",
+                kiln_proto::sanitize::clean_line(&id)
+            ));
         }
         let cleanup = rundir::clean_stale(&base, &boot_id, &hostname, rundir::alive);
         if let Some(note) = cleanup.notice(&base) {
@@ -551,15 +576,7 @@ impl Run {
         let console_tail = if failed { tail(&log, TAIL_LINES) } else { Vec::new() };
         let kept = keep.then(|| (run_dir.path.clone(), scratch_dir.as_ref().map(|d| d.path.clone())));
         let vmm_logs = vmm_logs(vmm, &run_dir.path);
-        // The scratch directory first: while run.json lasts, it records it. The
-        // persisted disk's lock goes once the VMM has ended, and stays for as long as
-        // kiln runs when kiln gave up on a VMM that may still be using the disk.
-        drop(scratch_dir);
-        drop(run_dir);
-        match persist {
-            Some(p) if outcome.vmm_lost => p.hold(),
-            other => drop(other),
-        }
+        release(scratch_dir, run_dir, persist, outcome.vmm_lost);
         Report {
             outcome,
             console_tail,
@@ -642,6 +659,57 @@ mod tests {
         // one that includes it still reaches its other addresses.
         assert!(spec.check_allow(&[Ipv4Addr::new(192, 0, 2, 7)]).is_err());
         assert!(spec.check_allow(&[Ipv4Addr::new(10, 1, 9, 9)]).is_ok());
+    }
+
+    /// A VMM kiln gave up on keeps its run directory (and run.json, which names
+    /// it) for the next run's reaper; otherwise the directories go.
+    #[test]
+    fn a_lost_vmm_leaves_its_run_directory_for_the_reaper() {
+        let base = tempfile::tempdir().unwrap();
+        let me = rundir::identity(std::process::id()).unwrap();
+        let gone = Identity {
+            start_time: me.start_time + 1,
+            ..me
+        };
+        let mut child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let vmm = rundir::identity(child.id()).unwrap();
+        let (boot, host) = (rundir::boot_id(), rundir::hostname());
+        let make = || {
+            let d = RunDir::create(base.path()).unwrap();
+            d.write_info(&RunInfo {
+                version: RUN_INFO_VERSION,
+                id: d.id.clone(),
+                boot_id: boot.clone(),
+                hostname: host.clone(),
+                kiln: gone,
+                vmm: Some(vmm),
+                vmm_kind: "firecracker".into(),
+                image: "img".into(),
+                custom_kernel: None,
+                custom_init: None,
+                keep: false,
+                scratch_dir: None,
+            })
+            .unwrap();
+            d
+        };
+        let ended = make();
+        let path = ended.path.clone();
+        release(None, ended, None, false);
+        assert!(!path.exists());
+        let lost = make();
+        let (id, path) = (lost.id.clone(), lost.path.clone());
+        release(None, lost, None, true);
+        assert!(path.join("run.json").exists());
+        // The next run's reaper finds the VMM and kills it; then the sweep collects
+        // the directory.
+        assert_eq!(
+            rundir::kill_orphans(base.path(), &boot, &host, rundir::alive, rundir::kill_identity),
+            [id]
+        );
+        child.wait().unwrap();
+        rundir::clean_stale(base.path(), &boot, &host, rundir::alive);
+        assert!(!path.exists());
     }
 
     #[test]
