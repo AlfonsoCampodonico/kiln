@@ -76,8 +76,10 @@ fn boot() -> Result<()> {
     send(&GuestMessage::Running)?;
     enter(7)?;
     let exited = supervise::run(&config, started, &rx)?;
-    send(&GuestMessage::Exited(exited))?;
+    // The scratch disk is synced and read-only before `Exited`: the host may end
+    // the VM as soon as it has the message, and `Exited` means the disk is safe.
     storage::finish(&scratch);
+    send(&GuestMessage::Exited(exited))?;
     Ok(())
 }
 
