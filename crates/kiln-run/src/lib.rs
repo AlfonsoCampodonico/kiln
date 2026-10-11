@@ -6,6 +6,7 @@
 //! instead ([`LIMA_INSTRUCTIONS`]).
 #![forbid(unsafe_code)]
 
+pub mod build;
 pub mod config;
 pub mod console;
 mod error;
