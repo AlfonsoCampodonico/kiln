@@ -649,12 +649,18 @@ fn the_boot_timeout_ends_a_stuck_guest() {
     assert!(text(&o.stderr).contains("boot timeout"), "{}", text(&o.stderr));
 }
 
+/// The fixture's image has the pinned kernel layer (kiln convert fetched it) and
+/// no init layer: it needs --init, and --kernel needs its flag.
 #[test]
-fn a_provisional_image_needs_the_custom_kernel_flags() {
+fn an_image_without_a_pinned_init_needs_the_custom_flags() {
     let Some(f) = fixture() else { return };
     let o = f.kiln().args(["run", "busybox"]).finish();
     assert_eq!(code(&o), 125);
-    assert!(text(&o.stderr).contains("has no kernel layer"), "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("no pinned kiln-init") && text(&o.stderr).contains("--allow-custom-init"),
+        "{}",
+        text(&o.stderr)
+    );
     let o = f
         .kiln()
         .args(["run", "--kernel"])
@@ -698,6 +704,10 @@ fn with_boot_layers(store: &kiln_store::Store, from: &str, tag: &str, kernel: &P
     manifest.config = Descriptor::new(KILN_CONFIG, store.put_bytes(&config).unwrap(), config.len() as u64);
     let kernel = std::fs::read(kernel).unwrap();
     let init = kiln_image::init_layer(&std::fs::read(init).unwrap(), &store.tmp_dir()).unwrap();
+    // In place of the boot layers `kiln convert` added (the pinned kernel).
+    manifest
+        .layers
+        .retain(|l| l.media_type == kiln_image::types::KILN_LAYER);
     manifest.layers.splice(
         0..0,
         [
@@ -733,7 +743,7 @@ fn image_boot_layers_are_verified_and_init_replaced() {
     let o = run(&["--allow-custom-kernel", "pinned"]);
     assert_eq!(code(&o), 125);
     assert!(
-        text(&o.stderr).contains("does not pin the kernel base 6.18.54"),
+        text(&o.stderr).contains("is not the pinned kernel base 6.18.54"),
         "{}",
         text(&o.stderr)
     );
@@ -796,7 +806,7 @@ fn converted_boot_layers_are_replaced_or_refused_at_run() {
         .finish();
     assert_eq!(code(&o), 125);
     assert!(
-        text(&o.stderr).contains("does not pin the kernel base 6.18.54"),
+        text(&o.stderr).contains("is not the pinned kernel base 6.18.54"),
         "{}",
         text(&o.stderr)
     );

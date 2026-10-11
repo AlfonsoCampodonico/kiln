@@ -1,5 +1,5 @@
 //! Choosing what boots (spec §8.1, T4, §11.5 "kernel and init swap"), without a VM.
-//! The compiled table pins nothing yet, so each test passes its own: none, or pins
+//! The tests never depend on the compiled table: each passes its own, none or pins
 //! for blobs it puts in the store or serves from the in-process registry.
 
 use std::cell::Cell;
@@ -29,8 +29,8 @@ struct Setup {
     files: PathBuf,
 }
 
-/// A store with `app`, a provisional arm64 image (no boot layers, as convert makes
-/// them while kiln pins no kernel), and a kernel and an init binary in `files`.
+/// A store with `app`, a provisional arm64 image (no boot layers: the library's
+/// default), and a kernel and an init binary in `files`.
 fn setup() -> Setup {
     let (src, home, files) = (
         tempfile::tempdir().unwrap(),

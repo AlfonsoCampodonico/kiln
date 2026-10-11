@@ -239,8 +239,8 @@ mod convert {
         assert!(m.config.kernel.is_some() && m.config.init.is_none());
     }
 
-    /// Provisional: no boot layers, as before M3. It is the library's default, and
-    /// what `Pinned` gives while the compiled table pins nothing.
+    /// Provisional: no boot layers, as before M3. It is the library's default;
+    /// `Pinned` gives what the compiled table pins (the kernels, no kiln-init yet).
     #[test]
     fn provisional_images_have_no_boot_layers() {
         let src = tempfile::tempdir().unwrap();
@@ -255,8 +255,14 @@ mod convert {
             assert!(m.config.kernel.is_none() && m.config.init.is_none());
         }
         assert_eq!(BootLayers::default(), BootLayers::Provisional);
-        if kiln_image::artifacts::PINS.is_empty() {
-            assert_eq!(BootLayers::Pinned.for_arch("arm64"), None);
+        for arch in ["arm64", "amd64"] {
+            let pinned = BootLayers::Pinned.for_arch(arch).unwrap();
+            assert_eq!(
+                pinned.kernel.as_ref(),
+                kiln_image::artifacts::kernel_pin("base", "6.18.54", arch)
+            );
+            assert_eq!(pinned.init.as_ref(), kiln_image::artifacts::init_pin(arch));
         }
+        assert_eq!(BootLayers::Pinned.for_arch("riscv64"), None);
     }
 }

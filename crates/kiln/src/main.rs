@@ -284,7 +284,7 @@ fn human_size(n: u64) -> String {
 }
 
 /// What `kiln run` will need for an image `convert` made without some boot layer
-/// (the table pins no kernel or kiln-init for its architecture yet).
+/// (the table pins no kernel or no kiln-init for its architecture yet).
 fn boot_note(c: &kiln_image::Converted) -> Option<String> {
     let b = c.boot.clone().unwrap_or_default();
     let missing: Vec<(&str, &str)> = [
