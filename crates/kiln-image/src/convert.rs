@@ -489,15 +489,19 @@ pub fn convert_image(
         .as_ref()
         .map_or((None, None), |b| (b.kernel.as_ref(), b.init.as_ref()));
     let mut boot_layers = Vec::new();
-    let fetcher = RegistryFetcher::from_env();
-    if let Some(pin) = kernel_pin {
-        let kernel = artifacts::ensure(store, pin, &fetcher)?;
-        boot_layers.push(Descriptor::new(KILN_KERNEL, kernel.clone(), store.blob_size(&kernel)?));
-    }
-    if let Some(pin) = init_pin {
-        let init_bin = artifacts::ensure(store, pin, &fetcher)?;
-        let init = artifacts::init_layer_blob(store, &init_bin)?;
-        boot_layers.push(Descriptor::new(KILN_INIT, init.clone(), store.blob_size(&init)?));
+    // The fetcher (the Docker config's location) only when there is something to
+    // fetch: a provisional convert never builds one.
+    if boot.is_some() {
+        let fetcher = RegistryFetcher::from_env();
+        if let Some(pin) = kernel_pin {
+            let kernel = artifacts::ensure(store, pin, &fetcher)?;
+            boot_layers.push(Descriptor::new(KILN_KERNEL, kernel.clone(), store.blob_size(&kernel)?));
+        }
+        if let Some(pin) = init_pin {
+            let init_bin = artifacts::ensure(store, pin, &fetcher)?;
+            let init = artifacts::init_layer_blob(store, &init_bin)?;
+            boot_layers.push(Descriptor::new(KILN_INIT, init.clone(), store.blob_size(&init)?));
+        }
     }
     let config = KilnConfig {
         schema_version: SCHEMA_VERSION,

@@ -178,6 +178,12 @@ pub fn ensure(store: &Store, pin: &Pin, fetcher: &dyn Fetcher) -> Result<Digest>
 }
 
 /// The `cache/init-layers` key of the init layer around the `kiln-init` binary `init`.
+///
+/// The key covers everything the layer is made of only while [`init_layer`] wraps
+/// the binary in a fixed tree (its paths, modes and owners) written by the erofs
+/// writer of [`FORMAT_VERSION`]: a change to that tree must change the key too
+/// (bump `FORMAT_VERSION`, or add a version of the wrapper here), or stores keep
+/// serving init layers built the old way.
 fn init_layer_key(init: &Digest) -> String {
     format!("{init}@{FORMAT_VERSION}")
 }
