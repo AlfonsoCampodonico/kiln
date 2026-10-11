@@ -434,7 +434,7 @@ fn port_path(base: &Path, p: u32) -> PathBuf {
     PathBuf::from(format!("{}_{p}", base.display()))
 }
 
-fn bind(base: &Path, p: u32) -> Result<UnixListener> {
+pub(super) fn bind(base: &Path, p: u32) -> Result<UnixListener> {
     use std::os::unix::fs::FileTypeExt;
     let path = port_path(base, p);
     match std::fs::symlink_metadata(&path) {

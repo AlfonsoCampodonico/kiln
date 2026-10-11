@@ -21,6 +21,9 @@ use kiln_proto::{
 use crate::error::{Error, Result};
 use crate::options::VmmKind;
 
+#[cfg(target_os = "linux")]
+pub use crate::linux::{BuildVm, END_TIMEOUT, max_devices};
+
 /// The devices every build VM has: init layer, scratch, output disk, vsock. A VM
 /// with `network` has a NIC too.
 pub const FIXED_DEVICES: usize = 4;
