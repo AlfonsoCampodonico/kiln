@@ -11,16 +11,16 @@
 
 `kiln-shim` is a containerd shim v2 (`io.containerd.kiln.v2`) behind a Kubernetes RuntimeClass `kiln`. It runs each pod in a microVM, using `vmkit` and `kiln-init`.
 
-It is the deploy path for Laravel Cloud. A customer pod opts in with `runtimeClassName: kiln`, and everything else keeps working unchanged:
-- the operators, the `env-<uuid>` namespaces and Services/Ingress;
+It is a deploy path for a managed Kubernetes platform. A tenant pod opts in with `runtimeClassName: kiln`, and everything else keeps working unchanged:
+- the platform's operators, its per-environment namespaces and Services/Ingress;
 - kubelet probes;
-- the Fluent Bit `logging-collector` pipeline;
+- a node-level Fluent Bit log collector;
 - `kubectl logs` and `kubectl exec`.
 
 ### Success criteria
 
-1. A Laravel app built by potter runs in an `env-` namespace with `runtimeClassName: kiln`. It serves traffic through the existing Ingress, passes HTTP and exec probes, and its logs arrive in the customer log pipeline with no Fluent Bit changes.
-2. `kubectl exec -it` (TTY) and non-TTY exec work. That covers Laravel Cloud commands and `artisan` one-offs.
+1. A PHP web app built by potter runs in a tenant namespace with `runtimeClassName: kiln`. It serves traffic through the existing Ingress, passes HTTP and exec probes, and its logs arrive in the log pipeline with no Fluent Bit changes.
+2. `kubectl exec -it` (TTY) and non-TTY exec work. That covers one-off commands run through exec.
 3. When the guest runs out of memory, the container reports `OOMKilled` with exit code 137, as a runc container does.
 4. The same pod spec runs with runc or with `kiln` by changing only `runtimeClassName`. Ordinary OCI images also run, not only potter-built ones.
 5. Pod start is within **1.5 s** of runc on a warm node (image present). VMM memory overhead is ≤ **40 MiB** per pod and is declared in `RuntimeClass.overhead`.
@@ -43,11 +43,11 @@ Every kiln node, and every potter build node using `VmExecutor`, needs `/dev/kvm
 
 | Option | Instances | Notes |
 |---|---|---|
-| **A. Nested virtualization** (recommended to evaluate first) | Virtual C8i/M8i/R8i since February 2026, plus C7i/M7i/R7i, the C8id/M8id/R8id and flex variants, I7i and X8i since June 2026. No extra cost | Fits existing EKS node groups: a new node group with nested virtualization enabled, plus a node label. **Intel only.** The overhead of nested Firecracker and Cloud Hypervisor must be benchmarked (boot time, vsock throughput, EPT miss costs) before committing. |
+| **A. Nested virtualization** (recommended to evaluate first) | Virtual C8i/M8i/R8i since February 2026, plus C7i/M7i/R7i, the C8id/M8id/R8id and flex variants, I7i and X8i since June 2026. No extra cost | Fits existing Kubernetes node groups: a new node group with nested virtualization enabled, plus a node label. **Intel only.** The overhead of nested Firecracker and Cloud Hypervisor must be benchmarked (boot time, vsock throughput, EPT miss costs) before committing. |
 | **B. Bare metal** | `*.metal` (Intel, AMD, Graviton) | Best performance and the only aarch64 option. A large blast radius per node and coarse capacity steps. |
 | **C. Mixed** | Nested for x86_64, metal Graviton for aarch64 | Matches kiln's two-arch commitment. |
 
-**Recommendation:** start with A on C8i in a wave-1 canary region (ca-central-1 or ap-northeast-1), and run kiln's bench and E2E matrix there. Move to C only if aarch64 demand justifies it.
+**Recommendation:** start with A on C8i in a low-traffic canary region, and run kiln's bench and E2E matrix there. Move to C only if aarch64 demand justifies it.
 
 **Scheduling:**
 - Kiln nodes carry the label `kiln.dev/kvm=true` and the taint `kiln.dev/kvm:NoSchedule`.
@@ -94,7 +94,7 @@ kubelet ─CRI─► containerd 2.3+ ─shim v2 ttrpc─► kiln-shim (one per p
 
 - The CNI creates the pod netns and its veth as usual. The shim creates `tap0` inside the pod netns and links veth and tap with **tc mirred redirect** in both directions (Kata's `tcfilter` model).
 - The guest gets the pod's IP, routes and DNS through kiln-proto `Config.network`. To Kubernetes the VM *is* the pod IP, so Services, Ingress, NetworkPolicy and probes work unchanged.
-- **Egress policy under the shim:** kiln's standalone default-deny (T5) does not apply, because customer apps must reach the `db-` and `cache-` clusters on private addresses.
+- **Egress policy under the shim:** kiln's standalone default-deny (T5) does not apply, because apps must reach managed databases and caches on private addresses.
   - Routing policy belongs to the CNI and NetworkPolicy.
   - The shim **always** enforces a fixed deny list, in nftables inside the pod netns, applied before the VMM starts and unreachable from the guest: link-local (including instance metadata `169.254.169.254` and `fd00:ec2::254`) and the node's own addresses.
 - `vmkit` inbound port publishing is not used under the shim. It remains for standalone `kiln run`.
@@ -103,7 +103,7 @@ kubelet ─CRI─► containerd 2.3+ ─shim v2 ttrpc─► kiln-shim (one per p
 
 - containerd hands the shim the container's stdio FIFOs, and the CRI log file is written by containerd from those FIFOs, as for runc.
 - The shim relays the stdout/stderr messages from kiln-proto into them unmodified.
-- The Fluent Bit `logging-collector` tails the CRI log path as today. No pipeline change.
+- A node-level Fluent Bit log collector tails the CRI log path as today. No pipeline change.
 
 ---
 
@@ -132,7 +132,7 @@ These are kiln PRs, each with its own plan. The protocol stays a single protocol
   - `Stats{mem_total, mem_available, mem_rss_main, cpu_usage_ns, pressure{cpu,mem,io}}`, read by kiln-init from `/proc/meminfo`, `/proc/stat` and PSI.
   - `OomKill{pid, proc, comm}`, sent when the guest kernel OOM-kills a process. kiln-init watches `/proc/vmstat` `oom_kill` and the kernel log for the victim.
 - **Shim behaviour:**
-  - Task `Stats` returns the guest stats alongside the VMM cgroup's own usage, so kubelet, cAdvisor and Mimir see both.
+  - Task `Stats` returns the guest stats alongside the VMM cgroup's own usage, so kubelet, cAdvisor and the metrics pipeline see both.
   - If the main process dies after an `OomKill` that named it, the shim reports exit 137 with reason `OOMKilled`.
 - **Trust:** stats and OOM reports are guest-asserted. They are used for reporting only, never for quota or security. The host-side memory limit is the VM's configured memory; the guest cannot exceed it.
 
@@ -201,7 +201,7 @@ If the VMM process dies unexpectedly, containerd sees the task exit with code 25
 
 - **The containerd shim conformance suite** (`critest` and the containerd integration tests) runs against `kiln` on KVM CI. Known unsupported features are skipped explicitly: multi-container pods, debug containers, hostPath.
 - **E2E on kind with KVM nodes:**
-  - deploy the potter-built Laravel fixture behind an Ingress and check HTTP probes;
+  - deploy the potter-built PHP fixture behind an Ingress and check HTTP probes;
   - `kubectl exec` with and without a TTY;
   - a memory hog gets `OOMKilled`;
   - Secret and ConfigMap updates propagate;
@@ -225,7 +225,7 @@ If the VMM process dies unexpectedly, containerd sees the task exit with code 25
 | S2 | Media type alignment with containerd's erofs snapshotter (kiln PR + test) | kiln M1 |
 | S3 | `kiln-shim`: lifecycle, networking, logs, exec, stats, projected volumes | S1, S2, kiln M3b |
 | S4 | Resize, verity, init containers | S3 |
-| S5 | Laravel Cloud canary: wave-1 region, opt-in RuntimeClass on selected `env-` namespaces | S0, S3 |
+| S5 | Platform canary: one canary region, opt-in RuntimeClass on selected tenant namespaces | S0, S3 |
 
 ---
 
