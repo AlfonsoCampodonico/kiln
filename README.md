@@ -1,10 +1,29 @@
 # kiln
 
-kiln turns OCI container images into microVM images: one deterministic erofs filesystem per layer, stacked with overlayfs inside the guest. It runs natively on macOS and Linux, without root.
+kiln turns OCI container images into microVM images and runs them. Each OCI layer becomes one deterministic, read-only erofs filesystem, written by kiln's own Rust erofs writer straight from the layer's tar stream; inside the guest, kiln's own init (`kiln-init`) stacks those layers with overlayfs over a writable ext4 scratch disk and runs the image's command. Converting, pulling, pushing and inspecting images runs natively on Linux and macOS without root. `kiln run` boots images under Firecracker or Cloud Hypervisor through [vmkit](https://github.com/AlfonsoCampodonico/vmkit), on Linux with KVM (on macOS, in a Lima VM), also without root.
 
-Status: milestone M3b. `kiln convert` works on registry images and local inputs, `kiln pull`/`kiln push` move kiln images through registries, and `kiln run` boots an image under Firecracker or Cloud Hypervisor on Linux with KVM (on macOS, in a Lima VM), with a persistent disk and networking. kiln pins vmkit's `base` 6.18.54 kernels; no kiln-init release is pinned yet, so `kiln run` needs `--init` (below).
+The point is per-layer caching and dedupe for microVM root filesystems, a stable documented image format ([docs/format.md](docs/format.md)), and a run path that treats both images and guests as untrusted.
 
-## Quickstart
+## Status
+
+kiln is at milestone M3b. There are no releases yet; build from source.
+
+| Area | Status |
+|---|---|
+| `kiln convert` from registries, OCI layouts and `docker save` archives | Works on Linux and macOS |
+| erofs writer and reader, per-layer cache, bottom-layer squash | Works; erofs profile version 1, golden digests are immutable |
+| `pull`, `push`, `import`, `inspect`, `ls`, `gc` | Works |
+| `kiln run` on Firecracker | Works on Linux with KVM; the reference VMM |
+| `kiln run` on Cloud Hypervisor | Works, with known limits: online disk growth beyond about 8 GiB hangs, and guests sometimes stall under nested virtualization |
+| `kiln run` on macOS | Through the Lima VM in `lima/kiln.yaml` (Apple M3 or later, macOS 15 or later) |
+| Networking (`--net`, `--egress`, `-p`) and persistent disks (`--persist`) | Works |
+| Pinned kernel | vmkit's `base` 6.18.54 for arm64 and amd64, added by `kiln convert` |
+| Pinned kiln-init | Not yet: no kiln-init release exists, so `kiln run` needs `--init PATH --allow-custom-init` |
+| `kiln build`, services in kiln-init, a containerd shim | Designed in the [spec](docs/superpowers/specs/2026-09-30-kiln-design.md), not implemented |
+
+## Quick start
+
+Convert and inspect images (Linux or macOS):
 
 ```bash
 cargo install --path crates/kiln
@@ -19,110 +38,209 @@ docker save --platform linux/arm64 php:8.4-cli -o php.tar
 kiln convert --platform linux/arm64 --tag php:8.4-cli php.tar
 
 kiln ls
-kiln inspect php:8.4-cli
 kiln gc
 ```
 
-`convert` options:
+Run one (Linux with KVM, Firecracker and vmkit's `vmkit-sandbox` helper installed; see [docs/running.md](docs/running.md)). Until a kiln-init is released, build one ([docs/testing.md](docs/testing.md#building-kiln-init)) and name it:
+
+```bash
+# On an aarch64 host, use target/aarch64-unknown-linux-musl instead.
+K="--init target/x86_64-unknown-linux-musl/release/kiln-init --allow-custom-init"
+kiln convert alpine:3
+kiln run $K alpine:3 -- sh -c 'echo hello'
+kiln run $K -t -i alpine:3                      # Ctrl-] q stops the guest, Ctrl-] k kills it
+```
+
+## Concepts
+
+- **kiln image.** An OCI 1.1 artifact (`artifactType` `application/vnd.kiln.image.v1`): a manifest per platform, under an index when there are several, whose layers are a kernel, an init layer and the app layers, plus a small config with the process (entrypoint, cmd, env, user, working directory, stop signal). Specified in [docs/format.md](docs/format.md).
+- **One erofs per OCI layer.** Each OCI layer tar is converted to an erofs image without being extracted, so conversion works on macOS filesystems that cannot hold Linux ownership or device nodes. Output depends only on the tar, inherited attributes and the format version, so the same input gives the same bytes on any host.
+- **Implicit parents.** A directory a layer creates only because a descendant needs it inherits its attributes from the layers below it, as containerd does. Such a layer is marked `dev.kiln.inherits` and is cached against the attributes it inherited.
+- **Squash.** Every app layer becomes a virtio-blk disk at run time, so `--max-layers` (default 10) bounds them: with `n` app layers and `n > N`, the bottom `n - N + 1` are squashed into one.
+- **Boot layers and pins.** kiln compiles in the digests of the kernels and kiln-init binaries it trusts. `kiln convert` adds the pinned ones; `kiln run` boots an image's kernel only if it matches the pin and always supplies the init layer itself. An image without boot layers is *provisional*.
+- **Scratch disk.** A writable ext4 disk per run, created from a reproducible template embedded in kiln and grown by the guest at boot. It holds the overlay's upper directory; `--persist PATH` keeps it across runs.
+- **Store.** `$KILN_HOME` (default `~/.local/share/kiln`): content-addressed blobs, conversion caches and a `refs.json` of names. Everything is verified by digest before it is stored.
+- **kiln-init.** A static musl PID 1 that mounts the layers, sets up the guest much as Docker sets up a container, runs the command and talks to the host over a framed, schema-validated vsock protocol.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph host["Host side"]
+        CLI["kiln<br/>(CLI)"]
+        RUN["kiln-run<br/>run, session, disks"]
+        IMG["kiln-image<br/>convert, pull, push, import"]
+        OCI["kiln-oci<br/>OCI inputs"]
+        REG["kiln-registry<br/>registry client"]
+        EROFS["kiln-erofs<br/>erofs writer and reader"]
+        STORE["kiln-store<br/>blobs, caches, refs, gc"]
+    end
+    subgraph guest["Guest side"]
+        INIT["kiln-init<br/>PID 1"]
+    end
+    PROTO["kiln-proto<br/>control protocol"]
+    VMKIT["vmkit<br/>(external, Linux only)"]
+    CLI --> IMG
+    CLI --> RUN
+    RUN --> IMG
+    RUN --> PROTO
+    RUN --> VMKIT
+    IMG --> EROFS
+    IMG --> OCI
+    OCI --> REG
+    REG --> STORE
+    IMG --> STORE
+    INIT --> PROTO
+```
+
+The workspace's crates and their main dependencies (some direct edges, such as the CLI's to the lower crates, are left out). `kiln-testguest` is a hostile guest used only by the boot tests.
+
+| Crate | Role |
+|---|---|
+| `kiln` | The CLI. Every string from an image is sanitised before it is printed. |
+| `kiln-image` | The OCI to kiln conversion pipeline, the image format, inspect, import, registry convert, pull and push, the init layer and the scratch disk. |
+| `kiln-erofs` | Deterministic erofs writer and reader for kiln's erofs profile; parent inheritance and squash over merged views. |
+| `kiln-oci` | OCI types and verified inputs: registries, OCI layouts and `docker save` archives. File names, `index.json` and `manifest.json` are never trusted. |
+| `kiln-registry` | A minimal OCI distribution client: Docker credentials, verified blob fetches, redirect and address rules ([docs/registries.md](docs/registries.md)). |
+| `kiln-store` | The local store: content-addressed blobs, conversion caches, refs, a store-wide lock and garbage collection. |
+| `kiln-run` | The host side of `kiln run`: preparing what boots, run directories, scratch and persisted disks, the protocol session, stdio, the terminal and signals. Boots VMs through vmkit on Linux. |
+| `kiln-proto` | The control protocol between kiln-init and the host: framing, messages, validation. |
+| `kiln-init` | The guest's PID 1. |
+| `kiln-testguest` | Hostile guest programs for the boot tests. |
+
+### Image pipeline
+
+```mermaid
+flowchart TD
+    A["Registry reference"] --> R
+    B["OCI layout directory"] --> R
+    C["docker save archive"] --> R
+    R["Resolve the platform manifests<br/>and configs"] --> Q{"Layer cached for its<br/>digest and diff_id?"}
+    Q -->|yes| H["Reuse the erofs blob"]
+    Q -->|no| F["Fetch or read the blob,<br/>verify digest and diff_id"]
+    F --> W["Decompress gzip, zstd or plain tar,<br/>stream it into erofs"]
+    W --> S
+    H --> S{"More app layers<br/>than --max-layers?"}
+    S -->|yes| SQ["Squash the bottom layers into one"]
+    S -->|no| P
+    SQ --> P["Add the pinned kernel and kiln-init layers<br/>(fetched once by digest)"]
+    P --> M["Write config, manifest and index;<br/>tag the image in refs.json"]
+```
+
+What `kiln convert` does, per platform. A warm convert of an unchanged image makes one manifest HEAD request and reuses every layer; changing a base layer reconverts only the layers that inherit attributes from it.
+
+### Run flow
+
+```mermaid
+flowchart TD
+    A["kiln run IMAGE"] --> B["Resolve the image in the store"]
+    B --> C["Prepare what boots: kernel checked against the pin,<br/>init layer from the pin or --init, app layers"]
+    C --> D["Check the VMM's device budget,<br/>clean up runs whose kiln was killed"]
+    D --> E["Create the run directory and the scratch disk<br/>(from the template, or --persist)"]
+    E --> F["Create the VM through vmkit:<br/>sandboxed VMM, pasta with --net"]
+    F --> G
+    subgraph guest["Guest: kiln-init as PID 1"]
+        G["Send Hello, receive Config"] --> H["Mount the erofs layers and the scratch disk,<br/>overlayfs root, pivot_root"]
+        H --> I["Hostname, /etc/hosts, resolv.conf, network"]
+        I --> J["Start the process, relay stdio over vsock"]
+        J --> K["Supervise: signals, shutdown, reaping"]
+        K --> L["Sync the scratch disk, send Exited, end the VM"]
+    end
+    L --> M["kiln exits with the command's code"]
+```
+
+One `kiln run`, from the host's setup to the guest's seven boot stages. The protocol messages are in [docs/running.md](docs/running.md#what-a-run-does) and specified in [docs/format.md](docs/format.md#control-protocol-version-1).
+
+## Command reference
+
+```mermaid
+flowchart LR
+    REG["Registry"] -->|"convert REF"| ST
+    LOC["OCI layout or<br/>docker save archive"] -->|"convert PATH"| ST
+    ST[("kiln store<br/>$KILN_HOME")] -->|push| REG
+    REG -->|pull| ST
+    OTHER[("Another store")] -->|import| ST
+    ST -->|"run (Linux with KVM)"| VM["microVM"]
+    ST --- LOCAL["inspect, ls, gc"]
+```
+
+How the commands move images between registries, local sources, stores and microVMs. `convert` reads OCI images; `pull` and `push` move kiln images.
+
+| Command | What it does |
+|---|---|
+| `kiln convert PATH\|REF` | Converts an OCI image into a kiln image in the store. |
+| `kiln pull REF [--tag NAME]` | Downloads a kiln image (an index of at most 8 platforms), verifying every blob. |
+| `kiln push NAME REF` | Uploads a kiln image; blobs the registry already has are skipped. |
+| `kiln import --from-store DIR NAME [--as NAME]` | Copies an image from another, possibly read-only, store, verifying every blob. |
+| `kiln inspect NAME [--json]` | Shows an image's platforms, process, provenance, boot layers and layers. |
+| `kiln ls [--json]` | Lists tagged images. |
+| `kiln gc` | Removes blobs and cache entries no tag reaches. Pinned kernels and kiln-init stay, so cached runs keep working offline. |
+| `kiln run [OPTIONS] IMAGE [CMD...]` | Boots an image in a microVM and runs its command. See [docs/running.md](docs/running.md). |
+| `kiln bench LAYOUT` | Measures cold, warm and changed-top-layer conversions of a local OCI layout and prints JSON. |
+
+Global: `--store DIR` (or `$KILN_HOME`) selects the store; the default is `~/.local/share/kiln`. `inspect`, `push` and `run` also find an image by its normalised reference (`kiln inspect php:8.4-cli`) or by digest.
+
+### `kiln convert`
+
 - `--platform os/arch[/variant]`: repeatable; the default is the host's. Several platforms produce a multi-arch index.
 - `--tag NAME`: the name in the store (default: the normalised reference, such as `docker.io/library/php:8.4-cli`, or `<file name>:latest` for a path).
 - `--ref NAME`: which image to take when a local source holds several. References compare normalised, so `php:8.4-cli` matches `docker.io/library/php:8.4-cli`.
 - `--max-layers N` (default 10): with `n` app layers and `n > N`, the bottom `n - N + 1` are squashed into one, leaving exactly `N`. The kernel and init layers don't count. Each app layer becomes a virtio-blk disk at run time, so `N` plus the init and scratch disks, vsock and the NIC must fit the VMM's devices (Firecracker: 17 on x86_64, 92 on aarch64; Cloud Hypervisor: 30 usable). The squashed layer is cached under the ordered erofs digests it merges, and the layers above it are converted against the unsquashed stack first, so they are the same blobs with or without the squash (`crates/kiln-image/tests/squash.rs`).
+- `--jobs N`: layers converted in parallel (default: the available CPUs).
+- `--boot-layers pinned|none` (default `pinned`): `none` makes a provisional image without kernel or kiln-init layers, for offline use or behind a proxy kiln cannot use; `kiln run` then needs `--kernel PATH --allow-custom-kernel`.
 - `--json`: a machine-readable summary.
 
-An argument that names an existing path is a local source; anything else must be an image reference. An argument starting with `./`, `../`, `/` or `~`, or ending in `.tar`, `.tar.gz` or `.tgz`, is always taken as a local path, and a full reference such as `docker.io/library/php` forces the registry. A second convert of the same image is served from the layer cache and costs the registry one manifest HEAD, which Docker Hub does not count against its pull limit. Changing a base layer reconverts only the layers that inherit attributes from it.
+An argument that names an existing path is a local source; anything else must be an image reference. An argument starting with `./`, `../`, `/` or `~`, or ending in `.tar`, `.tar.gz` or `.tgz`, is always taken as a local path, and a full reference such as `docker.io/library/php` forces the registry. Registry behaviour, credentials and address rules are in [docs/registries.md](docs/registries.md).
 
-## Registries
+### `kiln run`
 
-- `kiln push NAME REF` uploads a kiln image (blobs the registry already has are skipped) and `kiln pull REF [--tag NAME]` downloads one, verifying every blob. Digests survive the round trip. `pull` accepts only kiln images (an index of at most 8 platforms); use `convert` for OCI images.
-- An anonymous request that a registry still refuses after handing out a token usually means the repository does not exist (Docker Hub answers so), or that it is private and needs `docker login`. An empty username in the Docker config or from a credential helper means no credentials, as in Docker.
-- Credentials come from Docker's config (`$DOCKER_CONFIG/config.json`, else `~/.docker/config.json`): `auths`, `credsStore` and `credHelpers` (`docker-credential-*` on `PATH`), as `docker login` writes them. They are sent only to the registry's own origin and its token realm, never to redirect targets.
-- Registries are spoken to over https. A registry on `localhost`, `127.0.0.0/8` or `::1` is always spoken to over plain http, as Docker does; a TLS registry reached through a localhost tunnel or port forward is therefore not supported.
-- A tag is resolved with a manifest HEAD; manifests and configs already in the store are not downloaded again (they are content-addressed and were verified when stored), so a warm convert makes that single request. A cold one adds a GET of the manifest by the digest the HEAD reported.
-- kiln contacts only the registry: descriptor `urls` are ignored, and redirects (at most 5), token realms and upload locations must be https and must not lead to loopback, link-local (cloud metadata), private, CGNAT, unspecified or reserved addresses (including site-local, 6to4 and local-use NAT64 IPv6 ranges). The exception is a registry with no public address at all: what it hands out may use the address classes it is in itself. Proxy settings are not used.
-- Downloads are bounded by per-layer and per-image size limits.
-- Commands that accept a name (`inspect`, `push`) also find an image by its normalised reference: `kiln inspect php:8.4-cli`.
+`--vmm firecracker|cloud-hypervisor`, `--cpus N` (default 1), `--memory MiB` (default 512), `-i`, `-t`, `-e KEY[=VALUE]`, `--disk SIZE` (default 4G), `--persist PATH` with `--persist-reset` or `--persist-force`, `--net` with `--egress POLICY` and `-p [ADDRESS:]HOST:GUEST[/tcp|udp]`, `--stop-timeout SECS` (default 10), `--boot-timeout SECS` (default 30), `--kernel PATH --allow-custom-kernel`, `--init PATH --allow-custom-init`. kiln's flags go before IMAGE; everything after IMAGE is the command. Exit codes follow `docker run` (125 for kiln's own errors, 126 and 127 for an entrypoint that cannot run, 137 when you killed the VM). Details in [docs/running.md](docs/running.md).
 
-## Other commands
+## Related projects
 
-- `kiln import --from-store DIR NAME [--as NAME]` copies an image from another store (for example the macOS store mounted read-only into a Lima VM), verifying every blob.
-- `kiln bench LAYOUT` measures cold, warm and changed-top-layer conversions and prints JSON.
-- `--store DIR` (or `$KILN_HOME`) selects the store; the default is `~/.local/share/kiln`.
+kiln is one of three projects. Dependencies point one way: potter depends on kiln, and kiln depends on vmkit.
 
-## Running images
+- **[vmkit](https://github.com/AlfonsoCampodonico/vmkit)** is the VM layer: Firecracker and Cloud Hypervisor behind one `Vmm` trait, the unprivileged per-VM sandbox (`vmkit-sandbox`), per-VM networking with an nftables egress policy and `pasta`, and the `base` kernel that kiln pins. kiln depends on it by git revision, on Linux only.
+- **[potter](https://github.com/AlfonsoCampodonico/potter)** builds kiln images from application source: it detects the project or reads a `potter.toml`, produces a build plan, runs its steps, and writes kiln images to `$KILN_HOME`, so `kiln run` runs what potter built. It uses kiln's crates for the image format and the store.
 
-`kiln run IMAGE [CMD...]` boots the image in a microVM on Linux with KVM and runs its command (or `CMD`, which replaces the image's cmd), as `docker run` would. `kiln convert` adds the pinned kernel to the image; until kiln pins a released kiln-init, every run names one:
+## Testing
 
 ```bash
-K="--init kiln-init --allow-custom-init"
-kiln run $K alpine:3 -- sh -c 'echo hello'      # exit code, stdout and stderr as with docker run
-echo hi | kiln run $K -i alpine:3 -- cat        # -i relays stdin; without it stdin is at EOF
-kiln run $K -t -i alpine:3                      # a terminal: Ctrl-] q stops the guest, Ctrl-] k kills it
+cargo test --all          # needs nothing: no network, no root, no KVM
 ```
 
-- The first SIGINT or SIGTERM asks the guest to stop (`STOPSIGNAL`, then SIGKILL after `--stop-timeout`, default 10 s); a second SIGINT kills the VM. kiln kills the VM itself only when the guest has not reported its exit 10 s after the stop timeout (60 s with `--persist`): the guest syncs its disk before it reports. Without a stop request, a guest stuck before it reports its exit (in that sync, say) is treated like a command that still runs: kiln waits, as `docker run` does, and Ctrl-C twice kills it. SIGHUP, SIGQUIT, SIGUSR1 and SIGUSR2 are forwarded to the command.
-- Exit codes: the command's, or `128 + signal`; 127 and 126 when the entrypoint is missing or not executable; 137 when you killed the VM, as with `docker kill`; 125 when kiln, the VM or the guest's init failed, including the `--boot-timeout` (default 30 s), with the end of the guest's console.
-- Other flags: `--vmm firecracker|cloud-hypervisor` (default Firecracker), `--cpus N`, `--memory MiB`, `--disk SIZE` (the scratch disk, default 4G), `-e KEY[=VALUE]`. kiln's flags go before IMAGE: as with `docker run`, everything after IMAGE is the command, flags included (`kiln run img -i` runs `-i`), and a `--` right after IMAGE is optional.
-- `--net` gives the guest `eth0` (`172.30.0.2/30`, gateway and DNS `172.30.0.1`) in the VM's own network namespace, with egress through the host by `pasta`. `--egress` sets what it may reach: `restricted` (the default: no private, link-local or cloud metadata, CGNAT, loopback or multicast ranges, and none of the host's own addresses), `deny-all` (DNS only), `open` (everything, with a warning), and `allow=CIDR` exceptions (repeatable; one that opens cloud metadata or a whole private, CGNAT or link-local range, or everything, is warned about as `open` is, and exceptions given with `open` are ignored, with a warning). pasta gives the VM's namespace the host's outbound address (the one on its default route), so the guest can never reach that address: an exception for it alone is refused, and a wider one that includes it is warned about. The host's other addresses can be reached through an exception. Without `--net` the guest has only loopback, and its `/etc/resolv.conf` names `127.0.0.1`, so lookups fail at once.
-- `-p [ADDRESS:]HOST:GUEST[/tcp|udp]` (repeatable, with `--net`) publishes a guest port on the host. The address defaults to `127.0.0.1`, unlike Docker's `0.0.0.0`: a published port stays on this machine unless you give `-p 0.0.0.0:8080:8080` (or another of the host's addresses). A host port below 1024 needs privileges kiln does not have (pasta binds it as you): publish a high port, `-p 8080:80`, rather than `-p 80:80`. The image decides which port its app listens on, and the app must listen on `0.0.0.0` (or the guest's address) at the guest port: a forward to an app listening on `127.0.0.1` cannot work, and its connections end at once.
-- `--persist PATH` keeps the scratch disk (everything the guest wrote over the image) in the file PATH across runs, with a sidecar `PATH.kiln.json` naming the image and its layers, written once the guest runs the command (a run that fails to boot leaves the old one, or none for a disk it created). A disk is reused only with the same app layers in the same order, since overlayfs cannot keep files over other layers; another manifest with the same layers (a changed env or cmd) reuses it, with a note. `--persist-reset` recreates it and `--persist-force` reuses it anyway, with a warning (but never a disk whose sidecar a newer kiln wrote). It is never shrunk (a smaller `--disk` is refused; a larger one grows it), two runs never share it, and kiln never removes it.
-- Usage errors of `kiln run` exit 125, as `docker run`'s do. An interrupt (SIGINT, SIGTERM, or SIGHUP when the terminal goes away) while kiln is still setting the VM up stops the setup, removes what it made and exits 137; SIGQUIT, SIGUSR1 and SIGUSR2 then are not forwarded once the command runs, and kiln says so.
-- What boots: kiln compiles in a table of the kernels (vmkit's releases) and kiln-init binaries (kiln's) it trusts, by digest. `kiln convert` adds a kernel layer and an init layer for each one the table pins for the image's architecture, fetched once by digest (`kiln inspect` shows them on its `boot:` line; without them the image is provisional, and convert says what `kiln run` will need). `kiln run` boots an image's kernel layer only when it is the pinned one for the profile and version its config names, and always replaces the image's init layer with the pinned kiln-init's; neither needs the network once fetched, and `kiln gc` keeps them. The table pins vmkit's `kernels-6.18.54` release (profile `base`, arm64 and amd64, from `ghcr.io/alfonsocampodonico/vmkit-kernels/base`) and no kiln-init yet: until one is released, `--init PATH --allow-custom-init` names it (`kiln-init` is built as below). The kernel is fetched anonymously from ghcr.io (with your Docker credentials only if it demands them). Offline, or behind an HTTPS proxy (kiln's registry client does not use one), `kiln convert --boot-layers none` makes a provisional image without boot layers, which `kiln run` boots with `--kernel PATH --allow-custom-kernel` (kiln-init comes from the pin, or `--init`, as for any image). An image converted before the kernel was pinned has no kernel layer either: convert it again, or boot another kernel with `--kernel PATH --allow-custom-kernel`. Custom ones are warned about and recorded in the run's `run.json`. An image's own init layer never boots.
-- Per-run state (`run.json`, the VMM's sockets and logs, `console.log`) lives in `$XDG_RUNTIME_DIR/kiln/<id>/` (or `/tmp/kiln-<uid>/<id>/`), mode 0700. The scratch disk is not kept there, since that directory is usually a tmpfs whose pages would hold the guest's disk in memory: it is in `$KILN_HOME/scratch/<id>/` (mode 0700, on the store's filesystem), and goes with the run; `kiln gc` leaves it alone. `KILN_KEEP_RUN_DIR=1` keeps both directories, and `KILN_TIMINGS=1` prints how long booting took. A later run removes the directories of a run whose kiln was killed, once neither kiln nor its VMM runs, and first kills such a run's VMM if it still runs (nothing can use it without its kiln); a scratch directory records whose it is (`scratch.json`), so it is removed even when a reboot or logout has already emptied the run directory.
-- On macOS, `kiln run` explains how to use a Lima VM (below).
+Linux-only tiers (the kernel's erofs and overlayfs, a containerd oracle, real registries, Docker Hub) and the boot suite that starts real guests on both VMMs are described in [docs/testing.md](docs/testing.md), with how to build `kiln-init`.
 
-### On macOS: the Lima VM
+## Repository layout
 
-`lima/kiln.yaml` is a Lima VM with nested KVM (an Apple M3 or later, macOS 15 or later) with Firecracker, Cloud Hypervisor, pasta and nftables installed, and the Mac's store (`~/.local/share/kiln`, which `kiln convert` creates) mounted read-only at `/mnt/kiln-store`. Install `kiln` and `vmkit-sandbox` in the VM's `/usr/local/bin` (until releases exist, build them there); the template's AppArmor profile lets that `vmkit-sandbox` create user namespaces.
-
-```bash
-limactl start --name kiln lima/kiln.yaml
-kiln convert php:8.4-cli                                         # on the Mac
-limactl shell kiln kiln run $K php:8.4-cli -- php -v             # in the VM
-limactl shell kiln kiln run $K --net -p 8080:8080 app:1          # then, on the Mac: curl localhost:8080
+```
+crates/
+  kiln/             the CLI
+  kiln-image/       conversion pipeline, image format, boot artifacts, scratch disk template
+  kiln-erofs/       erofs writer and reader, with golden, property, kernel and oracle tests
+  kiln-oci/         OCI layouts, docker save archives and registry inputs
+  kiln-registry/    OCI distribution client
+  kiln-store/       local store
+  kiln-run/         host side of kiln run
+  kiln-proto/       control protocol
+  kiln-init/        guest PID 1
+  kiln-testguest/   hostile guests for the boot tests
+assets/             make-ext4-template.sh, which regenerates the scratch disk template
+docs/               format specification, guides, design spec and milestone plans
+lima/               kiln.yaml, the Lima VM for kiln run on macOS
+scripts/            boot-tests.sh, run-root-test.sh and comparison helpers
+tools/oracle/       Go helper wrapping containerd's layer applier, for the oracle test
 ```
 
-- The VM keeps its own store (Unix sockets and `flock` are not reliable on shared mounts). `KILN_IMPORT_FROM=/mnt/kiln-store` is set there, so `kiln run` first imports the image from the Mac's store when that store has it, copying only missing blobs and tagging it again every time: the latest convert on the Mac is what runs.
-- A port published on the VM's `127.0.0.1` (the `-p` default) reaches the Mac's `localhost`: Lima forwards the VM's loopback listeners to the Mac's `127.0.0.1` (IPv4; if something on the Mac already listens on that port over IPv6, `localhost` may reach it instead). Nothing else on the Mac's network sees it.
+## Documentation
 
-## The guest
+- [docs/README.md](docs/README.md): index of everything under `docs/`.
+- [docs/format.md](docs/format.md): the normative image format, erofs profile, guest and control protocol.
+- [docs/running.md](docs/running.md): `kiln run`, networking, persistent disks, what boots, the Lima VM.
+- [docs/registries.md](docs/registries.md): registry access, credentials and address rules.
+- [docs/testing.md](docs/testing.md): test tiers, building kiln-init, the boot suite.
+- [docs/superpowers/specs/2026-09-30-kiln-design.md](docs/superpowers/specs/2026-09-30-kiln-design.md): the design, including the threat model and planned milestones.
 
-`kiln-init` is PID 1 of a kiln microVM. It stacks the image's layers with overlayfs on a scratch disk, sets the guest up much as Docker sets up a container (differences in `docs/format.md`; mounts, `/etc/hosts`, users, environment), runs the image's process and relays its stdio over vsock; `docs/format.md` specifies the guest and the control protocol. It is a static musl binary, for aarch64 and x86_64:
-
-```bash
-rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
-# rust-lld links the musl binaries without a C cross toolchain.
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo build --release --target aarch64-unknown-linux-musl -p kiln-init
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo build --release --target x86_64-unknown-linux-musl -p kiln-init
-```
-
-The boot tests (`crates/kiln-run/tests/boot.rs`, on the same session code `kiln run` uses, and `crates/kiln/tests/run.rs` for the CLI) boot real guests through vmkit on both VMMs: exit codes, stdio, `-t`, shutdown and signals, users, many layers, scratch growth, networking and protocol abuse, including a hostile PID 1. They need Linux with KVM and the tools vmkit's own contract suite needs, which come with the vmkit revision kiln pins:
-
-```bash
-vmkit=$(dirname "$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "vmkit") | .manifest_path')")
-"$vmkit/scripts/install-vmms.sh"                  # Firecracker and Cloud Hypervisor, into ~/.local/bin
-"$vmkit/kernels/build.sh" "$(uname -m)" out       # the guest kernel
-cargo build --manifest-path "$vmkit/Cargo.toml" --bin vmkit-sandbox --target-dir target
-"$vmkit/scripts/install-apparmor.sh" "$PWD/target/debug/vmkit-sandbox"   # Ubuntu 23.10+ only; uses sudo
-sudo apt-get install busybox-static passt nftables jq python3 flex bison bc libelf-dev libssl-dev
-export PATH="$HOME/.local/bin:$PATH"
-KILN_TEST_NET=1 scripts/boot-tests.sh out/vmlinux-*-"$(uname -m)" -- --test-threads=4
-```
-
-`scripts/boot-tests.sh` builds `kiln-init` and the hostile test guest for the host's musl target and runs the suite; without its environment the tests are skipped. `KILN_TEST_NET=1` adds the networking cases (pasta and nft; the `kiln run` egress case also needs the internet), `KILN_TEST_KEEP=1` keeps each run directory with its console log (the `kiln run` cases' through `KILN_KEEP_RUN_DIR=1`; CI uploads their logs when the job fails), and `KILN_TEST_VCPUS` sets the guests' vCPUs (default 1). Cargo arguments go after the kernel, for example `firecracker::` to run one VMM's boot cases; `KILN_TEST_VMM` (default `firecracker`) picks the VMM of the `kiln run` cases.
-
-The scratch disk starts from an ext4 template embedded in `kiln-image`. `assets/make-ext4-template.sh` regenerates it with Docker, byte for byte; CI checks that it does.
-
-Known limitations:
-- Cloud Hypervisor 53 cannot grow the scratch disk online beyond about 8 GiB (the resize hangs), and under nested virtualization (Lima on Apple Silicon) growth is unreliable at any size. Firecracker grows it to 64 GiB and is the reference VMM. kiln's default disk is 4 GiB.
-- Signals are 1 to 31. An image whose `STOPSIGNAL` is a real-time signal is refused.
-- Under nested virtualization (Lima on Apple Silicon), Cloud Hypervisor 53 guests sometimes stall, more often in vsock-heavy cases (stdio streaming, protocol abuse); rerun the failed cases there.
-
-## Docs
-
-- `docs/format.md`: the normative image format, erofs profile, guest and control protocol.
-- `docs/superpowers/specs/2026-09-30-kiln-design.md`: the design.
-
-kiln prints image-supplied strings (command lines, environment, error paths) with control characters removed.
+kiln prints image-supplied strings (command lines, environment, error paths) with control characters removed; the command's own stdio is passed through unmodified.
 
 License: Apache-2.0.

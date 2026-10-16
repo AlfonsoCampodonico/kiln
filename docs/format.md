@@ -6,6 +6,21 @@ This document is normative. It defines the **kiln image** (schema version 1, pro
 
 A kiln image is an OCI 1.1 artifact. All JSON kiln writes is serialised with keys sorted and no insignificant whitespace, so identical inputs give identical digests.
 
+```mermaid
+flowchart LR
+    IDX["Index<br/>(multi-platform only)"] --> M["Manifest<br/>(one per platform)"]
+    M --> CFG["Config<br/>process, kernel, init, source"]
+    M --> K["1. Kernel layer"]
+    M --> IL["2. Init layer (erofs)"]
+    M --> AL["3. App layers (erofs)<br/>lowest first"]
+    PIN["Pinned kiln-init<br/>or --init"] -.-> VDA["vda: init layer, ro"]
+    SCR["ext4 template,<br/>per run or --persist"] -.-> VDB["vdb: scratch, rw"]
+    AL -.-> VDC["vdc onward: app layers, ro"]
+    K -.->|"only if it matches the pin"| KER["booted kernel"]
+```
+
+Informative: the blobs of a kiln image (solid arrows) and what each becomes when `kiln run` boots it (dotted arrows; see Guest below). The image's own init layer never boots.
+
 ### Index (multi-platform images)
 
 An OCI image index (`mediaType` `application/vnd.oci.image.index.v1+json`, `schemaVersion` 2) with `artifactType` `application/vnd.kiln.image.v1`. Each entry in `manifests` is a kiln manifest descriptor with `artifactType` `application/vnd.kiln.image.v1` and a `platform` (`os`, `architecture`, optional `variant`). Entries are sorted by platform (architecture, then os, then variant). A single-platform image is a bare manifest with no index.
@@ -43,6 +58,16 @@ An OCI image manifest (`mediaType` `application/vnd.oci.image.manifest.v1+json`,
 - There is no kernel command line field and no kiln version field.
 
 ### Local store (informative)
+
+```
+$KILN_HOME/
+  lock                    flock: shared while converting, pulling, pushing, importing or setting up a run; exclusive for gc
+  refs.json               name -> digest
+  blobs/sha256/<hex>      every blob, content-addressed
+  cache/                  layers/, layers-ctx/, squash/, warnings/, init-layers/ (below)
+  tmp/                    staging, on the same filesystem as blobs/
+  scratch/<run-id>/       a running VM's scratch disk; never touched by gc
+```
 
 `$KILN_HOME` (default `~/.local/share/kiln`) holds `blobs/sha256/<hex>`, `refs.json` (`{"refs": {"<name>": "<digest>"}}`), and five caches of small text files. Each entry is written only after the layer it describes has been verified and committed:
 - `cache/layers/<source layer digest>@<hex diff_id>@<format version>`: `erofs <digest>` for a layer that depends only on its tar, or `parents <JSON list of hex-encoded implicit paths>`.
