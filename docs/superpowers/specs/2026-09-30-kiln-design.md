@@ -1,9 +1,12 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.4: 2026-10-02)
-**Status:** Draft rev 2.4, awaiting review
+**Date:** 2026-09-30 (rev 2.11: 2026-10-11)
+**Status:** Draft rev 2.11, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
-**Related:** `../../../../ROADMAP.md` (projects #1 snapshot registry and #2 agent sandbox)
+**Related:**
+- `../../../../ROADMAP.md`: the three-repo roadmap (`vmkit`, `kiln`, `potter`).
+- `2026-10-05-kiln-shim-design.md`: `kiln-shim` (codename slip), the containerd shim (§12, M4).
+- The potter spec, `potter/docs/superpowers/specs/2026-10-04-potter-design.md` (rev 1.3): potter's needs from kiln are its §4, §6.1.1 and §9.3.
 
 ### Revision history
 
@@ -30,20 +33,83 @@
   - `deny-all` honours `allow`;
   - pasta's version floor is documented rather than checked.
 
+- **rev 2.5 (2026-10-03):** §4.2 aligned with the validated M1b-2 plan:
+  - T2's exception applies only to registries without a public address, and only to their own address classes;
+  - tags are resolved HEAD-first, so a warm convert costs no Docker Hub pull;
+  - `pull` accepts at most 8 platform manifests;
+  - token realms and upload locations get the same destination check as redirects;
+  - credentials go only to the registry's own origin and its token realm;
+  - proxies are not used;
+  - plain HTTP is allowed only for loopback registries;
+  - `pull` fetches every platform of a kiln image;
+  - registry inputs are tagged and looked up by their normalised reference.
+- **rev 2.6 (2026-10-03):** §9.4, §9.5, §9.6 and §14 aligned with the validated M3a plan:
+  - vsock endpoints follow vmkit's `<vsock socket>_<port>`;
+  - the supervision order kills and reaps the other processes before draining stdio;
+  - stop signals are limited to 1–31;
+  - the ext4 template lives in the crate that embeds it;
+  - Cloud Hypervisor 53 cannot grow the scratch disk online beyond about 8 GiB.
+- **rev 2.7 (2026-10-04):** `kiln build` no longer requires BuildKit (user decision):
+  - pluggable backends: BuildKit, Podman/Buildah, and a native backend for Dockerfiles without `RUN`;
+  - `RUN` executed in a kiln microVM is planned post-v1 (§6, non-goals).
+- **rev 2.8 (2026-10-05):** project consolidation driven by potter (user decisions):
+  - rev 2.7's native RUN-free Dockerfile backend is cancelled. `kiln build --builder auto|potter|buildkit|podman|buildah` dispatches to an external builder, and `auto` tries potter first. kiln runs the `potter` binary; potter is the only Dockerfile implementation kiln ships with, `RUN` in a microVM included (§1, §2, §6).
+  - Three repositories only: `vmkit`, `kiln` and `potter`, depending `potter` → `kiln` → `vmkit`. The agent sandbox (sagger), snapshot distribution (sherd) and the containerd shim (slip, `kiln-shim`) live in kiln; lazy restore (raku) lives in vmkit (§1, §4).
+  - kiln-proto is extended, never replaced. The planned extensions (services, build mode, exec, guest stats, OOM reports, file updates) and the versioning rule for them are in §9.8.
+  - Milestones (§12): M3 is split into M3a (done), M3b and M3c, with new M3d (`services`), M3e (build mode) and M4 (`kiln-shim`). sagger and sherd follow, each with its own spec.
+  - The kiln-shim draft spec moved here from the potter repo.
+- **rev 2.9 (2026-10-06):** §5.2, §5.3, §8.1, §9.5 and §9.7 aligned with the M3b-1 plan (`kiln run`, runtime and CLI; validated prototype `m3b-proto` and the controller's rulings). M3b is planned in two parts: M3b-1, the runtime and CLI, and M3b-2, pinned artifacts, `--persist`, `--net` and the Lima template (§12).
+  - `--init <path>` boots a static kiln-init of the user's, only with `--allow-custom-init`, as `--kernel` needs `--allow-custom-kernel`; both are warned about and recorded in `run.json`. Until kiln pins released kernels and kiln-init, every run names both; an image's kernel layer is used only with `profile: custom` and `--allow-custom-kernel` (§8.1).
+  - A run the user kills (a second SIGINT, `Ctrl-]` `k`, or a stop request before the guest's `Hello`) exits 137, as `docker kill`, unless the guest's final message came first: a kill after `Exited` keeps the app's code, one after `InitFailed` keeps init's 127, 126 or 125. Kills `kiln` decides (protocol violations, the boot timeout, the stop and end bounds below) stay 125 (§9.5).
+  - After `Exited`, `InitFailed` or the control connection closing, the guest has 10 s to end the VM, then it is killed; after `Exited` the app's exit code is kept, with a warning. After `Shutdown`, `kiln` kills the VM itself once the grace period plus 5 s has passed (125, with a warning); the guest's final message ends that bound, and only the 10 s one applies from then. A stop request before `Hello` kills at once. A killed VMM has 5 s to exit; then `kiln` stops waiting for it, with a warning (§9.7).
+  - After the VMM exits, stdout and stderr (or the terminal) are drained to EOF however long `kiln`'s own stdout takes them (a pager, a stopped terminal), as a pipeline would; only reading is bounded (2 s without a byte while nothing is being written). After `kiln` gave up on a VMM, or when the user asks to stop (SIGINT, SIGTERM, `Ctrl-]`) after the VM's end, the output gets a fixed 2 s, so a sink that never takes it cannot hold `kiln`. A stream cut off with bytes pending is warned about. Output whose connection the VMM made just before it exited is still accepted (§9.7).
+  - When the VM ends without `Exited` or `InitFailed`, `kiln` names the likely causes (the VMM failed, or ran out of memory) and the VMM's log, or that `KILN_KEEP_RUN_DIR=1` keeps it (§9.7).
+  - SIGHUP, SIGQUIT, SIGUSR1 and SIGUSR2 are forwarded to the main process as `Signal`, as Docker's sig-proxy does. A second SIGTERM re-sends `Shutdown`, whose deadline can only shrink; only a second SIGINT kills. SIGWINCH is forwarded with `-t` only (§9.7).
+  - Signal handling starts before setup. SIGINT, SIGTERM or SIGHUP during setup stops it, removes what it made and exits 137, as a user's kill before `Hello` does; SIGQUIT, SIGUSR1 and SIGUSR2 then are dropped with a note, never delivered once the app runs (§9.7).
+  - With `-t -i`, terminal input to a guest that stops reading it is dropped after 5 s, so `Ctrl-]` keys always act (§9.7).
+  - `-t` without `-i` gives the guest a terminal without raw mode or stdin relay; `-t -i` needs a terminal on stdin. Both as Docker (§9.7).
+  - Errors before the guest runs exit 125, and so do usage errors of `kiln run`, as `docker run`'s do. As with `docker run`, everything after IMAGE is the command, flags included; a `--` right after IMAGE is optional. A `Config` over the protocol's frame is refused before boot. Defaults: `--vmm firecracker`, `--cpus 1`, `--memory 512`; the guest's hostname is the run id's first 12 hex digits; `-e`/`--env KEY[=VALUE]` as Docker's (§9.7).
+  - `console.log` drops its oldest half when it would pass 1 MiB; the VMM writes the console to a FIFO that `kiln` copies (§5.3).
+  - Stale run directories from other boots or hosts are left alone and reported in a note; directories kept for debugging (`KILN_KEEP_RUN_DIR=1`) are never cleaned (§5.3).
+  - The scratch disk moves out of the run directory, which is usually a tmpfs (`$XDG_RUNTIME_DIR`): its pages would hold the guest's disk in host memory, charged to the VMM's cgroup (`--memory` plus 256 MiB), so a guest writing a few hundred MB had its VMM killed. It lives in a per-run directory on the store's filesystem, `$KILN_HOME/scratch/<run-id>/`, recorded in `run.json` and removed with the run or by the stale cleanup; it carries its own identity (`scratch.json`), so it is cleaned up even after a reboot or logout emptied the run directories; GC never touches it (§5.2, §5.3).
+- **rev 2.10 (2026-10-07):** §5.1, §5.2, §6.5, §8.1, §9.3, §9.4, §9.5, §9.6, §9.7, §10 and §12 aligned with the M3b-2 plan (`docs/superpowers/plans/2026-10-07-m3b2-artifacts-persist-net.md`: pinned artifacts, `--persist`, `--net` and the Lima VM), the controller's rulings 2, 3, 4, 7 and 10, and a field report from a real user of `kiln run`.
+  - `-p [ADDRESS:]HOST:GUEST[/tcp|udp]`: the host address defaults to `127.0.0.1` (Docker's is `0.0.0.0`), so an untrusted image's ports stay on the host unless `-p 0.0.0.0:…` (or another of the host's addresses) says otherwise; vmkit's `PortForward` gains the address. A host port is published once per protocol whatever its addresses. The image owns its listen port: the app must listen on `0.0.0.0` or the guest's address, and a forward to a guest listening on `127.0.0.1` ends at once (§9.3).
+  - Without a network, or with one that names no DNS server, `/etc/resolv.conf` adds `nameserver 127.0.0.1` after its comment, as Docker's `--network none` lists a resolver: lookups fail at once instead of tools refusing to start (§9.6, `docs/format.md`).
+  - pasta copies the host's outbound address (the one on its default route) into the VM's namespace, so the guest can never reach it: an `--egress allow=` entry that is only that address is refused before boot, by `kiln` and by vmkit, and a wider one that includes it is warned about. The host's other addresses can be reached through `allow=` (finding 4.1, §9.3).
+  - `--persist` reuses a disk whose sidecar lists the same app layers in the same order even when the manifest differs (another env or cmd); the sidecar records the new manifest and a note is printed (ruling 2). `--persist-reset` and `--persist-force` exclude each other; a disk without a readable sidecar needs one of them; the disk is locked for the run; it replaces the run's scratch directory and no cleanup touches it; the guest gets 60 s instead of 10 s to end the VM after its final message (§9.4, §9.7).
+  - `kiln gc` keeps every blob the compiled pin table names, and the init layers built from pinned kiln-init binaries with their `cache/init-layers` entries, so offline runs survive it (ruling 3, finding 4.2, §5.2).
+  - Fix wave 1 (M3b-2 reviews): after `Shutdown`, `kiln` kills the VM itself once the grace period plus the end bound (10 s, 60 s with `--persist`) has passed, not plus 5 s, so the guest's sync before `Exited` is not cut short; a guest stuck before `Exited` without a stop request is waited for like a running command, as `docker run` does (a second SIGINT kills it). kiln-init syncs and remounts the scratch disk read-only before `Exited` (§9.6). `--persist` takes the disk's lock before it inspects and decides, writes the sidecar once the guest runs, reads it without following a symlink, refuses to downgrade a newer kiln's, and drops its size field (§9.4). The kernel pins are filled (vmkit `kernels-6.18.54`, `ghcr.io/alfonsocampodonico/vmkit-kernels/base`), and an image's pinned kernel layer is checked by size too and fetched by digest when missing (§8.1). `KILN_IMPORT_FROM` runs the image by the tag the import set (the source's normalised name wins over a stale exact local tag), imports a missing digest, and notes a tag moved without copying blobs (§10). `allow=` exceptions that open cloud metadata or a whole private, CGNAT or link-local range (or everything) are warned about as `--egress open` is, and `allow=` under `open` is ignored with a warning (§9.3).
+  - Final fix wave (M3b-2 final review): `kiln convert --boot-layers pinned|none` (default `pinned`; `none` makes a provisional image without fetching, the offline or proxied path), and the default tests need no network (one real-fetch test behind `KILN_TEST_NETWORK=1`; no override of the pin table). Pinned blobs are fetched anonymously first, with the Docker config's credentials only when the registry demands them (§8.1). A run whose VMM `kiln` gave up on leaves its run directory, so the next run's orphan reaper (a VMM whose `kiln` is gone is killed through a verified pidfd) finds it before a `--persist` disk is reused; a new `--persist` disk is created under a temporary name, locked, then linked into place (§5.3, §9.4).
+  - A pin names the artifact's blob (the kernel image, the static kiln-init), its repository and size: fetching is one digest-verified blob GET, from the store when it is there. The table ships empty until vmkit's kernel and kiln's kiln-init releases exist (ruling 7). `convert` adds each boot layer whose artifact is pinned for the architecture, independently (a kernel can be pinned before any kiln-init release); without either it makes a provisional image and says what `kiln run` needs, and `inspect` prints a `boot:` line. `config.init` is informational, since `kiln run` always replaces the init layer (finding 4.3) (§5.1, §6.5, §8.1).
+  - The device budget's remedy is `kiln convert --max-layers N` (finding 4.4, §9.7); the config's grace field is `shutdownGraceSecs` (finding 4.5, §9.5).
+  - §10: `KILN_IMPORT_FROM` imports (missing blobs only) and retags on every run when the source store has the name, so the newest convert on macOS wins (ruling 4); ports published on the Lima VM's `127.0.0.1` reach the Mac's `localhost` through Lima's own forwarding.
+- **rev 2.11 (2026-10-11):** §5.1, §9.5, §9.6, §9.7, §9.8 and §12 aligned with the M3d plan (`docs/superpowers/plans/2026-10-11-m3d-services.md`: kiln-init `services`, validated prototype `m3d-proto`) and the controller's rulings 1–5 on it. What §9.8 left to M3d is decided:
+  - **Image:** services come from the `dev.kiln.services` label of the source OCI config, a JSON array of `{name, process, ready, stopSignal}`. A service's `process` is the main process's without `stopSignal`; unknown fields are refused at every level; names are `[a-z0-9-]{1,32}`, unique, at most 16; `ready` defaults to `none`, `stopSignal` to SIGTERM (1–31). `kiln convert` checks the label and stores it as the kiln config's `services`, so the image digest covers it; a bad label fails the conversion. potter sets the label on the `ResolvedImage` it builds and calls `convert_resolved` unchanged. `kiln inspect` lists the services; `kiln run` has no flag for them (§5.1, §9.8).
+  - **Schema version 2 (ruling 1):** a config with services has `schemaVersion` 2, one without keeps 1, and readers accept 2 only with services and 1 only without. Every kiln before M3d accepts only 1, so it refuses an image with services instead of running it without them (§5.1).
+  - **Protocol version 2:** `Config.services` (the final environment, `ready` always present, `stopSignal` a number), `Config.readyTimeoutMs` (present exactly with services) and `Exited.service`; a `Config` without services is a version 1 `Config` byte for byte. A version 1 host refuses a version 2 `kiln-init`'s `Hello`; by design, since `kiln run` boots the `kiln-init` pinned to it (§8.1) and the two ship together (ruling 2) (§9.5, §9.8).
+  - **Readiness:** a connection to the service's Unix socket, or to `127.0.0.1:<port>`, accepted and closed at once; `none` at once. Services must listen on the loopback or the wildcard address (ruling 4); the probes may show up in a service's log (ruling 5). `readyTimeoutMs` bounds all services from `Config`'s arrival; the host sets it to what remains of the boot timeout less 2 s, so the guest's `InitFailed` naming the service arrives before the boot timeout. A service not ready in time, exiting first or not executable fails stage 6 naming it (127 and 126 as for the main process) (§9.6, §9.8).
+  - **Stopping (ruling 3):** the first process to exit (a service or the main process), or `Shutdown`, ends the run. The others stop in reverse start order, each with its own stop signal; the grace period is split evenly between the processes still to stop, and one that has not exited when its share ends gets SIGKILL before the next gets its stop signal, so a stuck nginx no longer costs php-fpm its SIGQUIT. The sequence stays within the grace period; the host's stop deadline is unchanged (§9.6).
+  - **Reporting:** `Exited` carries the status of the process whose exit ended the run, naming it when it was a service, or after `Shutdown` the main process's; `kiln run` exits with it and prints which service ended the run (§9.5, §9.7).
+  - **Sharing:** services share the main process's stdout and stderr (with `-t`, the terminal, never as their controlling terminal or input); `kiln run --env` values reach every service as well as the main process; forwarded signals go to the main process only (§9.6, §9.7).
 ---
 
 ## 1. Goals
 
-`kiln` turns an OCI image, or a Dockerfile via BuildKit, into a bootable microVM image.
+`kiln` turns an OCI image, or a Dockerfile via an external builder (potter, BuildKit, Podman or Buildah), into a bootable microVM image.
 - Images run on Firecracker and Cloud Hypervisor, on aarch64 and x86_64.
 - Caching is per layer, fast enough that an unchanged rebuild is near-instant.
 
-It is meant to be a serious open-source tool: a stable format, real docs and a polished CLI. It is built to exercise the internals (a native erofs writer and reader, a custom init, a control protocol) rather than wrap existing tools. It is also the foundation of an AI-agent sandbox (project #2), so it treats images and guests as untrusted (§3).
+It is meant to be a serious open-source tool: a stable format, real docs and a polished CLI. It is built to exercise the internals (a native erofs writer and reader, a custom init, a control protocol) rather than wrap existing tools. It treats images and guests as untrusted (§3), because it is also the base of the rest of the project family:
+- **potter** (its own repo) builds images from source and runs build steps in kiln microVMs.
+- **`kiln-shim`** (codename slip, in this repo) runs kiln images as a Kubernetes RuntimeClass.
+- **The agent sandbox** (codename sagger) and **snapshot distribution** (codename sherd) are planned in this repo, with lazy restore (codename raku) in `vmkit`.
+
+Codenames name internal pieces only. The products are `kiln`, `vmkit` and `potter`.
 
 ### Success criteria
 
 1. `kiln convert php:8.4-cli` produces an image that boots and runs `php -v` on both VMMs and both architectures.
-2. `kiln build -f Dockerfile .` produces the same kind of image via a reachable BuildKit.
+2. `kiln build -f Dockerfile .` produces the same kind of image through any available backend: potter, BuildKit, Podman or Buildah (§6).
 3. The filesystem a guest sees matches what containerd produces for the same image, as checked by the oracle test (§11.2), across the fixture set.
 4. Performance targets, measured by `kiln bench` (§11.6). All are measured with `kiln convert` from a local OCI layout:
    - Warm, unchanged image: **< 200 ms**.
@@ -52,18 +118,18 @@ It is meant to be a serious open-source tool: a stable format, real docs and a p
 5. Builds are deterministic: for the same `kiln` version, identical inputs produce byte-identical blobs and manifests on any host.
 6. Where each command runs:
    - `convert`, `pull`, `push`, `inspect`, `ls`, `gc`, `import` run natively on macOS: no root, no Linux VM.
-   - `build` needs a reachable BuildKit.
+   - `build` needs one of potter, BuildKit, Podman or Buildah, and runs wherever that backend does (§6). kiln has no Dockerfile engine of its own.
    - `run` needs Linux, KVM and membership in the `kvm` group. It **never needs root**.
 7. Untrusted images cannot poison the cache, reach host-internal network endpoints from the build host, or swap the kernel or init. Untrusted guests cannot reach link-local, private or host addresses by default, or other VMs. A VMM compromise lands in an unprivileged sandbox (§3).
 8. `docs/format.md` documents the image format, the erofs profile and the control protocol well enough for a third party to produce or consume `kiln` images.
 
 ### Non-goals (v1)
 
-- A native Dockerfile engine (BuildKit does this).
+- A Dockerfile engine in kiln. `kiln build` delegates every Dockerfile to a backend (§6). potter is the project family's only Dockerfile implementation, including `RUN` in a kiln microVM.
 - Per-workload kernel tuning or local kernel builds.
 - erofs compression (LZ4 is the planned follow-up).
 - Auto-delegating `kiln run` to a Lima VM on macOS.
-- Snapshot/restore *implementation* (its trait shape is fixed here; the implementation belongs to #2), forking, and lazy restore (#1).
+- Snapshot/restore *implementation* (its trait shape is fixed here), forking, and lazy restore. Snapshot, restore and fork belong to sagger, and lazy restore to raku, in later milestones with their own specs (§12).
 - DNS-name-based egress policy (CIDR policy only in v1).
 - IPv6 inside guests.
 - Windows hosts, GPUs, non-Linux guests.
@@ -77,15 +143,15 @@ It is meant to be a serious open-source tool: a stable format, real docs and a p
 | Language | Rust, all components | Matches Firecracker, Cloud Hypervisor and rust-vmm. No GC suits future UFFD work. One toolchain across all three projects. |
 | VMMs | Firecracker **and** Cloud Hypervisor from day one, behind `vmkit` | Real portability. The abstraction is designed against two concrete backends rather than retrofitted. |
 | Architectures | aarch64 and x86_64 from day one | aarch64 is native on the dev machine; x86_64 is the common production target. |
-| Input | OCI images are the core input; Dockerfiles go through `docker buildx` or `buildctl` | Effort goes into conversion, not into a BuildKit clone. |
+| Input | OCI images are the core input; Dockerfiles go through an external backend: potter first, then BuildKit, then Podman or Buildah (§6) | Effort goes into conversion, not into a BuildKit clone. potter owns the project family's only Dockerfile implementation, so kiln keeps none. |
 | Rootfs format | One read-only erofs image per OCI layer, overlayfs in the guest, writable ext4 scratch | True per-layer caching, cross-image dedupe, and a compact format that mounts quickly. |
 | erofs | Native Rust writer **and reader**, streaming tar to erofs without extraction | Runs on macOS, where APFS can't faithfully hold Linux ownership, device nodes or case-distinct names. The reader is needed for squash (§6.4) and parent inheritance (§6.3). |
 | Implicit parents | Inherit attributes from the merged lower layers (decision B) | Matches containerd. Otherwise overlayfs shows invented directory permissions (e.g. `/tmp` losing 1777). |
 | Registry client | Own minimal client, `kiln-registry` | `oci-client` verifies digests only at end of stream, follows descriptor `urls` unauthenticated (an SSRF vector), and has no Docker credential-helper support. Owning the client gives full control over verification, redirects and auth. |
-| Guest↔host control | virtio-vsock control protocol (decision A) | One mechanism covers config delivery, readiness, graceful shutdown, signals, stdio with EOF, TTY mode and exit status, on both VMMs. #2 needs the same channel. |
+| Guest↔host control | virtio-vsock control protocol (decision A) | One mechanism covers config delivery, readiness, graceful shutdown, signals, stdio with EOF, TTY mode and exit status, on both VMMs. potter, `kiln-shim` and sagger extend the same channel (§9.8). |
 | VMM privileges | VMMs run **unprivileged**, inside a per-VM sandbox built by `vmkit` from user, mount, PID and net namespaces plus seccomp or Landlock (decision C) | Firecracker requires the jailer "or equal or more restrictive" constraints. The jailer itself needs root. An unprivileged sandbox meets the bar without any root component. |
 | Networking | A tap device inside the VM's own net namespace, a default-deny nftables policy in that namespace, and `pasta` for unprivileged egress | No host-global `ip_forward` and no host firewall edits. Every VM is isolated in its own namespace. The guest cannot alter the policy. It works on hosts running Docker or systemd-resolved. |
-| Kernel | Prebuilt, versioned profiles, published from the **`vmkit` repo** and fetched by pinned digest | Kernel builds take minutes. The profiles are VMM-facing and shared by #2. |
+| Kernel | Prebuilt, versioned profiles, published from the **`vmkit` repo** and fetched by pinned digest | Kernel builds take minutes. The profiles are VMM-facing and shared by everything that boots through `vmkit`. |
 | `kiln-init` delivery | Released as a versioned artifact fetched by pinned digest (same mechanism as kernels) | Avoids `include_bytes!` breaking `cargo install`. Run-time verification compares against the pin. |
 | Running | `kiln run` on top of `vmkit` | Images must boot to be testable. VMM drivers are written once. |
 | License | Apache-2.0 | Matches the ecosystem. |
@@ -113,7 +179,7 @@ The `kiln` and `vmkit` binaries; the pinned digest tables compiled into `kiln`; 
 - Attackers already running as the invoking user. They can ptrace `kiln` anyway.
 - Hardware side channels.
 - Host DoS by CPU, when cgroup delegation is unavailable (§9.2 degrades with a warning).
-- Integrity of exit codes and status reported by the guest. These are guest-asserted, and `kiln` and #2 must treat them as such.
+- Integrity of exit codes, status, stats and OOM reports from the guest. These are guest-asserted, and `kiln`, potter and `kiln-shim` must treat them as such: they never drive a security or quota decision.
 
 ### Required properties (each tested in §11.5)
 
@@ -133,7 +199,13 @@ The `kiln` and `vmkit` binaries; the pinned digest tables compiled into `kiln`; 
 
 ## 4. Repositories and components
 
-Two repositories. `vmkit` is the only code shared between the microVM projects. All other coupling is through documented formats.
+The project family has three repositories, and only three: `vmkit`, `kiln` and `potter`. Dependencies point one way, `potter` → `kiln` → `vmkit`; nothing depends upward. This spec covers `kiln` and `vmkit`'s v1 scope. Beyond crate dependencies, coupling is through documented formats: the image format and kiln-proto (`docs/format.md`).
+
+| Repo | Owns |
+|---|---|
+| `vmkit` | VMMs behind the `Vmm` trait, the sandbox, networking, kernel profiles (§4.1); later, lazy restore (raku) |
+| `kiln` | The image format, conversion, the store and registry client, `kiln-init` and kiln-proto, `kiln run`, `kiln build` dispatch (§4.2); `kiln-shim` (slip, M4); later, the agent sandbox's snapshot, restore and fork (sagger) and snapshot distribution in OCI registries (sherd) |
+| `potter` | Source → kiln image: detectors, the plan IR, the runtime catalog, the build executors, the Dockerfile frontend, the remote cache. It depends on kiln crates and `vmkit` pinned by git rev |
 
 ### 4.1 `vmkit` (separate repo)
 
@@ -143,7 +215,7 @@ VMM-neutral VM lifecycle, sandboxing, networking and kernel profiles.
   - `create(VmSpec) -> Vm` and `restore(SnapshotBundle, RestoreSpec) -> Vm`. Restore is a constructor because both VMMs require a fresh, unconfigured process for it.
   - On `Vm`: `start`, `pause`, `resume`, `kill`, `wait -> VmEnd`, `snapshot(dest)`, `capabilities()`.
   - Graceful shutdown is **not** a VMM operation. It goes through the guest control channel (§9.5).
-  - `snapshot` and `restore` are part of the trait so its shape is fixed now. Their implementation and contract tests ship with #2.
+  - `snapshot` and `restore` are part of the trait so its shape is fixed now. Their implementation and contract tests ship with sagger.
 - **`VmSpec`.**
   - Kernel path and cmdline. The cmdline is assembled only by `kiln`/`vmkit` (§8.3).
   - Ordered block devices (path, read-only flag), vCPUs, memory MiB.
@@ -162,22 +234,29 @@ VMM-neutral VM lifecycle, sandboxing, networking and kernel profiles.
 - **`sandbox` module:** user, mount, PID and net namespaces; the fixed in-sandbox file layout; cgroups; rlimits; seccomp and Landlock flags (§9.2).
 - **Binary discovery:** `$VMKIT_FIRECRACKER`, `$VMKIT_CLOUD_HYPERVISOR` and `$VMKIT_PASTA`, else `PATH`; the sandbox helper from `$VMKIT_SANDBOX`, else next to the running program, else `PATH`. VMM minimum versions are pinned and checked when a backend is discovered. pasta's floor (2024-02-20) is documented, not checked: distribution builds print no usable version. No component runs with elevated privileges, so environment-selected binaries confer nothing beyond what the user already has.
 - **`kernels/`:** per-arch config fragments, a pinned LTS version, and the CI build, boot-test and publish pipeline (§8.2).
+- **Planned growth** (vmkit's own milestones; listed here because kiln's consumers need them):
+  - a generalised `sandbox` that runs any process, with nested user namespaces, and `net` without a tap for a bare net namespace (potter spec §4, for potter P2);
+  - `Capabilities.supports_memory_hotplug` (virtio-mem on Cloud Hypervisor) and vCPU hotplug (shim spec §4.3, for M4's S4);
+  - lazy restore below the VMM (raku), with its own spec.
 
 ### 4.2 `kiln` (this repo, Cargo workspace)
 
 | Crate | Responsibility | Depends on |
 |---|---|---|
 | `kiln-store` | Content-addressed blob store, layer caches, refs index, store lock, GC, artifact fetch by pinned digest. | — |
-| `kiln-registry` | Minimal OCI distribution client: bearer and basic token auth, `~/.docker/config.json` including `credsStore`/`credHelpers` (exec `docker-credential-*`), HEAD/GET of manifests and indexes, verified blob GET, monolithic blob PUT, manifest PUT. Enforces T2: descriptor `urls` are never fetched; redirects are HTTPS-only, at most 5, and never to loopback, link-local, private or CGNAT destinations (checked after DNS resolution) unless the configured registry host is itself in such a range. Query strings and userinfo are redacted from errors. | `reqwest`, `kiln-store` |
+| `kiln-registry` | Minimal OCI distribution client: bearer and basic token auth, `~/.docker/config.json` including `credsStore`/`credHelpers` (exec `docker-credential-*`), HEAD/GET of manifests and indexes, verified blob GET, monolithic blob PUT, manifest PUT. Enforces T2:<ul><li>Descriptor `urls` are never fetched.</li><li>Redirects are HTTPS-only (plain HTTP only from a loopback registry to loopback) and at most 5.</li><li>Redirects never go to loopback, link-local, private, CGNAT, multicast or reserved destinations, unless the configured registry host resolves only to non-public addresses and the destination is in one of their classes (so a loopback registry may redirect to loopback, never to link-local, and a registry with any public address may hand out only public destinations). The check runs after DNS resolution, and connections are pinned to the checked addresses.</li><li>Token realms and upload `Location`s get the same check.</li><li>Credentials are sent only to the registry's own origin and to the token realm its challenge names (the token protocol requires it), never to a redirect target such as a CDN.</li><li>Proxies are not used, since a proxy would resolve names outside the check.</li><li>Plain HTTP is used only for loopback registries.</li></ul>Query strings, userinfo and tokens are redacted from errors. | `reqwest`, `kiln-store` |
 | `kiln-oci` | Resolve references and platforms; read OCI image layouts and `docker save` archives, hashing every file (filenames and `manifest.json` are never trusted). | `kiln-registry`, `kiln-store` |
 | `kiln-erofs` | erofs **writer** (tar stream → erofs) and **reader** (lookup, readdir, attributes, file data). Implements the erofs profile in §7 and the layer semantics in §7.4. Pure `Read`/`Write + Seek`. | — |
-| `kiln-init` | Static musl PID 1 for the guest, including the guest side of the control protocol. | — (guest only) |
-| `kiln-proto` | Control-protocol message types and framing, shared by `kiln-init` and the host (§9.5). | `serde` |
+| `kiln-init` | Static musl PID 1 for the guest, including the guest side of the control protocol. Gains `services` (M3d), build mode (M3e), and exec, stats, OOM reports and file updates (M4) (§9.8). | — (guest only) |
+| `kiln-proto` | Control-protocol message types and framing, shared by `kiln-init` and every host side: `kiln run`, potter and `kiln-shim` (§9.5, §9.8). | `serde` |
 | `kiln-image` | `kiln` image manifest and config types; assembly; run-time verification of kernel and init (§8.1). | `kiln-oci`, `kiln-erofs`, `kiln-store` |
-| `kiln` (bin) | CLI: `convert`, `build`, `pull`, `push`, `import`, `run`, `inspect`, `ls`, `gc`, `bench`. | all of the above, `vmkit` |
+| `kiln` (bin) | CLI: `convert`, `build` (backend dispatch, §6), `pull`, `push`, `import`, `run`, `inspect`, `ls`, `gc`, `bench`. | all of the above, `vmkit` |
+| `kiln-shim` (bin, M4) | containerd shim v2 `io.containerd.kiln.v2`, one microVM per pod, behind the RuntimeClass `kiln`. Specified in `2026-10-05-kiln-shim-design.md`. | `kiln-proto`, `kiln-image`, `vmkit` (exact set designed in M4) |
+
+potter depends on `kiln-oci`, `kiln-erofs`, `kiln-image`, `kiln-store`, `kiln-registry` and `kiln-proto` (potter spec §4). kiln never depends on potter's crates: that would be a cycle, so `kiln build` runs the `potter` binary instead (§6).
 
 Other repo contents:
-- `assets/ext4-template.img.zst` with its reproducible generation script (§9.4).
+- `assets/make-ext4-template.sh`, the reproducible generation script for `crates/kiln-image/assets/ext4-template.img.zst` (§9.4).
 - `lima/kiln.yaml` (§10).
 - `tools/oracle/`: a Go test helper wrapping containerd's `archive.Apply` (§11.2).
 - `xtask/`.
@@ -196,10 +275,11 @@ A `kiln` image is an OCI 1.1 artifact.
   - `schemaVersion` (starts at 1)
   - `architecture` (`arm64` | `amd64`)
   - `process`: `entrypoint`, `cmd`, `env`, `workingDir`, `user`, `stopSignal` (all from the source OCI config)
-  - `kernel`: `{ profile, version }`
-  - `init`: `{ version }`
+  - `kernel`: `{ profile, version }`, present with the kernel layer (`kiln run` verifies that layer against the pin for it, §8.1)
+  - `init`: `{ version }`, present with the init layer; informational, since `kiln run` always replaces that layer
   - `source`: `{ manifestDigest, reference? }`. `reference` is present only for registry inputs, normalised (e.g. `docker.io/library/php:8.4-cli`). Local inputs omit it, keeping manifests deterministic.
   - `erofsFormatVersion`
+  - `services` (M3d, omitted when empty): processes `kiln-init` starts before the main process, from the source config's `dev.kiln.services` label (§9.8). A config with services has `schemaVersion` 2, one without keeps 1, so a kiln older than M3d refuses an image with services (rev 2.11).
   - There is **no** kernel cmdline field (T4). There is **no** `kiln` version field, so patch releases that produce identical output produce identical digests.
 - **Layers, in boot order:**
   1. Kernel: `application/vnd.kiln.kernel.v1`.
@@ -212,6 +292,8 @@ A `kiln` image is an OCI 1.1 artifact.
 
 `docs/format.md` is the normative version of §5.1, §7 and §9.5. Breaking changes bump `schemaVersion`; readers reject unknown major versions.
 
+**containerd alignment (M4, shim spec §3.1):** containerd 2.3's erofs snapshotter and differ must accept kiln's app layers as native EROFS layers. M4 either aligns the app-layer media type with containerd's or registers kiln's as an alias, and tests that the §7 profile (4096-byte blocks, no compression, xattrs) mounts through the snapshotter. Which of the two is designed in M4. Changing kiln's own media type is a breaking change under the rule above.
+
 ### 5.2 Store (`$KILN_HOME`, default `~/.local/share/kiln`)
 
 ```
@@ -223,23 +305,25 @@ $KILN_HOME/
   cache/layers-ctx/<src-digest>@<diff-id-hex>@<fmt>@<ctx>  # erofs digest for a layer with inherited parents (§6.3)
   cache/squash/<sha256(ordered erofs digests)>@<fmt>
   cache/warnings/<layer cache key>             # JSON list of the layer's conversion warnings, removed with its cache/layers entry
+  cache/init-layers/<kiln-init digest>@<fmt>   # the init layer built around that kiln-init binary (§6.5)
   tmp/                                        # staging, same filesystem as blobs/
+  scratch/<run-id>/                           # a running VM's scratch disk (§5.3), 0700; never touched by GC
 ```
 
 - **Atomic writes:** write to `tmp/`, `fsync`, then `rename`. A cache entry is written only after its blob is committed and verified.
 - **Cache hits** `stat` the target blob. A missing blob counts as a miss.
-- **GC** takes the exclusive lock, marks from `refs.json`, deletes dangling or unreferenced cache entries **before** blobs, then deletes blobs.
+- **GC** takes the exclusive lock, marks from `refs.json` and from the pinned artifacts (every blob the compiled table of §8.1 names, and the init layers built from its kiln-init binaries), deletes dangling or unreferenced cache entries **before** blobs, then deletes blobs. The pinned roots keep runs that need no network working after GC.
 - **`kiln run`** holds the shared lock only during setup. Once the VMM sandbox holds open file descriptors and bind mounts, a GC that deletes a blob cannot affect the running VM on Linux.
 
 ### 5.3 Run state
 
 - Each run's state lives in `$XDG_RUNTIME_DIR/kiln/<run-id>/`, mode 0700. If `XDG_RUNTIME_DIR` is unset, the fallback is `/tmp/kiln-<uid>/`, which is created 0700 and owner-verified with `O_NOFOLLOW`. That directory is always on a local filesystem.
 - Its contents:
-  - `run.json`: VMM pidfd-derived identity (pid plus start time), `boot_id`, hostname, VMM kind.
+  - `run.json`: VMM pidfd-derived identity (pid plus start time), `boot_id`, hostname, VMM kind, and the run's scratch directory.
   - The VMM API socket and the vsock UDS endpoints.
-  - The scratch disk, unless persisted.
   - `console.log`: a 1 MiB ring.
-- Cleanup only considers entries whose `boot_id` and hostname match the current host and whose process identity is dead. Entries from other boots or hosts are reported but never touched (T7).
+- The scratch disk, unless persisted, is not in that directory, which is usually a tmpfs whose pages would hold the guest's disk in host memory (and count against the VMM's memory limit). It lives in the run's scratch directory, `$KILN_HOME/scratch/<run-id>/` on the store's filesystem, created 0700 under an owner-verified `scratch/` and recorded in `run.json` before it is made. It is removed with the run directory, never by GC. It also holds its own identity, `scratch.json` (`boot_id`, hostname, `kiln`'s and the VMM's identities), written atomically when it is made, because a reboot or logout can empty the run directory's tmpfs first.
+- Cleanup only considers entries whose `boot_id` and hostname match the current host and whose process identity is dead; it removes the scratch directory `run.json` records (only a path of the form `…/scratch/<run-id>`) with the run directory. Entries from other boots or hosts are reported but never touched (T7). `$KILN_HOME/scratch/` is swept too, by each directory's `scratch.json`: a real directory of this user's is removed when it names this hostname and either another boot or dead identities (unless kept); other hosts' directories and those without a readable identity are reported and left alone, and the latter are skipped silently for their first minute (a run may be creating one).
 
 ---
 
@@ -247,11 +331,14 @@ $KILN_HOME/
 
 `kiln convert <ref|path>` runs §6.1–§6.5.
 
-`kiln build -f Dockerfile [--platform …] [--builder NAME] <context>` first produces an OCI layout, then runs `convert` on it:
-- **Producing the layout:**
-  - If `BUILDKIT_HOST` is set, use `buildctl`.
-  - Otherwise use `docker buildx build --output type=oci,tar=false,dest=<tmp>`.
-- **Docker driver check:** `kiln` checks the selected buildx driver first. The `docker` driver without the containerd image store can't export OCI. In that case `kiln` fails with the exact command to create a `docker-container` builder; it never creates one implicitly.
+`kiln build -f Dockerfile [--platform …] [--builder auto|potter|buildkit|podman|buildah] <context>` hands the Dockerfile to a backend and turns the result into a kiln image. kiln has no Dockerfile engine of its own; it dispatches.
+- **Backend selection** (`--builder auto`, the default; the first available wins):
+  1. **potter:** kiln runs the `potter` binary (`potter build -f …`). potter is the only Dockerfile implementation kiln ships with, and it executes `RUN` in a kiln microVM (potter spec §6.3, §9.3). It is a process boundary, never a crate dependency: potter depends on kiln's crates, so the reverse would be a cycle (§4.2).
+  2. **BuildKit:** `buildctl` if `BUILDKIT_HOST` is set, else `docker buildx build --output type=oci,tar=false,dest=<tmp>`. The OCI layout is then converted (§6.1–§6.5).
+  3. **Podman or Buildah:** `podman build` or `buildah build`, exported as an OCI layout and converted. Rootless and daemonless.
+- **No backend:** `kiln build` fails with the list of backends to install.
+- **potter's contract** (arguments kiln passes, the output form, and how `--platform` maps onto potter, which builds only for the host's architecture) is designed in M3c. potter writes its images into `$KILN_HOME` (potter spec §4) and can also emit an OCI layout (`--output oci-layout=DIR`, potter spec §11).
+- **Docker driver check:** for BuildKit through buildx, `kiln` checks the selected buildx driver first. The `docker` driver without the containerd image store can't export OCI. In that case `kiln` fails with the exact command to create a `docker-container` builder; it never creates one implicitly.
 - **Cross-platform builds** need binfmt/QEMU on the BuildKit host. This is documented, and `kiln` detects the failure from the `exec format error` signature.
 
 ### 6.1 Resolve and fetch (verified)
@@ -313,6 +400,7 @@ The VM's device budget is `max_virtio_devices` minus the fixed devices: the init
    - It is wrapped in a tiny erofs containing `/kiln-init` and the empty directories `/proc`, `/sys`, `/dev` and `/kiln`.
    - Cache key: `kiln-init` digest plus `erofsFormatVersion`.
 2. **Kernel:** fetch `profile@version` for the arch by pinned digest.
+   - Each of the two layers is added when the table pins its artifact for the arch, independently; without either the image is provisional (app layers only), `convert` says what `kiln run` will need, and `inspect` shows a `boot:` line. The library's convert makes provisional images unless asked for the pinned layers; `kiln convert` asks.
 3. **Commit:** write the config, manifest and multi-arch index, then update `refs.json` under the lock.
 
 ### 6.6 Determinism rules
@@ -421,12 +509,14 @@ The per-image limit counts the bytes one conversion decompresses. Layers served 
 ### 8.1 Pinned artifacts and run-time verification (T4)
 
 - `kiln` compiles in a table: `(kind ∈ {kernel, init}, profile/version, arch) → digest`.
+  - A pin names the artifact's blob itself (the kernel image, the static kiln-init binary), the registry repository holding it and its size. Fetching is one blob GET by digest, verified; no tag or manifest is resolved. A blob already in the store is used without contacting the registry.
+  - The table pins vmkit's `kernels-6.18.54` release (profile `base`, arm64 and amd64). No kiln-init is released yet (M3c): until then every run names `--init`.
   - Kernels come from `vmkit` releases. `kiln-init` comes from `kiln` releases.
   - Both are also published as OCI artifacts.
 - **At build:** artifacts are fetched and verified against the table.
 - **At run:**
-  - The image's kernel layer digest must equal the pinned digest for the `(profile, version, arch)` in its config.
-  - `--kernel <path>` and `profile: custom` images are refused unless `--allow-custom-kernel` is given.
+  - The image's kernel layer digest must equal the pinned digest for the `(profile, version, arch)` in its config. An image without a kernel layer needs `--kernel`.
+  - `--kernel <path>` and `profile: custom` images are refused unless `--allow-custom-kernel` is given; `--init <path>` (a static kiln-init) is refused unless `--allow-custom-init` is given.
   - The image's init layer is **replaced** with the init layer for the pinned `kiln-init` of the running `kiln`. A warning is printed when the image's init layer differs.
   - `inspect` labels `source` as unverified provenance.
 
@@ -479,11 +569,11 @@ Each VMM runs as the invoking user, started by the `vmkit-sandbox` helper. Ubunt
 
 Further constraints:
 - **File handling:** `vmkit` opens every file with `O_NOFOLLOW` and attaches it by file descriptor (`open_tree`/`move_mount`), so path swaps between check and use are impossible.
-- **In-sandbox paths are fixed** (`/vm/disk/<n>`), so snapshots can be restored from any host-side location (#2).
+- **In-sandbox paths are fixed** (`/vm/disk/<n>`), so snapshots can be restored from any host-side location (sagger).
 - **Seccomp and Landlock:** Firecracker's built-in seccomp stays at its default. Cloud Hypervisor runs with `--seccomp true --landlock` and Landlock rules limited to `/vm` and `/dev/net/tun`, which are set in its `vm.create` configuration. The sandbox has no `/proc` or `/sys`.
 - **Hardening:** `no_new_privs`, all inherited file descriptors closed except those needed, rlimits on file descriptors and processes.
 - **cgroups:** if the systemd user session can create a scope (`systemd-run --user --scope`), the VMM goes into one with memory, CPU and tasks limits from `--memory` and `--cpus`. Otherwise `kiln run` warns once (`vmkit::cgroups_available()`).
-- **API socket:** lives in the 0700 run dir (§5.3). The driver keeps it open for #2, but only the invoking user can reach it.
+- **API socket:** lives in the 0700 run dir (§5.3). The driver keeps it open for sagger, but only the invoking user can reach it.
 
 ### 9.3 Networking (`--net`, T5)
 
@@ -500,29 +590,30 @@ Inside the VM's own net namespace:
   - DNS from the guest to `.1:53` is DNAT'd to pasta's `--dns-forward` address. pasta queries the host's resolver from the host namespace, so loopback stubs such as `127.0.0.53` work.
 - **Egress policy** (`--egress`):
   - **Default `restricted`:** deny `169.254.0.0/16`, `100.64.0.0/10`, RFC 1918, `0.0.0.0/8`, `127.0.0.0/8`, multicast, and the host's own addresses; allow the rest.
-  - `--egress allow=<cidr>`: adds exceptions.
+  - `--egress allow=<cidr>`: adds exceptions (repeatable). pasta copies the host's outbound address (the one on its default route) into the namespace, so the guest can never reach it: an exception that is only that address is refused before boot, and a wider one that includes it is warned about. The host's other addresses can be reached through an exception.
   - `--egress deny-all`: blocks everything except DNS and `allow=` exceptions.
   - `--egress open`: removes the default denies, with a warning.
   - The guest cannot modify the policy; it lives outside the guest.
-- **Port forwarding:** `-p HOST:GUEST[/tcp|udp]` via `pasta` port forwarding plus DNAT to `.2`, on both of pasta's paths: through its interface (prerouting), and spliced from host loopback as a local connection to the namespace's own address (nat output, with `route_localnet` on `tap0`).
+- **Port forwarding:** `-p [ADDRESS:]HOST:GUEST[/tcp|udp]` (repeatable). The host address `pasta` listens on defaults to `127.0.0.1`, so a published port stays on the host unless an address is given (`0.0.0.0` for all); a host port is published once per protocol whatever its addresses, since the namespace sees only the port. The image owns its listen port: the app must listen on `0.0.0.0` or the guest's address, and a forward to a guest listening on `127.0.0.1` ends at once. Forwarding is `pasta` port forwarding plus DNAT to `.2`, on both of pasta's paths: through its interface (prerouting), and spliced from host loopback as a local connection to the namespace's own address (nat output, with `route_localnet` on `tap0`).
 - **Guest addressing** is delivered in the config message (§9.5). The guest configures `eth0` over netlink.
 
 ### 9.4 Scratch disk and `--persist`
 
-- **Template.** `assets/ext4-template.img.zst` is created by a committed script with pinned e2fsprogs:
+- **Template.** `crates/kiln-image/assets/ext4-template.img.zst` is created by the committed script `assets/make-ext4-template.sh` with pinned e2fsprogs:
   - `mke2fs -t ext4 -b 4096 -I 256 -i 65536 -O meta_bg,^resize_inode -U <fixed> -E hash_seed=<fixed>`, 64 MiB.
   - The template is committed and embedded in `kiln` (a few KB compressed), so no `mkfs` is needed anywhere.
 - **Per run:** the template is decompressed to a sparse file in the run dir and extended to `--disk` (default 4 GiB).
 - **In the guest** (§9.6 stage 3): mount with `noinit_itable`, **then** grow online with `EXT4_IOC_RESIZE_FS` on an fd for the mount point.
 - **`--persist <path>`:**
-  - The disk lives at `<path>`, with a host-side sidecar `<path>.kiln.json` recording the image manifest digest, the ordered layer digests and the size.
-  - **Different image:** reuse with a different image or layer set is refused unless `--persist-reset` (recreate) or `--persist-force` (accept the risk, with a warning) is given. overlayfs forbids offline lower-layer changes when `xino` is on.
-  - **Size:** the disk is never truncated; a `--disk` smaller than the current size is refused.
+  - The disk lives at `<path>`, with a host-side sidecar `<path>.kiln.json` recording the image manifest digest and the ordered layer digests. It is written once the guest is running: a run that fails to boot leaves the old sidecar, or none when it created or recreated the disk (a recreate removes the old sidecar first). A sidecar from a newer kiln is refused even with `--persist-force`; only `--persist-reset` replaces it.
+  - **Different layers:** reuse with a different ordered set of app layers is refused unless `--persist-reset` (recreate) or `--persist-force` (accept the risk, with a warning) is given; the two exclude each other. overlayfs forbids offline lower-layer changes when `xino` is on. The same layers under another manifest (a changed env or cmd) are reused: the sidecar records the new manifest, with a note. A disk without a readable sidecar is refused unless reset or forced.
+  - **Size:** the disk is never truncated; a `--disk` smaller than the current size is refused; a larger one grows it.
+  - **One run at a time:** the disk is locked (`flock`) first, and inspected and decided on under the lock, for the whole run (and for as long as `kiln` runs when it gave up on a VMM that may still use it). It replaces the run's scratch directory (§5.3), so no cleanup touches it; symlinks are refused.
   - The host never parses the guest-written ext4.
 
 ### 9.5 Control protocol (`kiln-proto`, normative in `docs/format.md`, T9)
 
-**Transport:** hybrid vsock. The guest connects to host CID 2. The VMM maps guest port `P` to the host UDS `/vm/sock/v.sock_P`, which is `<run-dir>/v.sock_P` on the host.
+**Transport:** hybrid vsock. The guest connects to host CID 2. The VMM maps guest port `P` to the host Unix socket `<vsock socket>_P`, where `<vsock socket>` is the path vmkit reports for the VM (`Vm::vsock_socket()`); kiln listens on each port's socket before boot.
 
 | Port | Stream | Direction |
 |---|---|---|
@@ -539,20 +630,23 @@ Inside the VM's own net namespace:
 | Direction | Message | Meaning |
 |---|---|---|
 | guest → host | `Hello { protocol }` | First message. The host replies with `Config` **once per run**. A second `Hello` (e.g. after a guest reset) makes the host kill the VM. |
-| host → guest | `Config { … }` | Process overrides, `stopSignal`, `tty`, `interactive`, `hostname`, network, `layers`, `scratch`, `exitMethod`, `shutdownGrace`. |
+| host → guest | `Config { … }` | Process overrides, `stopSignal`, `tty`, `interactive`, `hostname`, network, `layers`, `scratch`, `exitMethod`, `shutdownGraceSecs`. |
 | guest → host | `Stage { n }` | Progress, for diagnostics. |
 | guest → host | `Running` | Workload started. Ends the boot timeout. |
-| guest → host | `Exited { signaled, code }` | Main process ended. Sent after its stdout and stderr hit EOF. |
+| guest → host | `Exited { signaled, code, service? }` | The run ended: the main process's status, or (version 2) that of the service named in `service`, whose exit ended the run. Sent after stdout and stderr hit EOF. |
 | guest → host | `InitFailed { stage, errno?, message }` | Init failure (sanitised on display). |
-| host → guest | `Shutdown { graceSecs }` | Send `stopSignal` to the main process, then SIGKILL everything after the grace period. |
+| host → guest | `Shutdown { graceSecs }` | Stop the main process with `stopSignal`, then (version 2) the services in reverse start order, the grace period split between them; SIGKILL everything when it ends (§9.6). |
 | host → guest | `Signal { sig }` | Forward a signal to the main process. |
 | host → guest | `WindowSize { rows, cols }` | `-t` mode only. |
 
+This is protocol version 1. Version 2 (M3d) adds `Config.services`, `Config.readyTimeoutMs` and `Exited.service` (§9.8). Later versions add to it under the rules in §9.8.
+
 **Host-side exit codes:**
 - The app's exit code, or `128 + signal`.
-- **125:** `kiln` or infrastructure error, including boot timeout or the VM ending without `Exited`.
-- **126:** entrypoint not executable.
-- **127:** entrypoint not found.
+- **125:** `kiln` or infrastructure error, including boot timeout, the VM ending without `Exited`, and any init failure other than the two below (for example an unknown user).
+- **137:** the user killed the VM (a second SIGINT, `Ctrl-]` `k`) before the app exited, as `docker kill`.
+- **126:** the entrypoint was found but could not be executed (`EACCES` or `EISDIR` from exec).
+- **127:** the entrypoint was not found (`ENOENT` from exec).
 
 The numbers match Docker. These codes are guest-asserted (§3).
 
@@ -574,27 +668,30 @@ Each stage reports `Stage { n }`. A failure reports `InitFailed` when the contro
    - **No** tmpfs on `/run` or `/tmp`, matching Docker.
    - `pivot_root(".", ".")`, then detach the old root.
 5. **Identity and network:**
-   - Write `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf` as regular files, replacing any symlink at those paths (unlink, then `O_CREAT|O_NOFOLLOW`).
+   - Write `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf` as regular files, replacing any symlink at those paths (unlink, then `O_CREAT|O_NOFOLLOW`). Without a network (or DNS servers), `resolv.conf` names `127.0.0.1`, as Docker's `--network none` does, so lookups fail at once.
    - Bring up `lo`. Configure `eth0` over netlink when there's a network.
 6. **Process:**
    - **User:** resolve `user` against the image's `/etc/passwd` and `/etc/group`. Numeric `uid[:gid]` works without entries.
    - **Groups:** call `setgroups` with the user's supplementary groups.
    - **Environment:** the image env plus overrides. Default `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` if unset; `HOME` from passwd, else `/`; `HOSTNAME`.
    - **Stdio:** pipes relayed to ports 1025–1027, or in `-t` mode a pty from devpts whose slave becomes the main child's controlling tty (`setsid` + `TIOCSCTTY`), relayed to port 1028.
+   - **Services** (protocol version 2): before the main process, each of `Config.services` is started in order with its own user, groups, environment and working directory, sharing the main process's stdout and stderr (with `-t`, the pty, but not as its controlling tty), and init waits until it is ready (a connection to its Unix socket or to `127.0.0.1:<port>` accepted, or at once with `none`) before the next, all within `Config.readyTimeoutMs`. A service not ready in time, exiting first or not executable fails this stage, naming it.
    - `chdir`, `exec`, then send `Running`.
 7. **Supervise:**
    - Reap all children.
    - Handle `Shutdown`, `Signal` and `WindowSize`. SIGINT (from Ctrl-Alt-Del) is treated as `Shutdown`.
-   - When the main process exits: drain stdout and stderr to EOF, send `Exited`, SIGKILL any remaining processes, `syncfs`, remount the upper read-only on a best-effort basis (EBUSY ignored), and exit via `exitMethod`.
+   - With services, the first of the processes to exit, or `Shutdown`, ends the run: the others are stopped in reverse start order (the main process first), each with its own stop signal, the grace period split evenly between those still to stop; one still running when its share ends gets SIGKILL and the next gets its stop signal. `Exited` carries the status of the process whose exit ended the run (naming it when it was a service), or after `Shutdown` the main process's. Signals the host forwards go to the main process. Once all of them have exited, the rest follows as below.
+   - When the main process exits: SIGKILL and reap every remaining process, drain stdout and stderr to EOF, `syncfs`, remount the scratch disk read-only on a best-effort basis (EBUSY ignored), send `Exited`, and exit via `exitMethod`. `Exited` therefore means the scratch disk is safe: a VM killed after it keeps every write (`--persist` relies on this); the host still never kills on `Exited` itself. Killing the rest before draining matches Docker (a container ends with its PID 1) and keeps a background process that holds stdout from blocking the drain forever.
+   - Stop signals and forwarded signals are numbers 1–31; images whose `STOPSIGNAL` is a real-time signal are refused with an error.
 
 ### 9.7 `kiln run`
 
 ```
 kiln run <ref> [--vmm firecracker|cloud-hypervisor] [--cpus N] [--memory MiB]
                [-i] [-t] [--disk SIZE] [--persist PATH [--persist-reset|--persist-force]]
-               [--net [--egress POLICY]... [-p HOST:GUEST[/proto]]...]
+               [--net [--egress POLICY]... [-p [ADDRESS:]HOST:GUEST[/proto]]...]
                [--env K=V]... [--stop-timeout SECS] [--boot-timeout SECS]
-               [--allow-custom-kernel] [-- CMD ARGS...]
+               [--kernel PATH] [--allow-custom-kernel] [--init PATH] [--allow-custom-init] [-- CMD ARGS...]
 ```
 
 - **stdio:** without `-i`, guest stdin gets EOF immediately. Pipes are binary-safe, and EOF propagates, so `echo hi | kiln run -i img -- cat` exits.
@@ -604,8 +701,69 @@ kiln run <ref> [--vmm firecracker|cloud-hypervisor] [--cpus N] [--memory MiB]
   - Second SIGINT: kill the VMM.
 - **The VMM never touches the terminal.** Its stdin is `/dev/null` and the serial console goes to `console.log`. A sanitised tail of `console.log` is printed when the run fails.
 - **`--boot-timeout`** (default 30 s) bounds the time from VMM start to `Running`.
-- **Device budget:** checked before boot (§6.4).
+- **Services** (M3d) come from the image only; `--env` values reach them as well as the main process. When a service's exit ends the run, `kiln run` exits with its status and prints which service it was (§9.8).
+- **Device budget:** checked before boot; the remedy offered is `kiln convert --max-layers N` (§6.4).
 - **On macOS:** `run` exits with instructions for the Lima template (§10).
+
+### 9.8 Control protocol growth
+
+kiln-proto is extended, never replaced. Every host that drives a kiln guest (`kiln run`, potter's VM executor, `kiln-shim`, later sagger) speaks kiln-proto to `kiln-init`. None of them adds a second protocol or a second PID 1.
+
+**Versioning** (ruling, rev 2.8; it keeps version 1's `Hello` handling in `docs/format.md`):
+1. Each milestone below that changes the protocol bumps the version once: 2, 3, … in the order they land. A version only adds things: message types (new type numbers), optional `Config` fields and new values. It never changes or removes what an earlier version defines.
+2. The guest's `Hello { protocol }` carries the highest version it implements. A host supports every version from 1 up to its own. A version higher than the host's still ends the VM (125), as in version 1.
+3. The host sends only messages, fields and values that the guest's version defines. If the run needs something the guest's version lacks (for example `services` or build mode), the host ends the VM instead of sending `Config` and reports 125 with an error naming the version required.
+4. The guest keeps version 1's strict decoding. An unknown type, field or value is a protocol error (`InitFailed`, then the VM ends), so an older `kiln-init` refuses an addition instead of ignoring it.
+
+kiln-init is pinned to the kiln release that boots it (§8.1), and potter and `kiln-shim` use that pinned kiln-init, so these rules fire only on mixed installs. Each addition stays inside T9: messages are size-bounded and schema-validated, and every value the guest sends is guest-asserted (§3).
+
+**Planned extensions.** Each is specified here only as far as its source spec specifies it. Anything marked "designed in" is decided in that milestone's plan and then made normative in `docs/format.md`. Wire names follow `docs/format.md`'s conventions (camelCase keys); the source specs' spellings are notation.
+
+| Extension | Milestone | Defined in |
+|---|---|---|
+| `services` | M3d | potter spec §4, §6.1.1 |
+| Build mode | M3e | potter spec §9.3 |
+| Exec, `Stats`, `OomKill`, `FileUpdate` | M4 (shim S1) | shim spec §4.1, §4.2, §4.5 |
+
+**`services` (M3d):**
+- `Config.services: [Service{name, process, ready, stop_signal}]`, where `ready` is `unix:<path> | tcp:<port> | none`.
+- Services start in order, each waiting for the previous one's readiness. The main process starts last.
+- If any of them exits, the rest are stopped in reverse order with their `stop_signal`, within the shutdown grace period. The VM's exit status is that of the first process to exit.
+- Signals the host delivers go to the main process. Every service shares the main process's stdout and stderr.
+- Users: potter's PHP web images run php-fpm as a service (`ready = unix:/run/php/fpm.sock`) with nginx as the main process (potter spec §6.1.1); `kiln-shim` runs sidecars this way (shim spec §4.4).
+- Designed in M3d (rev 2.11, normative in `docs/format.md`): a service's `process` is the main process's without `stopSignal`, and an image declares services with its `dev.kiln.services` label (§5.1); readiness is bounded by `Config.readyTimeoutMs`, which the host derives from its boot timeout; `Exited.service` names a service whose exit ended the run; `kiln run` takes services from the image only, passes them its `--env` values and names a service that ended the run. Stopping splits the grace period between the processes still to stop (ruling 3), and a config with services has `schemaVersion` 2 (ruling 1).
+
+**Build mode (M3e):**
+- `Config.mode = Run | Build`. In build mode, `Config` carries the layer and mount table and limits.
+- Messages: the guest sends `Ready`. For each step the host sends `RunStep{id, argv|shell, env, workdir, user, lowers_added, mounts, secrets, timeout_ms}`, where `lowers_added` names the pending inputs-layer disks to stack before the step runs. The guest streams the step's stdout and stderr, then sends `Exited{code|signal}`. On exit 0 it seals the step and sends `StepSealed{id, offset, len, sha256, entries}`.
+- Secrets arrive inline. kiln-init writes them to a tmpfs that is never part of the upper.
+- kiln-init build mode:
+  - runs the step;
+  - seals it: kills the step's process group and any stragglers, then unmounts the root overlay;
+  - converts the upper into an OCI tar diff (char 0/0 whiteouts become `.wh.<name>`, and `trusted.overlay.opaque` becomes `.wh..wh..opq`);
+  - appends the diff to the raw output disk at the next 4 KiB-aligned offset;
+  - remounts with the sealed upper as the topmost lower and a fresh upper. Mounts use per-layer `lowerdir+` or mount(2), never one long `lowerdir` string.
+- The host trusts none of `StepSealed`'s values. potter reads the range itself, checks its bounds, hashes it, and ingests it through kiln's untrusted tar path (potter spec §9.3, P4).
+- Designed in M3e: the session order (§9.5's `Hello`-first rule stands; see the note below), the build-mode device order (output disk, cache-mount disks) against §9.1, how a step's stdout and stderr are carried, how a step's `Exited` is told apart from the main process's, and the size bound on `RunStep`.
+
+**Exec, guest stats and file updates (M4):**
+- **Exec:**
+  - Host → guest `ExecStart{exec_id, argv, env, cwd, user, tty, window}`. Guest → host `ExecStarted{exec_id, pid}`, then `ExecExited{exec_id, code|signal}`.
+  - Stdio, `Signal` and `WindowSize` gain a `proc` field, `main | exec:<id>`. The main process stays `main`, so its messages are unchanged on the wire.
+  - At most 32 concurrent execs per VM (configurable), each with stdio bounded like the main process's.
+  - Exec ids are host-chosen and validated. The guest can report only on ids the host created.
+  - An exec runs in the guest's root with the image env merged with `env`. `user` follows kiln-init's id rules. Execs are killed when the main process exits.
+- **Stats:** guest → host `Stats{mem_total, mem_available, mem_rss_main, cpu_usage_ns, pressure{cpu,mem,io}}`, every 10 s by default and on request, read from `/proc/meminfo`, `/proc/stat` and PSI.
+- **OOM:** guest → host `OomKill{pid, proc, comm}` when the guest kernel OOM-kills a process. kiln-init watches `/proc/vmstat` `oom_kill` and the kernel log. Stats and OOM reports are used for reporting only (§3).
+- **Files:** projected volumes are delivered as files in `Config` at start. Updates arrive as `FileUpdate{path, content, mode}`, and kiln-init reproduces kubelet's atomic symlink swap. Their size is bounded.
+- Designed in M4:
+  - how exec stdio is carried (version 1 relays stdio as raw vsock streams on ports 1025–1028, not as messages);
+  - the stats request message;
+  - the `Config` field for initial files, and its bound against the 64 KiB frame;
+  - the `Config.network` additions the shim needs for the pod's IP, routes and DNS (shim spec §3.2);
+  - the dm-verity root hashes the shim passes to kiln-init (shim spec §3.1, S4).
+
+**Note on potter spec §9.3:** it has the host send `Config{mode: Build}` and the guest reply with `Hello`, then `Ready`. Under §9.5 the guest's `Hello` always comes first and the host answers it with `Config`. M3e keeps that order unless the user decides otherwise.
 
 ---
 
@@ -614,7 +772,8 @@ kiln run <ref> [--vmm firecracker|cloud-hypervisor] [--cpus N] [--memory MiB]
 - `lima/kiln.yaml`: `vmType: vz`, `nestedVirtualization: true` (needs an M3 or later and macOS 15 or later), Firecracker, Cloud Hypervisor and `pasta` installed, and the user in the `kvm` group.
 - **The macOS store is mounted read-only** into the VM. The Linux side uses its own local `$KILN_HOME` and its own `$XDG_RUNTIME_DIR`. Unix sockets and flock aren't reliable on Lima shared mounts.
 - **`kiln import --from-store <path> <ref>`** copies an image's blobs into the local store by digest, verifying each one.
-- The template sets `KILN_IMPORT_FROM` to the read-only mount, so `kiln run <ref>` imports missing blobs automatically. Only changed layers are copied.
+- The template sets `KILN_IMPORT_FROM` to the read-only mount, so `kiln run <ref>` imports the image from it whenever that store has the name: only missing blobs are copied, and the image is tagged again every time, so the newest convert on macOS is what runs.
+- Ports published on the VM's `127.0.0.1` (the `-p` default) reach the Mac's `localhost` through Lima's forwarding of loopback listeners; the template needs no `portForwards` entry.
 
 ---
 
@@ -657,7 +816,7 @@ One parametrised suite runs against both backends, using a test guest (the kerne
 - An image with implicit parents (built with `crane append`)
 - More than 10 layers (squash)
 - Whiteout and opaque cases, an empty layer
-- A Dockerfile build
+- A Dockerfile build through each backend (§6): potter, BuildKit, and Podman or Buildah
 - Each run checks: exit codes, stdio EOF and binary safety, `-t` mode, graceful shutdown within `--stop-timeout`, the `--persist` mismatch refusal, and the `--disk` shrink refusal.
 
 ### 11.5 Security tests
@@ -693,13 +852,22 @@ One parametrised suite runs against both backends, using a test guest (the kerne
 
 ## 12. Milestones (one implementation plan each)
 
-**M1 and M2 are independent and can proceed in parallel. M3 depends on both.**
+**Order:** M1 and M2 are independent. M3a depends on both, and M3b on M3a. M3c and M3d each depend on M3b. M3e depends on M3d. M4's phases depend as listed below. sagger and sherd come after, and each needs its own spec first.
 
-| Milestone | Repo | Contents | Needs KVM |
-|---|---|---|---|
-| **M1: convert** (planned as **M1a**, `kiln-erofs`, and **M1b**, store, registry, OCI inputs, pipeline and CLI) | `kiln` | `kiln-store`, `kiln-registry`, `kiln-oci`, `kiln-erofs` (writer, reader, profile, semantics, limits), §6.1–6.4 and §6.6, the oracle tests, the hostile-registry tests, and the CLI `convert`/`pull`/`push`/`import`/`inspect`/`ls`/`gc`/`bench`. Output is the app-layer set plus a provisional manifest without kernel and init layers. | No |
-| **M2: vmkit** | `vmkit` | `Vmm` trait (snapshot/restore shapes only), Firecracker and Cloud Hypervisor drivers, `sandbox`, `net` (tap, nftables, `pasta`), `Capabilities`, the kernel profiles pipeline, the contract suite, and the hostile-guest network tests (with the busybox guest). | Yes |
-| **M3: run** | `kiln` | `kiln-proto`, `kiln-init`, the ext4 template, §6.5, §8, §9, `kiln run`, `kiln build`, the Lima template, the end-to-end matrix, the remaining security tests, the release pipeline and the docs. | Yes |
+| Milestone | Repo | Contents | Needs KVM | Status |
+|---|---|---|---|---|
+| **M1: convert** (planned as **M1a**, `kiln-erofs`, and **M1b**, store, registry, OCI inputs, pipeline and CLI) | `kiln` | `kiln-store`, `kiln-registry`, `kiln-oci`, `kiln-erofs` (writer, reader, profile, semantics, limits), §6.1–6.4 and §6.6, the oracle tests, the hostile-registry tests, and the CLI `convert`/`pull`/`push`/`import`/`inspect`/`ls`/`gc`/`bench`. Output is the app-layer set plus a provisional manifest without kernel and init layers. | No | Done |
+| **M2: vmkit** | `vmkit` | `Vmm` trait (snapshot/restore shapes only), Firecracker and Cloud Hypervisor drivers, `sandbox`, `net` (tap, nftables, `pasta`), `Capabilities`, the kernel profiles pipeline, the contract suite, and the hostile-guest network tests (with the busybox guest). | Yes | Done |
+| **M3a: guest** | `kiln` | `kiln-proto` (protocol version 1), `kiln-init`, the ext4 template, the init layer (§6.5), the guest side of §9, the boot suite on both VMMs, and the control protocol in `docs/format.md`. | Yes | Done (PR #5) |
+| **M3b: run** (planned as **M3b-1**, the runtime and CLI, and **M3b-2**, pinned artifacts, `--persist`, `--net` and Lima) | `kiln` | `kiln run` (§9.7): the host runtime, its CLI flags, host signal handling and console tails; kernel and init layers in images with their pins and run-time verification (§6.5, §8.1); the Lima template (§10). | Yes | Planned (M3b-1: `docs/superpowers/plans/2026-10-06-m3b1-run.md`; M3b-2: `docs/superpowers/plans/2026-10-07-m3b2-artifacts-persist-net.md`) |
+| **M3d: services** | `kiln` | kiln-proto and `kiln-init` `services` (§9.8), as a protocol version bump. Needed by potter P2 (PHP web images). | Yes | Planned (`docs/superpowers/plans/2026-10-11-m3d-services.md`) |
+| **M3c: build** | `kiln` | `kiln build` backend dispatch: potter, BuildKit, Podman or Buildah (§6). The end-to-end matrix (§11.4), the kernel and init swap tests (§11.5), the release pipeline and the docs (§15). | Yes | Planned |
+| **M3e: build mode** | `kiln` | kiln-proto `Config.mode = Build`, the build-mode messages and `kiln-init` build mode (§9.8), as a protocol version bump. Lands with potter P4 (the VM executor). | Yes | Planned |
+| **M4: `kiln-shim`** (slip) | `kiln` | The containerd shim, in the phases of the shim spec (§8 there): **S0** a KVM node-group spike, nested C8i against metal, with kiln's bench and end-to-end matrix (after M3b); **S1** kiln-proto exec, `Stats`, `OomKill` and `FileUpdate` (§9.8; after M3a); **S2** media type alignment with containerd 2.3's erofs snapshotter, plus a test (§5.1; after M1); **S3** `kiln-shim`: lifecycle, networking, logs, exec, stats, projected volumes (after S1, S2 and M3b); **S4** resize, verity, init containers (after S3; uses the vmkit hotplug capabilities in §4.1). The shim spec's S5, a Laravel Cloud canary, is a rollout step, not kiln work. | Yes | Planned |
+| **sagger** (agent sandbox) | `kiln`, `vmkit` | Snapshot, restore and fork on the `Vmm` trait shapes fixed in M2. | Yes | Needs a spec |
+| **sherd** and **raku** | `kiln` (sherd), `vmkit` (raku) | Snapshot artifacts in OCI registries with chunk dedup (sherd); lazy restore below the VMM (raku). | Yes | Needs a spec |
+
+potter's own milestones (P1–P7) are in the potter spec §15. Its P2 needs M3d and vmkit's generalised `sandbox` and tap-less `net` (§4.1); its P4 needs M3b and M3e; its P5 provides the Dockerfile frontend that M3c's potter backend runs.
 
 ---
 
@@ -723,18 +891,18 @@ Each item has a defined fallback, so none blocks the design.
 | Cloud Hypervisor's vsock uses the same `<uds>_<port>` hybrid scheme as Firecracker for guest-initiated connections. | M2 | A per-driver port-to-path mapping inside `vmkit`. |
 | Cloud Hypervisor exits on guest power-off on both arches (ACPI S5 on x86_64, PSCI SYSTEM_OFF on aarch64). Source-level reading suggests yes. | M2 | Treat a guest halt detected by the event monitor as the end of the VM. |
 | Cloud Hypervisor aarch64 works under Lima nested virtualization on Apple Silicon (GIC/ITS). | M2 | Local aarch64 development is Firecracker-only. Cloud Hypervisor aarch64 is tested on the bare-metal runner. |
-| The ext4 template with the §9.4 parameters grows online to ≥ 64 GiB. | M3 | Several template sizes embedded, picking the nearest. |
+| The ext4 template with the §9.4 parameters grows online to ≥ 64 GiB. | M3a | Several template sizes embedded, picking the nearest. **Result (M3a):** true on Firecracker. On Cloud Hypervisor 53 under nested virtualization, growth past about 8 GiB hangs: CH advertises WRITE_ZEROES without a sparse backend. The default 4 GiB disk works on both; re-check on newer CH and bare metal. |
 | Crate names `kiln-*` and `vmkit` are free on crates.io. | M1 | Rename before first publish. |
 
 ---
 
 ## 15. Release and docs
 
-- **Binaries:** macOS arm64 and x86_64; Linux arm64 and x86_64 (static musl).
+- **Binaries:** macOS arm64 and x86_64; Linux arm64 and x86_64 (static musl). From M4, `kiln-shim` for Linux arm64 and x86_64.
 - **Artifacts:** `kiln-init` binaries and their pinned digests are published from the `kiln` release pipeline; kernels from `vmkit`'s.
 - **Docs:**
   - `README.md`: quickstart, building on the Mac, running in Lima.
-  - `docs/format.md`: normative image format, erofs profile and control protocol.
+  - `docs/format.md`: normative image format, erofs profile and control protocol, with every protocol version (§9.8).
   - `docs/architecture.md`.
   - `docs/security.md`: the threat model, sandbox and egress defaults.
 - **License:** Apache-2.0.
