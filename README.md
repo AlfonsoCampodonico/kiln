@@ -27,7 +27,7 @@ kiln gc
 - `--platform os/arch[/variant]`: repeatable; the default is the host's. Several platforms produce a multi-arch index.
 - `--tag NAME`: the name in the store (default: the normalised reference, such as `docker.io/library/php:8.4-cli`, or `<file name>:latest` for a path).
 - `--ref NAME`: which image to take when a local source holds several. References compare normalised, so `php:8.4-cli` matches `docker.io/library/php:8.4-cli`.
-- `--max-layers N` (default 10): more app layers than this squashes the bottom ones into one.
+- `--max-layers N` (default 10): with `n` app layers and `n > N`, the bottom `n - N + 1` are squashed into one, leaving exactly `N`. The kernel and init layers don't count. Each app layer becomes a virtio-blk disk at run time, so `N` plus the init and scratch disks, vsock and the NIC must fit the VMM's devices (Firecracker: 17 on x86_64, 92 on aarch64; Cloud Hypervisor: 30 usable). The squashed layer is cached under the ordered erofs digests it merges, and the layers above it are converted against the unsquashed stack first, so they are the same blobs with or without the squash (`crates/kiln-image/tests/squash.rs`).
 - `--json`: a machine-readable summary.
 
 An argument that names an existing path is a local source; anything else must be an image reference. An argument starting with `./`, `../`, `/` or `~`, or ending in `.tar`, `.tar.gz` or `.tgz`, is always taken as a local path, and a full reference such as `docker.io/library/php` forces the registry. A second convert of the same image is served from the layer cache and costs the registry one manifest HEAD, which Docker Hub does not count against its pull limit. Changing a base layer reconverts only the layers that inherit attributes from it.
