@@ -49,9 +49,9 @@ fn env() -> Option<Env> {
     }
 }
 
-const APPLETS: [&str; 19] = [
+const APPLETS: [&str; 20] = [
     "cat", "dd", "echo", "env", "grep", "hostname", "httpd", "id", "kill", "ls", "nc", "nslookup", "sh", "sleep",
-    "stty", "test", "true", "tty", "wc",
+    "stty", "test", "timeout", "true", "tty", "wc",
 ];
 
 /// busybox, its applets, and an extra file `marker` with `content`.
@@ -719,6 +719,23 @@ fn with_boot_layers(store: &kiln_store::Store, from: &str, tag: &str, kernel: &P
     store.set_ref(tag, &manifest).unwrap();
 }
 
+/// A kernel no kiln pins, for the cases where a `base` kernel layer must be
+/// refused: the test kernel with a byte appended. The test kernel itself may be
+/// the pinned one: vmkit's kernel build is reproducible, so a CI job that builds
+/// it at vmkit's pinned revision gets the very blob kiln pins (x86_64 does).
+fn unpinned_kernel(f: &Fixture) -> PathBuf {
+    let mut kernel = std::fs::read(&f.env.kernel).unwrap();
+    kernel.push(0);
+    let digest = kiln_store::Digest::of(&kernel).to_string();
+    assert!(
+        kiln_image::artifacts::PINS.iter().all(|p| p.digest != digest),
+        "{digest} is pinned"
+    );
+    let path = f._dirs[0].path().join("unpinned-kernel");
+    std::fs::write(&path, kernel).unwrap();
+    path
+}
+
 /// An image with boot layers (spec §8.1, §11.5): a `base` kernel this kiln does
 /// not pin is refused, a `custom` one boots with --allow-custom-kernel, and the
 /// image's init layer never boots (here it wraps busybox, which cannot be kiln's
@@ -727,8 +744,9 @@ fn with_boot_layers(store: &kiln_store::Store, from: &str, tag: &str, kernel: &P
 fn image_boot_layers_are_verified_and_init_replaced() {
     let Some(f) = fixture() else { return };
     let store = kiln_store::Store::open(&f.store).unwrap();
-    for (tag, profile) in [("pinned", "base"), ("custom", "custom")] {
-        with_boot_layers(&store, "busybox", tag, &f.env.kernel, profile, &f.env.busybox);
+    let unpinned = unpinned_kernel(&f);
+    for (tag, kernel, profile) in [("pinned", &unpinned, "base"), ("custom", &f.env.kernel, "custom")] {
+        with_boot_layers(&store, "busybox", tag, kernel, profile, &f.env.busybox);
     }
     let run = |more: &[&str]| {
         f.kiln()
@@ -759,9 +777,9 @@ fn image_boot_layers_are_verified_and_init_replaced() {
     );
 }
 
-/// The boot layers `convert` adds (spec §6.5), from pins for the test kernel and,
-/// as the image's "kiln-init", busybox: the image runs with the custom flags, and
-/// its init layer is replaced.
+/// The boot layers `convert` adds (spec §6.5), from pins for a kernel this kiln
+/// does not pin and, as the image's "kiln-init", busybox: the kernel layer is
+/// refused, the image runs with the custom flags, and its init layer is replaced.
 #[test]
 fn converted_boot_layers_are_replaced_or_refused_at_run() {
     let Some(f) = fixture() else { return };
@@ -783,7 +801,7 @@ fn converted_boot_layers_are_replaced_or_refused_at_run() {
         }
     };
     let boot = Boot {
-        kernel: Some(put(&f.env.kernel, ArtifactKind::Kernel, "base", "6.18.54")),
+        kernel: Some(put(&unpinned_kernel(&f), ArtifactKind::Kernel, "base", "6.18.54")),
         init: Some(put(&f.env.busybox, ArtifactKind::Init, "kiln-init", "0.0.1")),
     };
     let layout = f._dirs[0].path().join("busybox");
@@ -1170,14 +1188,30 @@ fn egress_policy_and_the_resolver_without_a_network() {
     if !net_enabled() {
         return;
     }
+    // The listener closes a connection once the client has (nc closes its side at
+    // the end of its stdin), as the public server below does. A server that writes
+    // and closes at once races the guest's handshake through pasta: older pasta
+    // (Ubuntu 24.04's) can lose that FIN, and nc, which has no read timeout,
+    // then waits forever.
     let server = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
     let hport = server.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for c in server.incoming().flatten() {
-            let _ = (&c).write_all(b"host\n");
+            std::thread::spawn(move || {
+                let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
+                let _ = std::io::copy(&mut &c, &mut std::io::sink());
+            });
         }
     });
-    let probe = |addr: String| format!("nc -w 3 {addr} </dev/null >/dev/null 2>&1 && echo reached || echo blocked");
+    // A probe either connects (reached), is refused or times out connecting
+    // (blocked), or connects and never ends (hung: a failure either way, but a
+    // quick one that says so).
+    let probe = |addr: String| {
+        format!(
+            "timeout 15 nc -w 3 {addr} </dev/null >/dev/null 2>&1; \
+             case $? in 0) echo reached;; 143) echo hung;; *) echo blocked;; esac"
+        )
+    };
     let o = f.output(&[
         "--net",
         "busybox",
