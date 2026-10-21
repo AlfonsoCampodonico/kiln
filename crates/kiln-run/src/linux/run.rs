@@ -114,6 +114,7 @@ pub fn vm_spec(
         memory_mib,
         vsock: Some(VsockSpec { guest_cid: GUEST_CID }),
         net,
+        tap: None,
         console_log: console_log.to_path_buf(),
         run_dir: run_dir.to_path_buf(),
     }
