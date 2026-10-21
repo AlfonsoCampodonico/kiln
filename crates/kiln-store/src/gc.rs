@@ -315,7 +315,8 @@ mod tests {
 
     /// A config naming another image's manifest as its "source" must not stop gc
     /// from walking that image: refs pop in reverse name order, so `zz-evil` comes
-    /// first.
+    /// first. `sourceLayers` is past the victim's one layer, so only walking the
+    /// victim keeps that layer.
     #[test]
     fn a_hostile_source_pointer_cannot_hide_another_image() {
         let dir = tempfile::tempdir().unwrap();
@@ -332,7 +333,7 @@ mod tests {
         let evil_config = put(serde_json::json!({
             "erofsFormatVersion": 1,
             "source": {"manifestDigest": victim.to_string()},
-            "base": {"manifestDigest": victim.to_string(), "layers": 0, "sourceLayers": 0},
+            "base": {"manifestDigest": victim.to_string(), "layers": 0, "sourceLayers": 1},
         }));
         let evil = put(serde_json::json!({"config": {"digest": evil_config.to_string()}, "layers": []}));
         s.set_ref("zz-evil:1", &evil).unwrap();
