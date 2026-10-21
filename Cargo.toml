@@ -6,7 +6,7 @@ members = ["crates/*"]
 # vmkit with TapAttach (vmkit PR #13, kiln's containerd shim), on vmkit main after guest
 # IPv6 egress (vmkit PR #12) and snapshot, restore and lazy restore (vmkit PR #11).
 [workspace.dependencies]
-vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "b5834cbe070fdc94c2b638c36858823f778494f8" }
+vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "b1baf3a0712209dbe7c7659186ad02b702524d3e" }
 
 [workspace.package]
 edition = "2024"

@@ -3178,7 +3178,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vmkit"
 version = "0.1.0"
-source = "git+https://github.com/AlfonsoCampodonico/vmkit?rev=b5834cbe070fdc94c2b638c36858823f778494f8#b5834cbe070fdc94c2b638c36858823f778494f8"
+source = "git+https://github.com/AlfonsoCampodonico/vmkit?rev=b1baf3a0712209dbe7c7659186ad02b702524d3e#b1baf3a0712209dbe7c7659186ad02b702524d3e"
 dependencies = [
  "libc",
  "rustix 1.1.5",
