@@ -952,6 +952,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-snapshot"
+version = "0.1.0"
+dependencies = [
+ "kiln-oci",
+ "kiln-registry",
+ "kiln-store",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "kiln-store"
 version = "0.1.0"
 dependencies = [
