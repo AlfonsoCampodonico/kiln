@@ -134,6 +134,7 @@ pub fn run(open_store: impl FnOnce() -> Result<kiln_store::Store>, args: &RunArg
     let signals = install_signals(opts.tty)?;
     let store = open_store()?;
     let store = &store;
+    crate::refuse_snapshot(store, &opts.image, "kiln cannot run snapshots yet")?;
     let raw_tty = opts.tty && opts.interactive;
     if raw_tty && !tty::stdin_is_terminal() {
         anyhow::bail!("the input device is not a TTY (-t with -i needs a terminal on stdin)");

@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.12: 2026-10-21)
-**Status:** Draft rev 2.12, awaiting review
+**Date:** 2026-09-30 (rev 2.13: 2026-10-22)
+**Status:** Draft rev 2.13, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:**
 - `../../../../ROADMAP.md`: the three-repo roadmap (`vmkit`, `kiln`, `potter`).
@@ -90,7 +90,17 @@
   - **Stopping (ruling 3):** the first process to exit (a service or the main process), or `Shutdown`, ends the run. The others stop in reverse start order, each with its own stop signal; the grace period is split evenly between the processes still to stop, and one that has not exited when its share ends gets SIGKILL before the next gets its stop signal, so a stuck nginx no longer costs php-fpm its SIGQUIT. The sequence stays within the grace period; the host's stop deadline is unchanged (§9.6).
   - **Reporting:** `Exited` carries the status of the process whose exit ended the run, naming it when it was a service, or after `Shutdown` the main process's; `kiln run` exits with it and prints which service ended the run (§9.5, §9.7).
   - **Sharing:** services share the main process's stdout and stderr (with `-t`, the terminal, never as their controlling terminal or input); `kiln run --env` values reach every service as well as the main process; forwarded signals go to the main process only (§9.6, §9.7).
-- **rev 2.12 (2026-10-21):** adds `kiln rebase` (§16): swap the base layers under an image for a patched base without rebuilding. It is the primitive `potter rebase` and Laravel Cloud's build operator share.
+- **rev 2.12 (2026-10-21):** snapshot/restore and lazy restore, per `2026-10-21-lazy-restore-design.md`. Decisions taken with the user:
+  - The cut stops before snapshotting `kiln run` guests. That needs `kiln-init` to survive the vsock reset of every restore, and is left to sagger.
+  - Code goes where the roadmap puts it: snapshot/restore and the lazy layer in `vmkit`, the snapshot artifact in `kiln` (`kiln-snapshot`).
+
+  Changes:
+  - §1: the snapshot non-goal shrinks to `kiln run` guests and fork.
+  - §3: new property T10.
+  - §4.1: `snapshot` and `restore` are implemented, and `Capabilities` gains `lazy_memory`.
+  - §4.2: adds `kiln-snapshot`.
+  - The overview, the repository table and §12: sherd and raku have a first cut; sagger remains.
+- **rev 2.13 (2026-10-22):** adds `kiln rebase` (§16): swap the base layers under an image for a patched base without rebuilding. It is the primitive `potter rebase` and Laravel Cloud's build operator share.
   - `kiln convert --base NAME` records the base/app boundary in the config (§5.1, §16.2).
   - §6.4 squashes the base and the app separately when a boundary is recorded, so no squashed layer straddles it.
   - Layers that inherited parents are re-finalised against the new base (§16.4).
@@ -106,7 +116,7 @@
 It is meant to be a serious open-source tool: a stable format, real docs and a polished CLI. It is built to exercise the internals (a native erofs writer and reader, a custom init, a control protocol) rather than wrap existing tools. It treats images and guests as untrusted (§3), because it is also the base of the rest of the project family:
 - **potter** (its own repo) builds images from source and runs build steps in kiln microVMs.
 - **`kiln-shim`** (codename slip, in this repo) runs kiln images as a Kubernetes RuntimeClass.
-- **The agent sandbox** (codename sagger) and **snapshot distribution** (codename sherd) are planned in this repo, with lazy restore (codename raku) in `vmkit`.
+- **The agent sandbox** (codename sagger) is planned in this repo. **Snapshot distribution** (codename sherd, `kiln-snapshot`) is here and lazy restore (codename raku) is in `vmkit`, both since rev 2.12.
 
 Codenames name internal pieces only. The products are `kiln`, `vmkit` and `potter`.
 
@@ -133,7 +143,7 @@ Codenames name internal pieces only. The products are `kiln`, `vmkit` and `potte
 - Per-workload kernel tuning or local kernel builds.
 - erofs compression (LZ4 is the planned follow-up).
 - Auto-delegating `kiln run` to a Lima VM on macOS.
-- Snapshot/restore *implementation* (its trait shape is fixed here), forking, and lazy restore. Snapshot, restore and fork belong to sagger, and lazy restore to raku, in later milestones with their own specs (§12).
+- Snapshotting guests started by `kiln run`, and forking (sagger, with its own spec). `kiln-init` would have to reconnect its control channel after the vsock reset every restore causes. Snapshot/restore itself (in `vmkit`), snapshot artifacts (sherd) and lazy restore (raku) are in scope since rev 2.12 (`2026-10-21-lazy-restore-design.md`).
 - DNS-name-based egress policy (CIDR policy only in v1).
 - IPv6 inside guests.
 - Windows hosts, GPUs, non-Linux guests.
@@ -198,6 +208,7 @@ The `kiln` and `vmkit` binaries; the pinned digest tables compiled into `kiln`; 
 | T7 | Run state lives in a 0700 per-user runtime directory and is never trusted across boots or hosts. | §5.3 |
 | T8 | Every string that comes from the guest or the image and is printed by `kiln` (diagnostics, `inspect`, `ls`, console excerpts) is sanitised. App stdio is passed through unmodified, like `docker run`, and this is documented. | §13 |
 | T9 | Guest control messages are size-bounded and schema-validated. Protocol violations end the VM. | §9.5 |
+| T10 | A snapshot is untrusted input. Its chunks are verified before use, its bounds are checked before anything is fetched, and its VMM state only ever reaches a sandboxed VMM; Cloud Hypervisor's `config.json` is rewritten, never passed on. | lazy-restore design §4.3, §4.5, §5.4 |
 
 ---
 
@@ -207,8 +218,8 @@ The project family has three repositories, and only three: `vmkit`, `kiln` and `
 
 | Repo | Owns |
 |---|---|
-| `vmkit` | VMMs behind the `Vmm` trait, the sandbox, networking, kernel profiles (§4.1); later, lazy restore (raku) |
-| `kiln` | The image format, conversion, the store and registry client, `kiln-init` and kiln-proto, `kiln run`, `kiln build` dispatch (§4.2); `kiln-shim` (slip, M4); later, the agent sandbox's snapshot, restore and fork (sagger) and snapshot distribution in OCI registries (sherd) |
+| `vmkit` | VMMs behind the `Vmm` trait, the sandbox, networking, kernel profiles (§4.1); snapshot, restore and lazy restore (raku) |
+| `kiln` | The image format, conversion, the store and registry client, `kiln-init` and kiln-proto, `kiln run`, `kiln build` dispatch (§4.2); `kiln-shim` (slip, M4); snapshot distribution in OCI registries (sherd, `kiln-snapshot`); later, the agent sandbox's snapshot, restore and fork of `kiln run` guests (sagger) |
 | `potter` | Source → kiln image: detectors, the plan IR, the runtime catalog, the build executors, the Dockerfile frontend, the remote cache. It depends on kiln crates and `vmkit` pinned by git rev |
 
 ### 4.1 `vmkit` (separate repo)
@@ -219,7 +230,8 @@ VMM-neutral VM lifecycle, sandboxing, networking and kernel profiles.
   - `create(VmSpec) -> Vm` and `restore(SnapshotBundle, RestoreSpec) -> Vm`. Restore is a constructor because both VMMs require a fresh, unconfigured process for it.
   - On `Vm`: `start`, `pause`, `resume`, `kill`, `wait -> VmEnd`, `snapshot(dest)`, `capabilities()`.
   - Graceful shutdown is **not** a VMM operation. It goes through the guest control channel (§9.5).
-  - `snapshot` and `restore` are part of the trait so its shape is fixed now. Their implementation and contract tests ship with sagger.
+  - `snapshot` and `restore` are implemented on both backends (lazy-restore design §4). A snapshot is a bundle directory: `bundle.json`, the VMM's own files, and the captured writable disks. Restore refuses a bundle from another VMM, VMM version or architecture.
+  - **Lazy restore** is below the VMM (lazy-restore design §6). A FUSE mount inside the sandbox serves the memory file and the disks from verified chunks, fetched on demand through a caller-supplied chunk source. Firecracker maps the memory lazily. Cloud Hypervisor does too only when it may use userfaultfd; otherwise it copies memory in through the same layer, skipping zero chunks.
 - **`VmSpec`.**
   - Kernel path and cmdline. The cmdline is assembled only by `kiln`/`vmkit` (§8.3).
   - Ordered block devices (path, read-only flag), vCPUs, memory MiB.
@@ -232,7 +244,7 @@ VMM-neutral VM lifecycle, sandboxing, networking and kernel profiles.
   - **Firecracker defaults:** a custom `boot_args` replaces Firecracker's default cmdline, so the driver re-adds every Firecracker parameter it needs, e.g. `reboot=k` and the i8042 options on x86_64.
 - **`Capabilities`.**
   - `max_virtio_devices`: Firecracker x86_64 17, Firecracker aarch64 92, Cloud Hypervisor 31 per PCI segment.
-  - `supports_diff_snapshot`, `supports_balloon`, `supports_drive_remap`.
+  - `supports_diff_snapshot`, `supports_balloon`, `supports_drive_remap`, `lazy_memory`.
   - Callers budget devices against `max_virtio_devices` and never match on backend type.
 - **`net` module:** the per-VM net namespace, tap, nftables policy and `pasta` attachment (§9.3).
 - **`sandbox` module:** user, mount, PID and net namespaces; the fixed in-sandbox file layout; cgroups; rlimits; seccomp and Landlock flags (§9.2).
@@ -241,7 +253,7 @@ VMM-neutral VM lifecycle, sandboxing, networking and kernel profiles.
 - **Planned growth** (vmkit's own milestones; listed here because kiln's consumers need them):
   - a generalised `sandbox` that runs any process, with nested user namespaces, and `net` without a tap for a bare net namespace (potter spec §4, for potter P2);
   - `Capabilities.supports_memory_hotplug` (virtio-mem on Cloud Hypervisor) and vCPU hotplug (shim spec §4.3, for M4's S4);
-  - lazy restore below the VMM (raku), with its own spec.
+  - lazy restore below the VMM (raku): done in rev 2.12, see `2026-10-21-lazy-restore-design.md`.
 
 ### 4.2 `kiln` (this repo, Cargo workspace)
 
@@ -254,7 +266,8 @@ VMM-neutral VM lifecycle, sandboxing, networking and kernel profiles.
 | `kiln-init` | Static musl PID 1 for the guest, including the guest side of the control protocol. Gains `services` (M3d), build mode (M3e), and exec, stats, OOM reports and file updates (M4) (§9.8). | — (guest only) |
 | `kiln-proto` | Control-protocol message types and framing, shared by `kiln-init` and every host side: `kiln run`, potter and `kiln-shim` (§9.5, §9.8). | `serde` |
 | `kiln-image` | `kiln` image manifest and config types; assembly; run-time verification of kernel and init (§8.1). | `kiln-oci`, `kiln-erofs`, `kiln-store` |
-| `kiln` (bin) | CLI: `convert`, `build` (backend dispatch, §6), `pull`, `push`, `import`, `rebase`, `run`, `inspect`, `ls`, `gc`, `bench`. | all of the above, `vmkit` |
+| `kiln-snapshot` | The snapshot artifact: a `vmkit` bundle as content-addressed chunks, its checks and limits, push and pull, and the store-backed chunk source for lazy restore (lazy-restore design §5, §6). | `kiln-oci`, `kiln-registry`, `kiln-store`, `vmkit` (Linux) |
+| `kiln` (bin) | CLI: `convert`, `build` (backend dispatch, §6), `pull`, `push`, `import`, `rebase`, `run`, `inspect`, `ls`, `gc`, `bench`, `snapshot push\|pull\|inspect`. | all of the above, `vmkit` |
 | `kiln-shim` (bin, M4) | containerd shim v2 `io.containerd.kiln.v2`, one microVM per pod, behind the RuntimeClass `kiln`. Specified in `2026-10-05-kiln-shim-design.md`. | `kiln-proto`, `kiln-image`, `vmkit` (exact set designed in M4) |
 
 potter depends on `kiln-oci`, `kiln-erofs`, `kiln-image`, `kiln-store`, `kiln-registry` and `kiln-proto` (potter spec §4). kiln never depends on potter's crates: that would be a cycle, so `kiln build` runs the `potter` binary instead (§6).
@@ -286,7 +299,7 @@ A `kiln` image is an OCI 1.1 artifact.
   - `services` (M3d, omitted when empty): processes `kiln-init` starts before the main process, from the source config's `dev.kiln.services` label (§9.8). A config with services has `schemaVersion` 2, one without keeps 1, so a kiln older than M3d refuses an image with services (rev 2.11).
   - `labels`: the source config's labels. It is **always** written, `{}` when there are none, so an absent field means a config from a kiln that did not record labels, and an empty one means none.
     - **Why:** the runtime gate (§16.3) must tell "no labels" from "not recorded", which only the field's presence can do once the source config is gone (a pulled base); the kiln config is also where labels survive `gc`.
-    - **Cost, accepted in rev 2.12:** every newly converted image gets a one-time config (and so manifest) digest change, labelled or not, and the golden manifest digest moved with it. Layer blobs and caches are unaffected, and configs without the field still read.
+    - **Cost, accepted in rev 2.13:** every newly converted image gets a one-time config (and so manifest) digest change, labelled or not, and the golden manifest digest moved with it. Layer blobs and caches are unaffected, and configs without the field still read.
   - `base` (only for `convert --base`, §16.2): `{ name, manifestDigest, layers, sourceLayers }`. The image's bottom `layers` app layers (kernel and init layers never count) are the base's, and they came from its first `sourceLayers` OCI layers.
   - There is **no** kernel cmdline field (T4). There is **no** `kiln` version field, so patch releases that produce identical output produce identical digests.
 - **Layers, in boot order:**
@@ -880,8 +893,8 @@ One parametrised suite runs against both backends, using a test guest (the kerne
 | **M3c: build** | `kiln` | `kiln build` backend dispatch: potter, BuildKit, Podman or Buildah (§6). The end-to-end matrix (§11.4), the kernel and init swap tests (§11.5), the release pipeline and the docs (§15). | Yes | Planned |
 | **M3e: build mode** | `kiln` | kiln-proto `Config.mode = Build`, the build-mode messages and `kiln-init` build mode (§9.8), as a protocol version bump. Lands with potter P4 (the VM executor). | Yes | Planned |
 | **M4: `kiln-shim`** (slip) | `kiln` | The containerd shim, in the phases of the shim spec (§8 there): **S0** a KVM node-group spike, nested C8i against metal, with kiln's bench and end-to-end matrix (after M3b); **S1** kiln-proto exec, `Stats`, `OomKill` and `FileUpdate` (§9.8; after M3a); **S2** media type alignment with containerd 2.3's erofs snapshotter, plus a test (§5.1; after M1); **S3** `kiln-shim`: lifecycle, networking, logs, exec, stats, projected volumes (after S1, S2 and M3b); **S4** resize, verity, init containers (after S3; uses the vmkit hotplug capabilities in §4.1). The shim spec's S5, a platform canary, is a rollout step, not kiln work. | Yes | Planned |
-| **sagger** (agent sandbox) | `kiln`, `vmkit` | Snapshot, restore and fork on the `Vmm` trait shapes fixed in M2. | Yes | Needs a spec |
-| **sherd** and **raku** | `kiln` (sherd), `vmkit` (raku) | Snapshot artifacts in OCI registries with chunk dedup (sherd); lazy restore below the VMM (raku). | Yes | Needs a spec |
+| **sagger** (agent sandbox) | `kiln`, `vmkit` | Snapshot, restore and fork of `kiln run` guests: `kiln-init` reconnects after restore, on `vmkit`'s snapshot and restore. | Yes | Needs a spec |
+| **sherd** and **raku** | `kiln` (sherd), `vmkit` (raku) | Snapshot artifacts in OCI registries with chunk dedup (sherd); lazy restore below the VMM (raku); `vmkit` snapshot and restore. | Yes | First cut done (`2026-10-21-lazy-restore-design.md`) |
 
 potter's own milestones (P1–P7) are in the potter spec §15. Its P2 needs M3d and vmkit's generalised `sandbox` and tap-less `net` (§4.1); its P4 needs M3b and M3e; its P5 provides the Dockerfile frontend that M3c's potter backend runs.
 
