@@ -317,3 +317,101 @@ fn base_plus_upper_squash_equals_full_squash() {
     assert_eq!(common::view(&full, true), common::view(&split, true));
     assert!(!split.contains_key(&p("w/deep")) && !split.contains_key(&p("o/old")));
 }
+
+/// Rewrites the dirent of `child` inside directory `dir` to point at `target`.
+fn relink(img: &[u8], dir: &str, child: &[u8], target: u64) -> Vec<u8> {
+    let mut probe = kiln_erofs::Image::open(Cursor::new(img)).unwrap();
+    let dir_nid = probe.lookup(dir.as_bytes()).unwrap().unwrap();
+    let child_nid = probe.lookup(&[dir.as_bytes(), b"/", child].concat()).unwrap().unwrap();
+    let needle = child_nid.to_le_bytes();
+    for at in (0..img.len() - 8).filter(|&i| img[i..i + 8] == needle) {
+        let mut out = img.to_vec();
+        out[at..at + 8].copy_from_slice(&target.to_le_bytes());
+        let Ok(mut i) = kiln_erofs::Image::open(Cursor::new(out.as_slice())) else {
+            continue;
+        };
+        if let Ok(entries) = i.read_dir(dir_nid)
+            && entries.iter().any(|e| e.name == child && e.nid == target)
+        {
+            return out;
+        }
+    }
+    panic!("no dirent for {child:?} in {dir}");
+}
+
+fn merged(layers: &[Vec<u8>]) -> kiln_erofs::Merged<Cursor<Vec<u8>>> {
+    let imgs = layers
+        .iter()
+        .map(|l| kiln_erofs::Image::open(Cursor::new(l.clone())).unwrap())
+        .collect();
+    kiln_erofs::Merged::new(imgs)
+}
+
+/// A hostile base whose directory points back at its parent must not loop.
+#[test]
+fn merged_subtree_refuses_a_directory_cycle() {
+    let l = t(TarBuilder::new()
+        .dir("a", &Opts::default())
+        .dir("a/b", &Opts::default())
+        .file("a/b/f", b"", &Opts::default()));
+    let img = convert_stack(&[l]).remove(0);
+    let a = kiln_erofs::Image::open(Cursor::new(img.as_slice()))
+        .unwrap()
+        .lookup(b"a")
+        .unwrap()
+        .unwrap();
+    let cyclic = relink(&img, "a", b"b", a);
+    let e = merged(&[cyclic]).subtree(b"").unwrap_err();
+    assert!(e.to_string().contains("linked twice"), "{e}");
+}
+
+/// Two names for one directory in one layer would make the walk exponential.
+#[test]
+fn merged_subtree_refuses_a_shared_directory() {
+    let l = t(TarBuilder::new()
+        .dir("x", &Opts::default())
+        .dir("x/p", &Opts::default())
+        .dir("x/q", &Opts::default())
+        .file("x/p/f", b"", &Opts::default()));
+    let img = convert_stack(&[l]).remove(0);
+    let p = kiln_erofs::Image::open(Cursor::new(img.as_slice()))
+        .unwrap()
+        .lookup(b"x/p")
+        .unwrap()
+        .unwrap();
+    let shared = relink(&img, "x", b"q", p);
+    let e = merged(&[shared]).subtree(b"").unwrap_err();
+    assert!(e.to_string().contains("linked twice"), "{e}");
+}
+
+#[test]
+fn merged_subtree_is_bounded_by_depth_and_entries() {
+    let l = t(TarBuilder::new().file("a/b/c/d", b"", &Opts::default()));
+    let layers = convert_stack(&[l]);
+    let imgs = || {
+        layers
+            .iter()
+            .map(|l| kiln_erofs::Image::open(Cursor::new(l.clone())).unwrap())
+            .collect()
+    };
+    let limits = |depth, entries| kiln_erofs::Limits {
+        max_path_depth: depth,
+        max_entries: entries,
+        ..Default::default()
+    };
+    let e = kiln_erofs::Merged::with_limits(imgs(), limits(3, 100))
+        .subtree(b"")
+        .unwrap_err();
+    assert!(e.to_string().contains("path depth"), "{e}");
+    let e = kiln_erofs::Merged::with_limits(imgs(), limits(10, 2))
+        .subtree(b"")
+        .unwrap_err();
+    assert!(e.to_string().contains("merged entries"), "{e}");
+    assert_eq!(
+        kiln_erofs::Merged::with_limits(imgs(), limits(4, 4))
+            .subtree(b"")
+            .unwrap()
+            .len(),
+        4
+    );
+}
