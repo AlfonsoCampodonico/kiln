@@ -6,6 +6,7 @@ use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::limits::Limits;
 use crate::ondisk::{S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG};
 use crate::path::components;
 use crate::reader::{Image, InodeInfo};
@@ -115,17 +116,27 @@ fn merged_lookup<R: Read + Seek>(
 }
 
 /// The merged (overlayfs) view of a layer stack, bottom first, for comparing what
-/// two bases show at the same paths (spec §16.3).
+/// two bases show at the same paths (spec §16.3). Layers may be hostile (a pulled
+/// base), so walks are bounded: a directory linked twice in a layer is an error,
+/// and depth and entry counts are capped by [`Limits`] (spec §7.6).
 pub struct Merged<R> {
     layers: Vec<Image<R>>,
     dirs: DirCache,
+    limits: Limits,
 }
 
 impl<R: Read + Seek> Merged<R> {
     pub fn new(layers: Vec<Image<R>>) -> Self {
+        Self::with_limits(layers, Limits::default())
+    }
+
+    /// `limits.max_path_depth` bounds walk depth and `limits.max_entries` the paths
+    /// one [`Merged::subtree`] returns.
+    pub fn with_limits(layers: Vec<Image<R>>, limits: Limits) -> Self {
         Self {
             layers,
             dirs: DirCache::new(),
+            limits,
         }
     }
 
@@ -138,14 +149,11 @@ impl<R: Read + Seek> Merged<R> {
         &mut self.layers[layer]
     }
 
-    /// Sorted names visible in the merged directory at `path` (empty unless it is one).
-    pub fn read_dir(&mut self, path: &[u8]) -> Result<Vec<Vec<u8>>> {
-        match self.lookup(path)? {
-            Some((layer, nid)) if self.layers[layer].inode(nid)?.is_dir() => {}
-            _ => return Ok(Vec::new()),
-        }
+    /// `(layer, nid)` of every layer's own directory at `path`, ignoring overlay
+    /// semantics: the directories a merged `read_dir` unions.
+    fn layer_dirs(&mut self, path: &[u8]) -> Result<Vec<(usize, u64)>> {
         let comps: Vec<&[u8]> = components(path).collect();
-        let mut names = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
         for layer in 0..self.layers.len() {
             let img = &mut self.layers[layer];
             let mut cur = Some(img.root_nid());
@@ -155,29 +163,73 @@ impl<R: Read + Seek> Merged<R> {
                     _ => None,
                 };
             }
-            if let Some(d) = cur.filter(|&d| img.inode(d).is_ok_and(|i| i.is_dir())) {
-                let entries = img.read_dir(d)?;
-                names.extend(entries.into_iter().map(|e| e.name));
+            if let Some(d) = cur
+                && img.inode(d)?.is_dir()
+            {
+                out.push((layer, d));
             }
+        }
+        Ok(out)
+    }
+
+    fn names(&mut self, path: &[u8], dirs: &[(usize, u64)]) -> Result<Vec<Vec<u8>>> {
+        let mut names = std::collections::BTreeSet::new();
+        for &(layer, d) in dirs {
+            names.extend(self.layers[layer].read_dir(d)?.into_iter().map(|e| e.name));
         }
         let mut out = Vec::new();
         for name in names {
-            let child = join(path, &name);
-            if self.lookup(&child)?.is_some() {
+            if self.lookup(&join(path, &name))?.is_some() {
                 out.push(name);
             }
         }
         Ok(out)
     }
 
+    /// Sorted names visible in the merged directory at `path` (empty unless it is one).
+    pub fn read_dir(&mut self, path: &[u8]) -> Result<Vec<Vec<u8>>> {
+        match self.lookup(path)? {
+            Some((layer, nid)) if self.layers[layer].inode(nid)?.is_dir() => {}
+            _ => return Ok(Vec::new()),
+        }
+        let dirs = self.layer_dirs(path)?;
+        self.names(path, &dirs)
+    }
+
     /// Every path visible below `path` in the merged view, sorted, `path` excluded.
     pub fn subtree(&mut self, path: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let too_many = |limit, max: usize, p: &[u8]| Error::LimitExceeded {
+            limit,
+            max: max as u64,
+            path: String::from_utf8_lossy(p).into_owned(),
+        };
         let mut out = Vec::new();
-        let mut stack = vec![path.to_vec()];
-        while let Some(dir) = stack.pop() {
-            for name in self.read_dir(&dir)? {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![(path.to_vec(), components(path).count())];
+        while let Some((dir, depth)) = stack.pop() {
+            match self.lookup(&dir)? {
+                Some((layer, nid)) if self.layers[layer].inode(nid)?.is_dir() => {}
+                _ => continue,
+            }
+            let dirs = self.layer_dirs(&dir)?;
+            // In a well-formed layer each directory sits at one path, so meeting one
+            // again means a cycle or a shared directory.
+            for &(layer, nid) in &dirs {
+                if !seen.insert((layer, nid)) {
+                    return Err(Error::Corrupt(format!(
+                        "directory nid {nid} of layer {layer} is linked twice"
+                    )));
+                }
+            }
+            for name in self.names(&dir, &dirs)? {
                 let child = join(&dir, &name);
-                stack.push(child.clone());
+                if depth + 1 > self.limits.max_path_depth {
+                    return Err(too_many("path depth", self.limits.max_path_depth, &child));
+                }
+                if out.len() as u64 >= self.limits.max_entries {
+                    return Err(too_many("merged entries", self.limits.max_entries as usize, &child));
+                }
+                stack.push((child.clone(), depth + 1));
                 out.push(child);
             }
         }
