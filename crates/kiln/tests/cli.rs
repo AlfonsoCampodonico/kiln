@@ -819,3 +819,195 @@ fn pinned_boot_layers_are_fetched_from_the_registry() {
     kiln(home.path()).arg("gc").assert().success();
     assert!(blob.exists(), "gc removed the pinned kernel");
 }
+
+/// A small vmkit bundle: `bundle.json` and three files, one with zero chunks.
+fn snapshot_bundle(dir: &Path, vmm: &str) -> Vec<(&'static str, Vec<u8>)> {
+    let k = 64 << 10;
+    let data = |n: usize, seed: u8| -> Vec<u8> {
+        (0..n)
+            .map(|i| ((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as u8 ^ seed | 1)
+            .collect()
+    };
+    let files = vec![
+        ("vmstate", data(5000, 1)),
+        ("memory", [data(k, 2), vec![0; 2 * k], data(k / 2, 3)].concat()),
+        ("disk-0", [vec![0; k], data(k, 4)].concat()),
+    ];
+    std::fs::create_dir_all(dir).unwrap();
+    let bundle = serde_json::json!({
+        "arch": "aarch64",
+        "disks": [{"captured": true, "read_only": false, "size": 2 * k}],
+        "files": [
+            {"name": "vmstate", "role": "state"},
+            {"name": "memory", "role": "memory"},
+            {"name": "disk-0", "role": "disk"}
+        ],
+        "memory_mib": 256,
+        "net": false,
+        "vcpus": 2,
+        "version": 1,
+        "vmm": {"name": vmm, "version": "1.17.0"},
+        "vsock": {"guest_cid": 3}
+    });
+    std::fs::write(dir.join("bundle.json"), serde_json::to_vec(&bundle).unwrap()).unwrap();
+    for (name, bytes) in &files {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    files
+}
+
+#[test]
+fn snapshot_push_pull_and_inspect_through_a_registry() {
+    let src = tempfile::tempdir().unwrap();
+    let files = snapshot_bundle(&src.path().join("vm"), "firecracker");
+    let reg = TestRegistry::start(Config::default());
+    let (home, other, lazy) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let r = format!("{}/team/vm:1", reg.host());
+    let pushed = stdout_json(
+        kiln(home.path())
+            .args(["snapshot", "push", "--json", "--chunk-size", "64K"])
+            .arg(src.path().join("vm"))
+            .arg(&r)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(pushed["blobs"], 5, "4 distinct chunks and the config");
+    let digest = pushed["digest"].as_str().unwrap().to_string();
+    kiln(home.path())
+        .args(["ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&r).and(predicate::str::contains("snapshot")));
+    let ls = stdout_json(kiln(home.path()).args(["ls", "--json"]).output().unwrap());
+    assert_eq!(ls[0]["type"], "snapshot");
+    kiln(home.path())
+        .args(["snapshot", "inspect", &r])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(&digest)
+                .and(predicate::str::contains("vmm:          firecracker 1.17.0"))
+                .and(predicate::str::contains("arch:         aarch64"))
+                .and(predicate::str::contains("memory:       256 MiB"))
+                .and(predicate::str::contains("chunk size:   64.0 KiB"))
+                .and(predicate::str::contains("memory  "))
+                .and(predicate::str::contains("4 chunks (2 zero)")),
+        );
+    let inspected = stdout_json(
+        kiln(home.path())
+            .args(["snapshot", "inspect", "--json", &r])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(inspected["digest"], digest.as_str());
+    assert_eq!(inspected["chunkSize"], 64 << 10);
+    assert_eq!(inspected["storedChunks"], 4);
+    // Image commands refuse a snapshot with a clear error.
+    for args in [
+        &["inspect", r.as_str()][..],
+        &["push", &r, &format!("{}/team/img:1", reg.host())],
+    ] {
+        kiln(home.path())
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("is a kiln snapshot, not an image"));
+    }
+
+    // An eager pull writes the bundle back byte for byte.
+    let out = tempfile::tempdir().unwrap();
+    kiln(other.path())
+        .args(["snapshot", "pull", &r])
+        .arg(out.path().join("bundle"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{r} → {digest}")));
+    for (name, bytes) in &files {
+        assert_eq!(&std::fs::read(out.path().join("bundle").join(name)).unwrap(), bytes);
+    }
+    // Into a non-empty directory, nothing is pulled.
+    kiln(other.path())
+        .args(["snapshot", "pull", &r])
+        .arg(out.path().join("bundle"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not empty"));
+
+    // A lazy pull writes only bundle.json and lazy.json.
+    let gets = reg.blob_requests("GET");
+    let pulled = stdout_json(
+        kiln(lazy.path())
+            .args(["snapshot", "pull", "--lazy", "--json", "--tag", "vm:lazy", &r])
+            .arg(out.path().join("lazy"))
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(pulled["tag"], "vm:lazy");
+    assert_eq!(reg.blob_requests("GET") - gets, 1, "the config only");
+    let mut names: Vec<_> = std::fs::read_dir(out.path().join("lazy"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["bundle.json", "lazy.json"]);
+    kiln(lazy.path())
+        .args(["snapshot", "inspect", "vm:lazy"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("firecracker"));
+}
+
+#[test]
+fn snapshot_strings_are_sanitised() {
+    let src = tempfile::tempdir().unwrap();
+    snapshot_bundle(src.path(), "fire\x1b[2Jcracker\x07");
+    let reg = TestRegistry::start(Config::default());
+    let home = tempfile::tempdir().unwrap();
+    let r = format!("{}/team/vm:1", reg.host());
+    kiln(home.path())
+        .args(["snapshot", "push"])
+        .arg(src.path())
+        .arg(&r)
+        .assert()
+        .success();
+    kiln(home.path())
+        .args(["snapshot", "inspect", &r])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\x1b")
+                .not()
+                .and(predicate::str::contains("\x07").not()),
+        );
+}
+
+#[test]
+fn snapshot_push_refuses_a_bad_chunk_size_and_a_bad_bundle() {
+    let src = tempfile::tempdir().unwrap();
+    snapshot_bundle(src.path(), "firecracker");
+    let home = tempfile::tempdir().unwrap();
+    kiln(home.path())
+        .args(["snapshot", "push", "--chunk-size", "1000"])
+        .arg(src.path())
+        .arg("127.0.0.1:1/team/vm:1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a power of two"));
+    std::fs::create_dir(src.path().join("sub")).unwrap();
+    kiln(home.path())
+        .args(["snapshot", "push"])
+        .arg(src.path())
+        .arg("127.0.0.1:1/team/vm:1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a regular file"));
+    kiln(home.path())
+        .args(["snapshot", "inspect", "nope"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no snapshot named"));
+}
