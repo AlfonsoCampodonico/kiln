@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod artifacts;
+mod boundary;
 mod convert;
 mod ctx;
 mod decompress;

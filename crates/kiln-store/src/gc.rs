@@ -38,10 +38,85 @@ pub fn references(json: &serde_json::Value) -> Vec<Digest> {
     out
 }
 
+/// The `<source digest>@<diff_id hex>@` prefixes of `cache/layers` entries that are
+/// `parents [...]`: source layers whose conversion inherits from the layers below.
+fn inheriting_prefixes(store: &Store) -> Result<BTreeSet<String>> {
+    Ok(store
+        .cache_entries(CacheKind::Layers)?
+        .into_iter()
+        .filter(|(_, v)| v.starts_with("parents "))
+        .filter_map(|(path, _)| {
+            let name = path.file_name()?.to_str()?.to_string();
+            let cut = name.rfind('@')?;
+            Some(name[..=cut].to_string())
+        })
+        .collect())
+}
+
 impl Store {
+    /// What a kiln image config keeps of its source (spec §5.2, §16.4): the source
+    /// manifest and config, small JSON that `kiln rebase` reads; and, when the
+    /// image records a base, the tars of its source layers that inherit from the
+    /// layers below, which rebase re-finalises. Other source tars are not kept.
+    fn keep_sources(
+        &self,
+        json: &serde_json::Value,
+        live: &mut BTreeSet<Digest>,
+        inheriting: &mut Option<BTreeSet<String>>,
+    ) -> Result<()> {
+        let digest = |v: Option<&serde_json::Value>| v.and_then(|d| d.as_str()).and_then(|s| Digest::parse(s).ok());
+        if json.get("erofsFormatVersion").is_none() {
+            return Ok(());
+        }
+        let Some(src) = digest(json.pointer("/source/manifestDigest")) else {
+            return Ok(());
+        };
+        let parse = |d: &Digest| -> Result<Option<serde_json::Value>> {
+            if !self.has_blob(d) {
+                return Ok(None);
+            }
+            match self.read_metadata(d) {
+                Ok(b) => Ok(serde_json::from_slice(&b).ok()),
+                Err(StoreError::TooLarge { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
+        };
+        let Some(manifest) = parse(&src)? else { return Ok(()) };
+        live.insert(src);
+        let Some(config_digest) = digest(manifest.pointer("/config/digest")) else {
+            return Ok(());
+        };
+        live.insert(config_digest.clone());
+        if json.get("base").is_none() {
+            return Ok(());
+        }
+        let Some(config) = parse(&config_digest)? else {
+            return Ok(());
+        };
+        let diff_ids = config.pointer("/rootfs/diff_ids").and_then(|v| v.as_array());
+        let layers = manifest.get("layers").and_then(|v| v.as_array());
+        let (Some(diff_ids), Some(layers)) = (diff_ids, layers) else {
+            return Ok(());
+        };
+        if inheriting.is_none() {
+            *inheriting = Some(inheriting_prefixes(self)?);
+        }
+        let prefixes = inheriting.as_ref().expect("just filled");
+        for (layer, diff_id) in layers.iter().zip(diff_ids) {
+            let (Some(layer), Some(diff_id)) = (digest(layer.get("digest")), digest(Some(diff_id))) else {
+                continue;
+            };
+            if prefixes.contains(&format!("{layer}@{}@", diff_id.hex()).replace(':', "_")) {
+                live.insert(layer);
+            }
+        }
+        Ok(())
+    }
+
     /// Blobs reachable from refs.
     pub fn live_blobs(&self) -> Result<BTreeSet<Digest>> {
         let mut live = BTreeSet::new();
+        let mut inheriting = None;
         let mut stack: Vec<Digest> = self.refs()?.into_values().collect();
         while let Some(d) = stack.pop() {
             if !live.insert(d.clone()) || !self.has_blob(&d) {
@@ -54,6 +129,7 @@ impl Store {
             };
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 stack.extend(references(&json));
+                self.keep_sources(&json, &mut live, &mut inheriting)?;
             }
         }
         Ok(live)
@@ -221,6 +297,58 @@ mod tests {
         assert_eq!(s.cache_get(CacheKind::InitLayers, &key(&old_init)).unwrap(), None);
         // Without roots, all of it goes.
         assert_eq!(s.gc().unwrap().blobs_removed, 3);
+    }
+
+    /// A kiln config keeps its source manifest and config; one that records a base
+    /// also keeps the tars of its inheriting source layers, and no others.
+    #[test]
+    fn kiln_configs_keep_what_rebase_needs_of_their_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let (plain, inheriting) = (
+            s.put_bytes(b"plain tar").unwrap(),
+            s.put_bytes(b"inheriting tar").unwrap(),
+        );
+        let (d1, d2) = (Digest::of(b"diff 1"), Digest::of(b"diff 2"));
+        let src_config =
+            serde_json::json!({"rootfs": {"type": "layers", "diff_ids": [d1.to_string(), d2.to_string()]}});
+        let src_config = s.put_bytes(&serde_json::to_vec(&src_config).unwrap()).unwrap();
+        let src = serde_json::json!({
+            "config": {"digest": src_config.to_string()},
+            "layers": [{"digest": plain.to_string()}, {"digest": inheriting.to_string()}],
+        });
+        let src = s.put_bytes(&serde_json::to_vec(&src).unwrap()).unwrap();
+        s.cache_put(CacheKind::Layers, &format!("{plain}@{}@1", d1.hex()), "erofs sha256:00")
+            .unwrap();
+        s.cache_put(
+            CacheKind::Layers,
+            &format!("{inheriting}@{}@1", d2.hex()),
+            "parents [\"61\"]",
+        )
+        .unwrap();
+        let tag = |name: &str, base: bool| {
+            let mut config =
+                serde_json::json!({"erofsFormatVersion": 1, "source": {"manifestDigest": src.to_string()}});
+            if base {
+                config["base"] = serde_json::json!({"layers": 1});
+            }
+            let c = s.put_bytes(&serde_json::to_vec(&config).unwrap()).unwrap();
+            let m = s
+                .put_bytes(
+                    &serde_json::to_vec(&serde_json::json!({"config": {"digest": c.to_string()}, "layers": []}))
+                        .unwrap(),
+                )
+                .unwrap();
+            s.set_ref(name, &m).unwrap();
+        };
+        tag("plain", false);
+        let live = s.live_blobs().unwrap();
+        assert!(live.contains(&src) && live.contains(&src_config));
+        assert!(!live.contains(&plain) && !live.contains(&inheriting));
+        tag("based", true);
+        let live = s.live_blobs().unwrap();
+        assert!(live.contains(&inheriting), "rebase re-finalises it");
+        assert!(!live.contains(&plain), "a cache hit needs no tar");
     }
 
     #[test]

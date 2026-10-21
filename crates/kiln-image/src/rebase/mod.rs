@@ -2,7 +2,7 @@
 
 pub mod gates;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 
@@ -12,9 +12,10 @@ use kiln_oci::media::{OCI_INDEX, OCI_MANIFEST};
 use kiln_oci::{Descriptor, ImageConfig, ImageManifest, Platform, ResolvedImage};
 use kiln_store::{Digest, Hasher, Store};
 
+use crate::boundary;
 use crate::convert::{
-    ConvertOptions, LayerReport, LayerSource, SquashKind, app_layers, commit_manifest, convert_layers, platform_entry,
-    squash_to,
+    ConvertOptions, LayerReport, LayerSource, SquashKind, app_budget, app_layers, commit_manifest, convert_layers,
+    platform_entry, squash_to,
 };
 use crate::error::{ImageError, Result, json};
 use crate::load::{KilnManifest, Loaded, load, resolve_name};
@@ -30,19 +31,22 @@ pub struct RebaseRequest<'a> {
     pub image: &'a str,
     /// Name to record in `refs.json`.
     pub tag: Option<&'a str>,
+    /// The most layers the result may have. `None` keeps the image's own app
+    /// layering and squashes only when the new base has more layers than the old.
+    pub max_layers: Option<usize>,
 }
 
 /// One app layer of the rebased image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppLayer {
     pub erofs: Digest,
-    /// The image's app layer at the same position, if it had one.
-    pub was: Option<Digest>,
+    /// The image already had this exact layer (compared by digest, not position).
+    pub reused: bool,
 }
 
 impl AppLayer {
     pub fn changed(&self) -> bool {
-        self.was.as_ref() != Some(&self.erofs)
+        !self.reused
     }
 }
 
@@ -66,19 +70,30 @@ pub struct Rebased {
     pub images: Vec<RebasedImage>,
 }
 
-/// Source tars must already be in the store: rebase never fetches.
+/// Source tars must already be in the store: rebase never fetches. As for any
+/// input (spec §6.1), a stored blob must also have its descriptor's size and a
+/// layer media type, so the expansion limits hold.
 struct StoredOnly<'a>(&'a Store);
 
 impl LayerSource for StoredOnly<'_> {
     fn fetch(&self, layer: &Descriptor) -> Result<()> {
-        if self.0.has_blob(&layer.digest) {
-            Ok(())
-        } else {
-            Err(ImageError::SourceMissing(format!(
+        if !self.0.has_blob(&layer.digest) {
+            return Err(ImageError::SourceMissing(format!(
                 "source layer {} is no longer in the store",
                 layer.digest
-            )))
+            )));
         }
+        kiln_oci::media::layer_compression(&layer.media_type)?;
+        let actual = self.0.blob_size(&layer.digest)?;
+        if actual != layer.size {
+            return Err(kiln_store::StoreError::SizeMismatch {
+                digest: layer.digest.clone(),
+                expected: layer.size,
+                actual,
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -213,17 +228,14 @@ fn normalise(path: &[u8]) -> Vec<u8> {
     out.join(&b'/')
 }
 
-/// Every path the app's source layers contain, except their implicit directories
-/// (spec §16.3).
+/// Every path the app's source layers contain; implicit directories are marked,
+/// so that the gate compares only their type (spec §16.3).
 fn shadowed(store: &Store, app: &[LayerReport]) -> Result<Vec<Shadowed>> {
     let mut out = BTreeSet::new();
     for l in app {
         let implicit: BTreeSet<&[u8]> = l.implicit.iter().map(Vec::as_slice).collect();
         let mut img = Image::open(store.open_blob(&l.erofs)?)?;
         for (path, nid) in img.walk()? {
-            if implicit.contains(path.as_slice()) {
-                continue;
-            }
             let info = img.inode(nid)?;
             let hides = if info.mode & S_IFMT == S_IFDIR {
                 img.xattrs(nid)?
@@ -232,14 +244,15 @@ fn shadowed(store: &Store, app: &[LayerReport]) -> Result<Vec<Shadowed>> {
             } else {
                 true
             };
-            out.insert(Shadowed { path, hides });
+            let implicit = implicit.contains(path.as_slice());
+            out.insert(Shadowed { path, hides, implicit });
         }
     }
     Ok(out.into_iter().collect())
 }
 
-/// A base layer carried into the rebased manifest as it is.
-fn base_layer(d: &Descriptor) -> LayerReport {
+/// A layer carried into the rebased manifest as it is.
+fn kept_layer(d: &Descriptor) -> LayerReport {
     let sources = d
         .annotation(ANN_SOURCE_DIGESTS)
         .map(|s| s.split(',').filter_map(|x| Digest::parse(x).ok()).collect())
@@ -255,6 +268,85 @@ fn base_layer(d: &Descriptor) -> LayerReport {
     }
 }
 
+/// A base's labels: its config's, else its source config's when that is still in
+/// the store; `None` when neither says (a base converted before kiln recorded
+/// labels, whose source is gone).
+fn labels_of(store: &Store, m: &KilnManifest) -> Option<BTreeMap<String, String>> {
+    if !m.config.labels.is_empty() {
+        return Some(m.config.labels.clone());
+    }
+    let src = source_image(store, m, &Platform::host()).ok()?;
+    Some(src.config.config.and_then(|c| c.labels).unwrap_or_default())
+}
+
+/// `derived` (one report per source layer) as `want` layers them: the same
+/// layers, or the bottom ones merged by an upper squash. `None` if they differ.
+fn as_layered(store: &Store, derived: &[LayerReport], want: &[Descriptor]) -> Result<Option<Vec<LayerReport>>> {
+    let width = (derived.len() + 1).checked_sub(want.len()).filter(|&w| w >= 1);
+    let Some(width) = width else { return Ok(None) };
+    Ok(
+        boundary::match_run(store, derived, 0, want, SquashKind::Upper, [width])?
+            .filter(|(end, _)| *end == derived.len())
+            .map(|(_, layers)| layers),
+    )
+}
+
+/// The app half above the new base: re-derived from the image's sources when
+/// they are in the store, checked first against the image's own app layers;
+/// otherwise the image's layers as they are, which is right only when none of
+/// them inherits from the base (spec §16.4). Returns the per-source layers for
+/// the shadowed-path gate and the app layers, before any further squash.
+enum App {
+    Derived { per_source: Vec<LayerReport> },
+    Kept(Vec<LayerReport>),
+}
+
+fn derive_app(
+    store: &Store,
+    im: &KilnManifest,
+    record: &BaseRecord,
+    platform: &Platform,
+    om: &KilnManifest,
+    nm: &KilnManifest,
+    opts: &ConvertOptions,
+) -> Result<std::result::Result<App, Refusal>> {
+    let image_app = app_layers(&im.manifest)[record.layers..].to_vec();
+    let src = match source_image(store, im, platform) {
+        Ok(src) => src,
+        Err(ImageError::SourceMissing(why)) => {
+            // Without sources, layers can be kept only if none depends on the base.
+            if image_app.iter().any(|d| d.annotation(ANN_INHERITS).is_some()) {
+                return Err(ImageError::SourceMissing(why));
+            }
+            return Ok(Ok(App::Kept(image_app.iter().map(kept_layer).collect())));
+        }
+        Err(e) => return Err(e),
+    };
+    let n = src.manifest.layers.len();
+    if record.source_layers >= n {
+        return Ok(Err(Refusal {
+            gate: "source",
+            reason: format!(
+                "the source manifest has {n} layers, but the base record says the base has {}",
+                record.source_layers
+            ),
+        }));
+    }
+    let range = record.source_layers..n;
+    let source = StoredOnly(store);
+    // The sources must rebuild the image's own app layers above the old base, or
+    // they are not this image's sources.
+    let above_old = convert_layers(store, &src, range.clone(), digests(om), opts, &source)?;
+    if as_layered(store, &above_old, &image_app)?.is_none() {
+        return Ok(Err(Refusal {
+            gate: "source",
+            reason: "the image's recorded sources do not rebuild its app layers on the old base".into(),
+        }));
+    }
+    let per_source = convert_layers(store, &src, range, digests(nm), opts, &source)?;
+    Ok(Ok(App::Derived { per_source }))
+}
+
 /// Rebases one platform; `Ok(Err(..))` when gates refuse.
 fn rebase_one(
     store: &Store,
@@ -265,6 +357,8 @@ fn rebase_one(
     new: &Loaded,
     opts: &ConvertOptions,
 ) -> Result<std::result::Result<RebasedImage, Vec<Refusal>>> {
+    // These two short-circuit: every other gate needs the old base's platform
+    // entry and the image's record (spec §16.3).
     let platforms = |l: &Loaded| l.entries.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>();
     if let Err(r) = gates::platform(platform, &platforms(old), &platforms(new)) {
         return Ok(Err(vec![r]));
@@ -275,13 +369,14 @@ fn rebase_one(
         return Ok(Err(vec![r]));
     }
     let record = im.config.base.as_ref().expect("bottom gate passed");
+    let (old_labels, new_labels) = (labels_of(store, om), labels_of(store, nm));
     let (mut old_view, mut new_view) = (merged(store, om)?, merged(store, nm)?);
     let mut refusals: Vec<Refusal> = [
         gates::distro(
             os_release(&mut old_view)?.as_deref(),
             os_release(&mut new_view)?.as_deref(),
         ),
-        gates::runtime(&om.config.labels, &nm.config.labels),
+        gates::runtime(old_labels.as_ref(), new_labels.as_ref()),
         gates::env(&om.config.process.env, &nm.config.process.env),
         gates::process(&om.config.process, &nm.config.process),
     ]
@@ -289,62 +384,73 @@ fn rebase_one(
     .filter_map(std::result::Result::err)
     .collect();
 
-    // Re-derive the app from its sources above the new base (§16.4).
-    let derived = source_image(store, im, platform).and_then(|src| {
-        let n = src.manifest.layers.len();
-        if record.source_layers >= n {
-            return Err(ImageError::SourceMissing(format!(
-                "the source manifest has {n} layers, but the base record claims {}",
-                record.source_layers
-            )));
+    let app = match derive_app(store, im, record, platform, om, nm, opts) {
+        Ok(Ok(app)) => app,
+        Ok(Err(r)) => {
+            refusals.push(r);
+            return Ok(Err(refusals));
         }
-        convert_layers(
-            store,
-            &src,
-            record.source_layers..n,
-            digests(nm),
-            opts,
-            &StoredOnly(store),
-        )
-    });
-    let app = match derived {
-        Ok(app) => app,
-        // A refusal says more than a missing source; report it first.
-        Err(_) if !refusals.is_empty() => return Ok(Err(refusals)),
+        // Reported with the gates' refusals, so none of them is lost.
+        Err(e @ ImageError::SourceMissing(_)) if !refusals.is_empty() => {
+            refusals.push(Refusal {
+                gate: "source",
+                reason: e.to_string(),
+            });
+            return Ok(Err(refusals));
+        }
         Err(e) => return Err(e),
     };
+    let checked: &[LayerReport] = match &app {
+        App::Derived { per_source } => per_source,
+        App::Kept(layers) => layers,
+    };
     let (mut ov, mut nv) = (ErofsView(old_view), ErofsView(new_view));
-    if let Err(r) = gates::shadow(&shadowed(store, &app)?, &mut ov, &mut nv)? {
+    if let Err(r) = gates::shadow(&shadowed(store, checked)?, &mut ov, &mut nv)? {
         refusals.push(r);
     }
     if !refusals.is_empty() {
         return Ok(Err(refusals));
     }
 
+    // Keep the image's app layering; squash further only to fit (spec §16.5).
+    let image_app = app_layers(&im.manifest)[record.layers..].to_vec();
     let new_base = app_layers(&nm.manifest);
     let m = new_base.len();
-    if opts.max_layers <= m {
-        return Err(ImageError::BadOption(format!(
-            "the new base has {m} layers, so --max-layers must be more than {m}"
-        )));
-    }
-    let reresolved = app.iter().filter(|l| l.inherits).count();
-    let (app, squashed) = squash_to(store, app, opts.max_layers - m, SquashKind::Upper)?;
-    let was = &app_layers(&im.manifest)[record.layers..];
-    let app_layers = app
+    let p = image_app.len();
+    let target = match req.max_layers {
+        Some(max) => p.min(app_budget(max, m)),
+        None => p.min((record.layers + p).saturating_sub(m).max(1)),
+    };
+    let (app, reresolved) = match app {
+        App::Derived { per_source } => {
+            let reresolved = per_source.iter().filter(|l| l.inherits).count();
+            (squash_to(store, per_source, target, SquashKind::Upper)?.0, reresolved)
+        }
+        App::Kept(layers) => (squash_to(store, layers, target, SquashKind::Upper)?.0, 0),
+    };
+    let squashed = match app.first().map_or(0, |l| l.sources.len()) {
+        0 | 1 => 0,
+        n => n,
+    };
+    let had: BTreeSet<&Digest> = image_app.iter().map(|d| &d.digest).collect();
+    let app_layers_out = app
         .iter()
-        .enumerate()
-        .map(|(i, l)| AppLayer {
+        .map(|l| AppLayer {
             erofs: l.erofs.clone(),
-            was: was.get(i).map(|d| d.digest.clone()),
+            reused: had.contains(&l.erofs),
         })
         .collect();
-    let mut layers: Vec<LayerReport> = new_base.iter().map(base_layer).collect();
+    let mut layers: Vec<LayerReport> = new_base.iter().map(kept_layer).collect();
     layers.extend(app);
 
     let mut config: KilnConfig = im.config.clone();
     config.process.env = gates::merge_env(&im.config.process.env, &om.config.process.env, &nm.config.process.env);
-    config.labels = gates::merge_labels(&im.config.labels, &om.config.labels, &nm.config.labels);
+    let image_labels = labels_of(store, im).unwrap_or_default();
+    config.labels = gates::merge_labels(
+        &image_labels,
+        old_labels.as_ref().expect("runtime gate passed"),
+        new_labels.as_ref().expect("runtime gate passed"),
+    );
     config.base = Some(BaseRecord {
         name: req.new.to_string(),
         manifest_digest: nm.digest.clone(),
@@ -364,7 +470,7 @@ fn rebase_one(
         platform: platform.clone(),
         manifest_digest,
         base_layers: m,
-        app: app_layers,
+        app: app_layers_out,
         reresolved,
         squashed,
     }))
@@ -373,7 +479,7 @@ fn rebase_one(
 /// Rebases every platform of `req.image` from `req.old` onto `req.new` (spec §16),
 /// then tags the result. Nothing is tagged unless every platform passes every gate.
 pub fn rebase(store: &Store, req: &RebaseRequest, opts: &ConvertOptions) -> Result<Rebased> {
-    if opts.max_layers == 0 || opts.jobs == 0 {
+    if req.max_layers == Some(0) || opts.jobs == 0 {
         return Err(ImageError::BadOption("max-layers and jobs must be at least 1".into()));
     }
     let _lock = store.lock_shared()?;
