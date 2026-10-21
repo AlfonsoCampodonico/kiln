@@ -1,8 +1,9 @@
 //! rtnetlink requests for `lo` and `eth0` (spec §9.6 stage 5): the guest has no
-//! `ip` binary, so init builds the three messages it needs itself. All values
-//! are native-endian, as netlink requires.
+//! `ip` binary, so init builds the messages it needs itself (a link up, and an
+//! address and a default route per address family). All values are
+//! native-endian, as netlink requires.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 const NLMSG_ERROR: u16 = 2;
 const RTM_NEWLINK: u16 = 16;
@@ -16,6 +17,8 @@ const NLM_F_CREATE: u16 = 0x400;
 
 const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
+const AF_INET6: u8 = 10;
+const IFA_F_NODAD: u8 = 0x02;
 const IFF_UP: u32 = 0x1;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
@@ -74,11 +77,31 @@ pub fn add_address(seq: u32, index: u32, addr: Ipv4Addr, prefix: u8) -> Vec<u8> 
     finish(m)
 }
 
+/// `ip -6 addr add <addr>/<prefix> dev <index> nodad`: usable at once, with no duplicate
+/// address detection (the host's namespace drops it anyway).
+pub fn add_address6(seq: u32, index: u32, addr: Ipv6Addr, prefix: u8) -> Vec<u8> {
+    let mut m = header(RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, seq);
+    m.extend_from_slice(&[AF_INET6, prefix, IFA_F_NODAD, RT_SCOPE_UNIVERSE]);
+    m.extend_from_slice(&index.to_ne_bytes());
+    attr(&mut m, IFA_LOCAL, &addr.octets());
+    attr(&mut m, IFA_ADDRESS, &addr.octets());
+    finish(m)
+}
+
 /// `ip route add default via <gateway> dev <index>`.
 pub fn add_default_route(seq: u32, index: u32, gateway: Ipv4Addr) -> Vec<u8> {
+    default_route(seq, index, AF_INET, &gateway.octets())
+}
+
+/// `ip -6 route add default via <gateway> dev <index>`.
+pub fn add_default_route6(seq: u32, index: u32, gateway: Ipv6Addr) -> Vec<u8> {
+    default_route(seq, index, AF_INET6, &gateway.octets())
+}
+
+fn default_route(seq: u32, index: u32, family: u8, gateway: &[u8]) -> Vec<u8> {
     let mut m = header(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, seq);
     m.extend_from_slice(&[
-        AF_INET,
+        family,
         0,
         0,
         0,
@@ -88,7 +111,7 @@ pub fn add_default_route(seq: u32, index: u32, gateway: Ipv4Addr) -> Vec<u8> {
         RTN_UNICAST,
     ]);
     m.extend_from_slice(&0u32.to_ne_bytes()); // rtm_flags
-    attr(&mut m, RTA_GATEWAY, &gateway.octets());
+    attr(&mut m, RTA_GATEWAY, gateway);
     attr(&mut m, RTA_OIF, &index.to_ne_bytes());
     finish(m)
 }
@@ -141,6 +164,36 @@ mod tests {
         let r = add_default_route(3, 3, Ipv4Addr::new(172, 30, 0, 1));
         assert_eq!(r.len(), 16 + 12 + 8 + 8);
         assert_eq!(&r[32..36], &[172, 30, 0, 1]);
+    }
+
+    #[test]
+    fn ipv6_messages_are_well_formed() {
+        let addr: Ipv6Addr = "fd76:6d6b:6974::2".parse().unwrap();
+        let a = add_address6(4, 3, addr, 64);
+        // nlmsghdr, ifaddrmsg, then IFA_LOCAL and IFA_ADDRESS with 16 bytes each.
+        assert_eq!(a.len(), 16 + 8 + 20 + 20);
+        assert_eq!(u32::from_ne_bytes(a[..4].try_into().unwrap()), a.len() as u32);
+        assert_eq!(u16::from_ne_bytes(a[4..6].try_into().unwrap()), RTM_NEWADDR);
+        assert_eq!(&a[16..20], &[AF_INET6, 64, IFA_F_NODAD, RT_SCOPE_UNIVERSE]);
+        assert_eq!(u32::from_ne_bytes(a[20..24].try_into().unwrap()), 3);
+        assert_eq!(u16::from_ne_bytes(a[26..28].try_into().unwrap()), IFA_LOCAL);
+        assert_eq!(&a[28..44], &addr.octets());
+        assert_eq!(u16::from_ne_bytes(a[46..48].try_into().unwrap()), IFA_ADDRESS);
+        assert_eq!(&a[48..64], &addr.octets());
+
+        let gw: Ipv6Addr = "fd76:6d6b:6974::1".parse().unwrap();
+        let r = add_default_route6(5, 3, gw);
+        assert_eq!(r.len(), 16 + 12 + 20 + 8);
+        assert_eq!(r[16], AF_INET6);
+        assert_eq!(
+            &r[17..20],
+            &[0, 0, 0],
+            "a default route: no destination or source prefix"
+        );
+        assert_eq!(u16::from_ne_bytes(r[30..32].try_into().unwrap()), RTA_GATEWAY);
+        assert_eq!(&r[32..48], &gw.octets());
+        assert_eq!(u16::from_ne_bytes(r[50..52].try_into().unwrap()), RTA_OIF);
+        assert_eq!(u32::from_ne_bytes(r[52..56].try_into().unwrap()), 3);
     }
 
     fn error_msg(seq: u32, err: i32) -> Vec<u8> {
