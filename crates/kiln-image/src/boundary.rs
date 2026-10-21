@@ -86,16 +86,18 @@ pub(crate) fn match_run(
     // With other layers above the merged one, their exact match pins the width;
     // alone, only the suggested widths are tried, so a one-layer base never
     // squashes every prefix.
+    // Widths come from hostile metadata too: one that does not fit is dropped.
+    let end_of = |g: usize| start.checked_add(g)?.checked_add(q - 1).filter(|&end| end <= n);
     let mut candidates: BTreeSet<usize> = widths.into_iter().filter(|&g| g >= 2).collect();
     if q > 1 {
-        candidates.extend((2..=n.saturating_sub(start + q - 1)).filter(|&g| {
-            let end = start + g + q - 1;
-            end <= n && same(&reports[start + g..end], &want[1..])
-        }));
+        candidates.extend(
+            (2..=n.saturating_sub(start + q - 1))
+                .filter(|&g| end_of(g).is_some_and(|end| same(&reports[start + g..end], &want[1..]))),
+        );
     }
     for g in candidates {
-        let end = start + g + q - 1;
-        if end > n || !same(&reports[start + g..end], &want[1..]) {
+        let Some(end) = end_of(g) else { continue };
+        if !same(&reports[start + g..end], &want[1..]) {
             continue;
         }
         if let Some(merged) = squash_if(store, &reports[start..start + g], kind, &want[0].digest)? {
@@ -134,7 +136,7 @@ fn match_base_at(
             .first()
             .and_then(hinted_width)
             .into_iter()
-            .chain(source.map(|s| s + 1 - want.len()));
+            .chain(source.and_then(|s| (s + 1).checked_sub(want.len())));
         return match_run(store, reports, 0, &want, SquashKind::Bottom, widths);
     };
     if depth >= MAX_CHAIN || r.layers > want.len() {
@@ -142,7 +144,12 @@ fn match_base_at(
     }
     let inner = match load_manifest(store, &r.manifest_digest) {
         Ok(m) => m,
-        Err(ImageError::Store(_)) => return Ok(None),
+        Err(ImageError::Store(_)) => {
+            return Err(ImageError::BaseMissing {
+                base: base.digest.clone(),
+                inner: r.manifest_digest.clone(),
+            });
+        }
         Err(e) => return Err(e),
     };
     let Some((k0, mut layers)) = match_base_at(store, reports, &inner, depth + 1)? else {
@@ -160,7 +167,7 @@ fn match_base_at(
         .first()
         .and_then(hinted_width)
         .into_iter()
-        .chain(source.map(|s| (s + 1).saturating_sub(r.source_layers + app.len())));
+        .chain(source.and_then(|s| (s + 1).checked_sub(r.source_layers.checked_add(app.len())?)));
     let Some((k, top)) = match_run(store, reports, k0, app, SquashKind::Upper, widths)? else {
         return Ok(None);
     };

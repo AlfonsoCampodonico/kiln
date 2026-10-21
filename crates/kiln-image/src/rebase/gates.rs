@@ -131,8 +131,9 @@ pub fn runtime(old: Option<&BTreeMap<String, String>>, new: Option<&BTreeMap<Str
             return refuse(
                 "runtime",
                 format!(
-                    "the {which} base's labels are unknown (converted before kiln recorded labels, and its source \
-                     config is gone); re-convert it"
+                    "the {which} base's labels are unknown: its kiln config was written by a kiln that did not \
+                     record labels, and its source config is not in this store. Use a {which} base converted or \
+                     pulled from a current kiln"
                 ),
             );
         }

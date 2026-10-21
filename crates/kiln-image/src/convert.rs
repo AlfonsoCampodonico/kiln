@@ -632,12 +632,13 @@ pub fn convert_image(
             reference: reference.map(str::to_string),
         },
         erofs_format_version: FORMAT_VERSION,
-        labels: img
-            .config
-            .config
-            .as_ref()
-            .and_then(|c| c.labels.clone())
-            .unwrap_or_default(),
+        labels: Some(
+            img.config
+                .config
+                .as_ref()
+                .and_then(|c| c.labels.clone())
+                .unwrap_or_default(),
+        ),
         base,
     };
     let (manifest_digest, manifest_size) = commit_manifest(store, &config, boot_layers, &layers)?;

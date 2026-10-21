@@ -240,8 +240,8 @@ fn convert_with_base_records_the_boundary() {
     assert_eq!(record.manifest_digest, f.manifest("base:1").digest);
     assert_eq!(f.layers("app:1")[..2], f.layers("base:1")[..]);
     assert_eq!(out.images[0].layers.len(), 4);
-    assert_eq!(m.config.labels["php.version"], "8.4.12");
-    assert_eq!(m.config.labels["app"], "demo");
+    assert_eq!(m.config.labels.as_ref().unwrap()["php.version"], "8.4.12");
+    assert_eq!(m.config.labels.as_ref().unwrap()["app"], "demo");
 }
 
 #[test]
@@ -361,8 +361,8 @@ fn rebase_swaps_the_base_and_refinalises_inheriting_layers() {
     );
     assert!(m.config.process.env.contains(&"PHP_VERSION=8.4.14".to_string()));
     assert!(m.config.process.env.contains(&"APP_ENV=production".to_string()));
-    assert_eq!(m.config.labels["php.version"], "8.4.14");
-    assert_eq!(m.config.labels["app"], "demo");
+    assert_eq!(m.config.labels.as_ref().unwrap()["php.version"], "8.4.14");
+    assert_eq!(m.config.labels.as_ref().unwrap()["app"], "demo");
     assert_eq!(m.config.source, f.manifest("app:1").config.source);
 
     // Deterministic, and reversible.
@@ -621,7 +621,7 @@ fn put_source(f: &Fixture, mut m: ImageManifest, c: &ImageConfig) -> Digest {
 fn labels_of_an_older_base_come_from_its_source_or_refuse() {
     let f = Fixture::new();
     f.base("base:1", &Base::old());
-    rewrite_config(&f, "base:1", |c| c.labels.clear());
+    rewrite_config(&f, "base:1", |c| c.labels = None);
     f.base(
         "base:2",
         &Base {
@@ -635,7 +635,7 @@ fn labels_of_an_older_base_come_from_its_source_or_refuse() {
     assert!(reason.contains("from 8.4.12 to 8.5.0"), "{reason}");
     f.rebase("base:1", "base:3", "app:1", "app:3").unwrap();
     assert_eq!(
-        f.manifest("app:3").config.labels["php.version"],
+        f.manifest("app:3").config.labels.as_ref().unwrap()["php.version"],
         "8.4.14",
         "labels follow the new base"
     );
@@ -689,8 +689,14 @@ fn rebase_still_works_after_gc() {
     f.app("app:1", "base:1", &Base::old(), &[app_code(), app_bin()])
         .unwrap();
     let removed = f.store.gc().unwrap().blobs_removed;
-    assert!(removed > 0, "the bases' and app_bin's tars go");
-    assert!(!f.store.has_blob(&Digest::of(&app_bin())));
+    assert!(removed > 0, "the bases' tars go");
+    // The app half's tars stay, the base half's go, even one that inherits.
+    assert!(f.store.has_blob(&Digest::of(&app_bin())) && f.store.has_blob(&Digest::of(&app_code())));
+    let base_half = Base::old().layers();
+    assert!(
+        !f.store.has_blob(&Digest::of(&base_half[1])),
+        "it has implicit parents, but is never re-derived"
+    );
     let out = f.rebase("base:1", "base:2", "app:1", "app:2").unwrap();
     assert!(out.images[0].app[0].changed() && !out.images[0].app[1].changed());
 }
@@ -884,4 +890,173 @@ fn rebase_keeps_the_image_app_layering() {
     };
     let out = rebase(&f.store, &req, &ConvertOptions::default()).unwrap();
     assert_eq!(out.images[0].app.len(), 1, "--max-layers squashes further");
+}
+
+/// A base whose recorded source manifest has fewer layers than the base itself, or
+/// whose own record claims an absurd source count, suggests widths that do not
+/// fit: they are dropped, never computed into a panic.
+#[test]
+fn hostile_source_counts_do_not_overflow() {
+    let f = Fixture::new();
+    f.base("base:1", &Base::old());
+    let empty = f
+        .store
+        .put_bytes(&canonical_json(&serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": "x", "digest": Digest::of(b"c").to_string(), "size": 1},
+            "layers": [],
+        })))
+        .unwrap();
+    rewrite_config(&f, "base:1", |c| c.source.manifest_digest = empty.clone());
+    let unrelated = vec![TarBuilder::new().file("x", b"x", &Opts::default()).finish(); 3];
+    let e = f
+        .convert_for(
+            "app:1",
+            &[arm()],
+            &unrelated,
+            Base::old().config(),
+            &f.on_base("base:1"),
+        )
+        .unwrap_err();
+    assert!(matches!(e, ImageError::NotOnBase(..)), "{e}");
+
+    // A chained base: its app half is tried with the record's source count.
+    f.base("base:0", &Base::old());
+    let mut mid = Base::old().layers();
+    mid.extend((0..3).map(|i| {
+        TarBuilder::new()
+            .file(&format!("opt/{i}"), b"m", &Opts::default())
+            .finish()
+    }));
+    let three = ConvertOptions {
+        max_layers: 3,
+        ..f.on_base("base:0")
+    };
+    f.convert_for("mid:1", &[arm()], &mid, Base::old().config(), &three)
+        .unwrap();
+    rewrite_config(&f, "mid:1", |c| {
+        c.source.manifest_digest = empty.clone();
+        c.base.as_mut().unwrap().source_layers = usize::MAX;
+    });
+    let mut tars = Base::old().layers();
+    tars.extend(unrelated);
+    let e = f
+        .convert_for("app:2", &[arm()], &tars, Base::old().config(), &f.on_base("mid:1"))
+        .unwrap_err();
+    assert!(matches!(e, ImageError::NotOnBase(..)), "{e}");
+}
+
+/// A squashed app half, then gc: rebase still re-derives it, whether or not the
+/// squash holds a layer that inherits from the base.
+#[test]
+fn a_squashed_app_half_survives_gc() {
+    let f = Fixture::new();
+    f.base("base:1", &Base::old());
+    f.base("base:2", &Base::patched());
+    let bins: Vec<Vec<u8>> = (0..3)
+        .map(|i| {
+            TarBuilder::new()
+                .dir("opt", &Opts::default().mode(0o755))
+                .file(&format!("opt/bin{i}"), b"b", &Opts::default())
+                .finish()
+        })
+        .collect();
+    let three = ConvertOptions {
+        max_layers: 3,
+        ..f.on_base("base:1")
+    };
+    let mut plain = Base::old().layers();
+    plain.extend(bins.clone());
+    f.convert_for("plain:1", &[arm()], &plain, Base::old().config(), &three)
+        .unwrap();
+    let mut mixed = Base::old().layers();
+    mixed.push(app_code());
+    mixed.extend(bins);
+    f.convert_for("mixed:1", &[arm()], &mixed, Base::old().config(), &three)
+        .unwrap();
+    f.store.gc().unwrap();
+    let out = f.rebase("base:1", "base:2", "plain:1", "plain:2").unwrap();
+    assert!(
+        !out.images[0].app[0].changed(),
+        "nothing inherits: the squash is the same"
+    );
+    let out = f.rebase("base:1", "base:2", "mixed:1", "mixed:2").unwrap();
+    assert!(out.images[0].app[0].changed(), "var/www follows the new /var");
+}
+
+fn labelled(labels: &[(&str, &str)]) -> ContainerConfig {
+    ContainerConfig {
+        cmd: Some(vec!["sh".into()]),
+        labels: Some(labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+        ..Default::default()
+    }
+}
+
+/// Configs record labels even when there are none, so a label-less base (most
+/// official images) is not "unknown" once its source is gone, and a label that a
+/// rebase dropped does not come back from the app's source.
+#[test]
+fn empty_labels_are_recorded() {
+    let f = Fixture::new();
+    let b = Base::old().layers();
+    f.convert("b:1", &b, labelled(&[("vendor", "acme")]), &ConvertOptions::default());
+    f.convert("b:2", &b, labelled(&[]), &ConvertOptions::default());
+    f.convert("b:3", &b, labelled(&[]), &ConvertOptions::default());
+    assert_eq!(f.manifest("b:2").config.labels, Some(BTreeMap::new()));
+    let mut tars = b.clone();
+    tars.push(app_code());
+    f.convert_for(
+        "app:1",
+        &[arm()],
+        &tars,
+        labelled(&[("vendor", "acme")]),
+        &f.on_base("b:1"),
+    )
+    .unwrap();
+    // As if pulled: no source config to fall back on (b:2 and b:3 share one).
+    let src = f.manifest("b:2").config.source.manifest_digest;
+    std::fs::remove_file(f.store.blob_path(&src)).unwrap();
+    f.rebase("b:1", "b:2", "app:1", "app:2").unwrap();
+    assert_eq!(f.manifest("app:2").config.labels, Some(BTreeMap::new()));
+    f.rebase("b:2", "b:3", "app:2", "app:3").unwrap();
+    assert_eq!(
+        f.manifest("app:3").config.labels,
+        Some(BTreeMap::new()),
+        "vendor stays dropped"
+    );
+}
+
+/// gc keeps a chained base's own base, so matching survives its tag moving; and a
+/// base whose own base is gone says so.
+#[test]
+fn a_chained_base_survives_gc_and_names_a_missing_inner_base() {
+    let f = Fixture::new();
+    f.base("a:1", &Base::old());
+    let mut b = Base::old().layers();
+    b.extend((0..3).map(|i| {
+        TarBuilder::new()
+            .file(&format!("opt/b{i}"), b"b", &Opts::default())
+            .finish()
+    }));
+    let three = ConvertOptions {
+        max_layers: 3,
+        ..f.on_base("a:1")
+    };
+    f.convert_for("b:1", &[arm()], &b, Base::old().config(), &three)
+        .unwrap();
+    let inner = f.manifest("a:1").digest;
+    f.base("a:1", &Base::patched());
+    f.store.gc().unwrap();
+    assert!(f.store.has_blob(&inner), "b:1's base is kept");
+    let mut c = b.clone();
+    c.push(app_code());
+    f.convert_for("c:1", &[arm()], &c, Base::old().config(), &f.on_base("b:1"))
+        .unwrap();
+
+    std::fs::remove_file(f.store.blob_path(&inner)).unwrap();
+    let e = f
+        .convert_for("c:2", &[arm()], &c, Base::old().config(), &f.on_base("b:1"))
+        .unwrap_err();
+    assert!(matches!(e, ImageError::BaseMissing { .. }), "{e}");
+    assert!(e.to_string().contains(&inner.to_string()), "{e}");
 }

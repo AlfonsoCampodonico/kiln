@@ -34,9 +34,10 @@ pub struct KilnConfig {
     pub init: Option<InitRef>,
     pub source: SourceRef,
     pub erofs_format_version: u32,
-    /// The source config's labels.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub labels: BTreeMap<String, String>,
+    /// The source config's labels, written even when empty by every kiln that
+    /// records them: `None` is a config from a kiln before labels (spec §5.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
     /// The base/app boundary, set by `convert --base` (spec §16.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<BaseRecord>,
@@ -159,7 +160,7 @@ mod tests {
                 reference: None,
             },
             erofs_format_version: 1,
-            labels: BTreeMap::new(),
+            labels: None,
             base: None,
         };
         let s = String::from_utf8(kiln_oci::canonical_json(&c)).unwrap();

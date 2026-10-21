@@ -268,12 +268,12 @@ fn kept_layer(d: &Descriptor) -> LayerReport {
     }
 }
 
-/// A base's labels: its config's, else its source config's when that is still in
-/// the store; `None` when neither says (a base converted before kiln recorded
-/// labels, whose source is gone).
+/// An image's labels: its config's (empty included), else, for a config from a
+/// kiln before labels, its source config's while that is still in the store;
+/// `None` when neither says.
 fn labels_of(store: &Store, m: &KilnManifest) -> Option<BTreeMap<String, String>> {
-    if !m.config.labels.is_empty() {
-        return Some(m.config.labels.clone());
+    if let Some(labels) = &m.config.labels {
+        return Some(labels.clone());
     }
     let src = source_image(store, m, &Platform::host()).ok()?;
     Some(src.config.config.and_then(|c| c.labels).unwrap_or_default())
@@ -311,15 +311,17 @@ fn derive_app(
     opts: &ConvertOptions,
 ) -> Result<std::result::Result<App, Refusal>> {
     let image_app = app_layers(&im.manifest)[record.layers..].to_vec();
+    // Without sources, the image's layers can be kept only if none depends on the base.
+    let keep = |why: String| {
+        if image_app.iter().any(|d| d.annotation(ANN_INHERITS).is_some()) {
+            Err(ImageError::SourceMissing(why))
+        } else {
+            Ok(Ok(App::Kept(image_app.iter().map(kept_layer).collect())))
+        }
+    };
     let src = match source_image(store, im, platform) {
         Ok(src) => src,
-        Err(ImageError::SourceMissing(why)) => {
-            // Without sources, layers can be kept only if none depends on the base.
-            if image_app.iter().any(|d| d.annotation(ANN_INHERITS).is_some()) {
-                return Err(ImageError::SourceMissing(why));
-            }
-            return Ok(Ok(App::Kept(image_app.iter().map(kept_layer).collect())));
-        }
+        Err(ImageError::SourceMissing(why)) => return keep(why),
         Err(e) => return Err(e),
     };
     let n = src.manifest.layers.len();
@@ -336,7 +338,11 @@ fn derive_app(
     let source = StoredOnly(store);
     // The sources must rebuild the image's own app layers above the old base, or
     // they are not this image's sources.
-    let above_old = convert_layers(store, &src, range.clone(), digests(om), opts, &source)?;
+    let above_old = match convert_layers(store, &src, range.clone(), digests(om), opts, &source) {
+        Ok(layers) => layers,
+        Err(ImageError::SourceMissing(why)) => return keep(why),
+        Err(e) => return Err(e),
+    };
     if as_layered(store, &above_old, &image_app)?.is_none() {
         return Ok(Err(Refusal {
             gate: "source",
@@ -446,11 +452,11 @@ fn rebase_one(
     let mut config: KilnConfig = im.config.clone();
     config.process.env = gates::merge_env(&im.config.process.env, &om.config.process.env, &nm.config.process.env);
     let image_labels = labels_of(store, im).unwrap_or_default();
-    config.labels = gates::merge_labels(
+    config.labels = Some(gates::merge_labels(
         &image_labels,
         old_labels.as_ref().expect("runtime gate passed"),
         new_labels.as_ref().expect("runtime gate passed"),
-    );
+    ));
     config.base = Some(BaseRecord {
         name: req.new.to_string(),
         manifest_digest: nm.digest.clone(),
