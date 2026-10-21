@@ -114,6 +114,8 @@ pub struct RestoreSpec {
     pub net: Option<NetSpec>,
     /// Serves the bundle's files that are not in `dir` (phase 3).
     pub chunks: Option<Arc<dyn ChunkSource>>,
+    /// Where disk copies and lazy backing files go (default `run_dir`, often a tmpfs).
+    pub scratch_dir: Option<PathBuf>,
 }
 
 pub enum RestoreDisk {
@@ -399,8 +401,8 @@ The bounds of §5.4 apply to `lazy.json` too, since kiln wrote it from untrusted
 - **Sandbox (Linux, no KVM):** a sandboxed `dd`/`cmp` reads a lazily served file through `Mount::Fuse` and `Mount::Rebind`. A counting `ChunkSource` shows only the touched chunks were fetched. A tampered chunk gives `EIO` and a `lazy.log` line.
 - **Contract (KVM, both backends):**
   - snapshot, then restore from a `lazy.json` bundle served by a counting source. The guest continues counting with its disk marker.
-  - On FC, the bytes fetched before the guest's first post-restore tick are a fraction of the memory size.
-  - On CH, the same holds with `lazy_memory`, and otherwise all data chunks are fetched and the zero chunks are not.
+  - With `lazy_memory`, the restore returns having fetched only the state files: memory comes in after `resume`. Without it (CH `Copy`), every memory data chunk is fetched before the restore returns.
+  - Either way zero chunks are never fetched, and nothing is fetched twice.
 - **kiln (Linux, KVM, local registry):** `kiln snapshot push` a vmkit bundle to the test registry, `pull --lazy` into an empty store, restore through vmkit with `StoreSource`, and the guest continues. The store then holds only the fetched chunks.
 
 ---
@@ -419,3 +421,23 @@ The bounds of §5.4 apply to `lazy.json` too, since kiln wrote it from untrusted
 - x86_64 is tested by vmkit's CI `contract-x86_64` job once the branch is pushed. kiln's KVM tests on x86_64 follow the repo's existing practice (§11.7).
 
 **Known environment limit:** Cloud Hypervisor 53 under aarch64 nested virtualization freezes guests at random and after resumes (HANDOFF, `tests/pause.rs`). Firecracker is the reference VMM. CH snapshot tests run alone (like `pause.rs`) and are judged on pass rates.
+
+---
+
+## 8. Findings during implementation (rev 1, 2026-10-21)
+
+**What the guest touches.** A restored busybox guest with 256 MiB of memory had 40 MiB of non-zero memory, in 1 MiB chunks.
+- Five ticks after resume it had fetched 37 MiB of those 40 MiB.
+- A Linux guest's kernel, page tables and slabs spread over nearly every chunk of the memory it uses.
+- So the gains from lazy memory are:
+  - restore returns before any memory is fetched;
+  - the zero chunks (216 MiB here) are never fetched;
+  - data the guest never needs stays remote.
+
+  A working set much smaller than used memory needs smaller chunks or the access-order prefetch of §5.6. The format allows both.
+
+**Cloud Hypervisor 53 under aarch64 nested virtualization**
+- A `Copy` restore of 256 MiB took about four minutes in the Lima template. Snapshot and restore calls get a ten-minute timeout.
+- Restoring a VM snapshotted before its guest had activated its virtio devices (mid-boot) panics CH: `GuestMemory(InvalidGuestAddress)` in `pci_device.rs`. The tests snapshot a guest only after it runs. vmkit does not guard against this; it reports the VMM's early exit.
+
+**userfaultfd.** On the Lima template, `vm.unprivileged_userfaultfd` is 0 and `/dev/userfaultfd` is root-only. CH's `OnDemand` restore fails there with `EPERM`, as §3 predicted, so vmkit uses `Copy` unless the caller may open `/dev/userfaultfd` (for example through an ACL) or the sysctl is 1.
