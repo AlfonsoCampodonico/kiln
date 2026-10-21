@@ -39,9 +39,52 @@ pub fn references(json: &serde_json::Value) -> Vec<Digest> {
 }
 
 impl Store {
+    /// What a kiln image config keeps of its source (spec §5.2, §16.4): the source
+    /// manifest and config, small JSON that `kiln rebase` reads. When the image
+    /// records a base, it also keeps the tars of the source layers above the base
+    /// (`base.sourceLayers..`), from which rebase re-derives the app half (a
+    /// squashed app half needs all of them), and its base's manifest, which the
+    /// caller then walks like any other (a chain of bases). Returns that manifest.
+    ///
+    /// What it keeps goes into `kept`, apart from the walk: a hostile config may
+    /// name another image's manifest as its source, and that manifest must still
+    /// be walked when its own ref reaches it.
+    fn keep_sources(&self, json: &serde_json::Value, kept: &mut BTreeSet<Digest>) -> Result<Option<Digest>> {
+        let digest = |v: Option<&serde_json::Value>| v.and_then(|d| d.as_str()).and_then(|s| Digest::parse(s).ok());
+        if json.get("erofsFormatVersion").is_none() {
+            return Ok(None);
+        }
+        let base = digest(json.pointer("/base/manifestDigest"));
+        let Some(src) = digest(json.pointer("/source/manifestDigest")) else {
+            return Ok(base);
+        };
+        let parse = |d: &Digest| -> Result<Option<serde_json::Value>> {
+            if !self.has_blob(d) {
+                return Ok(None);
+            }
+            match self.read_metadata(d) {
+                Ok(b) => Ok(serde_json::from_slice(&b).ok()),
+                Err(StoreError::TooLarge { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
+        };
+        let Some(manifest) = parse(&src)? else { return Ok(base) };
+        kept.insert(src);
+        if let Some(config) = digest(manifest.pointer("/config/digest")) {
+            kept.insert(config);
+        }
+        let first_app = json.pointer("/base/sourceLayers").and_then(|v| v.as_u64());
+        if let (Some(first), Some(layers)) = (first_app, manifest.get("layers").and_then(|v| v.as_array())) {
+            let first = usize::try_from(first).unwrap_or(usize::MAX);
+            kept.extend(layers.iter().skip(first).filter_map(|l| digest(l.get("digest"))));
+        }
+        Ok(base)
+    }
+
     /// Blobs reachable from refs.
     pub fn live_blobs(&self) -> Result<BTreeSet<Digest>> {
         let mut live = BTreeSet::new();
+        let mut kept = BTreeSet::new();
         let mut stack: Vec<Digest> = self.refs()?.into_values().collect();
         while let Some(d) = stack.pop() {
             if !live.insert(d.clone()) || !self.has_blob(&d) {
@@ -54,8 +97,10 @@ impl Store {
             };
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 stack.extend(references(&json));
+                stack.extend(self.keep_sources(&json, &mut kept)?);
             }
         }
+        live.extend(kept);
         Ok(live)
     }
 
@@ -221,6 +266,82 @@ mod tests {
         assert_eq!(s.cache_get(CacheKind::InitLayers, &key(&old_init)).unwrap(), None);
         // Without roots, all of it goes.
         assert_eq!(s.gc().unwrap().blobs_removed, 3);
+    }
+
+    /// A kiln config keeps its source manifest and config. One that records a base
+    /// also keeps the tars above the base, and its base's manifest and what that
+    /// keeps in turn; never the base half's tars.
+    #[test]
+    fn kiln_configs_keep_what_rebase_needs_of_their_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let put = |v: serde_json::Value| s.put_bytes(&serde_json::to_vec(&v).unwrap()).unwrap();
+        let tars: Vec<Digest> = (0..3)
+            .map(|i| s.put_bytes(format!("tar {i}").as_bytes()).unwrap())
+            .collect();
+        let src_config = put(serde_json::json!({"rootfs": {"type": "layers", "diff_ids": []}}));
+        let src = put(serde_json::json!({
+            "config": {"digest": src_config.to_string()},
+            "layers": tars.iter().map(|t| serde_json::json!({"digest": t.to_string()})).collect::<Vec<_>>(),
+        }));
+        let image = |config: serde_json::Value| {
+            let c = put(config);
+            put(serde_json::json!({"config": {"digest": c.to_string()}, "layers": []}))
+        };
+        let inner_src = put(serde_json::json!({"config": {"digest": src_config.to_string()}, "layers": []}));
+        let inner =
+            image(serde_json::json!({"erofsFormatVersion": 1, "source": {"manifestDigest": inner_src.to_string()}}));
+        let kiln = |base: bool| {
+            let mut c = serde_json::json!({"erofsFormatVersion": 1, "source": {"manifestDigest": src.to_string()}});
+            if base {
+                c["base"] = serde_json::json!({"manifestDigest": inner.to_string(), "layers": 1, "sourceLayers": 1});
+            }
+            image(c)
+        };
+        s.set_ref("plain", &kiln(false)).unwrap();
+        let live = s.live_blobs().unwrap();
+        assert!(live.contains(&src) && live.contains(&src_config));
+        assert!(tars.iter().all(|t| !live.contains(t)));
+        assert!(!live.contains(&inner));
+        s.set_ref("based", &kiln(true)).unwrap();
+        let live = s.live_blobs().unwrap();
+        assert!(!live.contains(&tars[0]), "the base half is never re-derived");
+        assert!(live.contains(&tars[1]) && live.contains(&tars[2]), "the app half is");
+        assert!(
+            live.contains(&inner) && live.contains(&inner_src),
+            "the chain is walked"
+        );
+    }
+
+    /// A config naming another image's manifest as its "source" must not stop gc
+    /// from walking that image: refs pop in reverse name order, so `zz-evil` comes
+    /// first. `sourceLayers` is past the victim's one layer, so only walking the
+    /// victim keeps that layer.
+    #[test]
+    fn a_hostile_source_pointer_cannot_hide_another_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let put = |v: serde_json::Value| s.put_bytes(&serde_json::to_vec(&v).unwrap()).unwrap();
+        let (layer, config) = (
+            s.put_bytes(b"victim layer").unwrap(),
+            put(serde_json::json!({"erofsFormatVersion": 1})),
+        );
+        let victim = put(
+            serde_json::json!({"config": {"digest": config.to_string()}, "layers": [{"digest": layer.to_string()}]}),
+        );
+        s.set_ref("app:1", &victim).unwrap();
+        let evil_config = put(serde_json::json!({
+            "erofsFormatVersion": 1,
+            "source": {"manifestDigest": victim.to_string()},
+            "base": {"manifestDigest": victim.to_string(), "layers": 0, "sourceLayers": 1},
+        }));
+        let evil = put(serde_json::json!({"config": {"digest": evil_config.to_string()}, "layers": []}));
+        s.set_ref("zz-evil:1", &evil).unwrap();
+        let live = s.live_blobs().unwrap();
+        for d in [&victim, &config, &layer] {
+            assert!(live.contains(d), "{d}");
+        }
+        assert_eq!(s.gc().unwrap().blobs_removed, 0);
     }
 
     #[test]

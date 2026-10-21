@@ -289,9 +289,10 @@ fn golden_manifest_digest_is_stable() {
     let path = layout(src.path(), &[arm()], &[gz(&base(0o1777)), gz(&top())]);
     let out = convert_local(&store, &path, &req(&[arm()], "g"), &ConvertOptions::default()).unwrap();
     // Changes only with an erofs format bump or a deliberate kiln schema change (spec §6.6);
-    // update both together.
+    // update both together. Last change: the config always records `labels` (spec
+    // §5.1, rev 2.13).
     assert_eq!(
         out.digest.to_string(),
-        "sha256:1d582c644583152fcf8d62bd7bdca95acb48e2ed0c4c03794267b791d7b47e33"
+        "sha256:df76535d4264a2fd93139f2a6c12bc8a97e354b1fcc513e751a9ff7ab3ea317a"
     );
 }

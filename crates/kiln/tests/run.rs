@@ -1339,3 +1339,54 @@ fn the_scratch_disk_holds_more_than_the_vmms_memory() {
         assert!(left.is_empty(), "{left:?}");
     }
 }
+
+/// A rebased image boots and sees the new base under its unchanged app layer
+/// (spec §16), whose implicit parent `srv/` is re-finalised against the new base.
+#[test]
+fn a_rebased_image_boots_on_the_new_base() {
+    let Some(f) = fixture() else { return };
+    let cfg = ContainerConfig {
+        cmd: Some(vec!["/bin/sh".into(), "-c".into(), "cat /marker /srv/app/hello".into()]),
+        ..Default::default()
+    };
+    let app = TarBuilder::new()
+        .file("srv/app/hello", b" app\n", &Opts::default())
+        .finish();
+    let convert = |name: &str, layers: Vec<Vec<u8>>, base: Option<&str>| {
+        let path = f._dirs[0].path().join(name);
+        let mut b = LayoutBuilder::new(&path);
+        let layers: Vec<TestLayer> = layers.into_iter().map(TestLayer::tar).collect();
+        let d = b.image(&Platform::host(), &layers, cfg.clone());
+        b.add(d, None).finish();
+        let mut c = f.kiln();
+        c.args(["convert", "--boot-layers", "none", "--tag", name]);
+        if let Some(base) = base {
+            c.args(["--base", base]);
+        }
+        let out = c.arg(&path).finish();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    let (old, new) = (
+        busybox_layer(&f.env.busybox, "base-1"),
+        busybox_layer(&f.env.busybox, "base-2"),
+    );
+    convert("base1", vec![old.clone()], None);
+    convert("base2", vec![new], None);
+    convert("app1", vec![old, app], Some("base1"));
+    let out = f
+        .kiln()
+        .args(["rebase", "base1", "base2", "app1", "--tag", "app2"])
+        .finish();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("1 app layer (0 changed, 1 re-resolved)"),
+        "{}",
+        text(&out.stdout)
+    );
+    for (image, want) in [("app1", "base-1 app\n"), ("app2", "base-2 app\n")] {
+        // Two boots in a row; a loaded nested-virt host can take longer than 30 s.
+        let o = f.output(&["--boot-timeout", "170", image]);
+        assert_eq!(code(&o), 0, "{image}: {}", text(&o.stderr));
+        assert_eq!(text(&o.stdout), want);
+    }
+}

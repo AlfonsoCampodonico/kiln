@@ -47,22 +47,11 @@ pub fn convert_resolved(
         });
     }
     images.sort_by(|a, b| a.platform.cmp(&b.platform));
-    let index = ImageIndex {
-        schema_version: 2,
-        media_type: Some(OCI_INDEX.to_string()),
-        artifact_type: Some(KILN_ARTIFACT.to_string()),
-        manifests: images
-            .iter()
-            .map(|c| {
-                let mut d = Descriptor::new(OCI_MANIFEST, c.manifest_digest.clone(), c.manifest_size);
-                d.artifact_type = Some(KILN_ARTIFACT.to_string());
-                d.platform = Some(c.platform.clone());
-                d
-            })
-            .collect(),
-        annotations: None,
-    };
-    let digest = store.put_bytes(&canonical_json(&index))?;
+    let entries = images
+        .iter()
+        .map(|c| (c.platform.clone(), c.manifest_digest.clone(), c.manifest_size))
+        .collect();
+    let digest = write_index(store, entries)?;
     Ok(Output {
         digest,
         media_type: OCI_INDEX,
@@ -70,6 +59,26 @@ pub fn convert_resolved(
         layers_downloaded: 0,
         bytes_downloaded: 0,
     })
+}
+
+/// Writes a kiln image index over per-platform manifests `(platform, digest, size)`.
+pub(crate) fn write_index(store: &Store, entries: Vec<(Platform, Digest, u64)>) -> Result<Digest> {
+    let index = ImageIndex {
+        schema_version: 2,
+        media_type: Some(OCI_INDEX.to_string()),
+        artifact_type: Some(KILN_ARTIFACT.to_string()),
+        manifests: entries
+            .into_iter()
+            .map(|(platform, digest, size)| {
+                let mut d = Descriptor::new(OCI_MANIFEST, digest, size);
+                d.artifact_type = Some(KILN_ARTIFACT.to_string());
+                d.platform = Some(platform);
+                d
+            })
+            .collect(),
+        annotations: None,
+    };
+    Ok(store.put_bytes(&canonical_json(&index))?)
 }
 
 /// What to convert from a local OCI layout or `docker save` archive.
