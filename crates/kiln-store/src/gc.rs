@@ -38,38 +38,21 @@ pub fn references(json: &serde_json::Value) -> Vec<Digest> {
     out
 }
 
-/// The `<source digest>@<diff_id hex>@` prefixes of `cache/layers` entries that are
-/// `parents [...]`: source layers whose conversion inherits from the layers below.
-fn inheriting_prefixes(store: &Store) -> Result<BTreeSet<String>> {
-    Ok(store
-        .cache_entries(CacheKind::Layers)?
-        .into_iter()
-        .filter(|(_, v)| v.starts_with("parents "))
-        .filter_map(|(path, _)| {
-            let name = path.file_name()?.to_str()?.to_string();
-            let cut = name.rfind('@')?;
-            Some(name[..=cut].to_string())
-        })
-        .collect())
-}
-
 impl Store {
     /// What a kiln image config keeps of its source (spec §5.2, §16.4): the source
-    /// manifest and config, small JSON that `kiln rebase` reads; and, when the
-    /// image records a base, the tars of its source layers that inherit from the
-    /// layers below, which rebase re-finalises. Other source tars are not kept.
-    fn keep_sources(
-        &self,
-        json: &serde_json::Value,
-        live: &mut BTreeSet<Digest>,
-        inheriting: &mut Option<BTreeSet<String>>,
-    ) -> Result<()> {
+    /// manifest and config, small JSON that `kiln rebase` reads. When the image
+    /// records a base, it also keeps the tars of the source layers above the base
+    /// (`base.sourceLayers..`), from which rebase re-derives the app half (a
+    /// squashed app half needs all of them), and its base's manifest, which the
+    /// caller then walks like any other (a chain of bases). Returns that manifest.
+    fn keep_sources(&self, json: &serde_json::Value, live: &mut BTreeSet<Digest>) -> Result<Option<Digest>> {
         let digest = |v: Option<&serde_json::Value>| v.and_then(|d| d.as_str()).and_then(|s| Digest::parse(s).ok());
         if json.get("erofsFormatVersion").is_none() {
-            return Ok(());
+            return Ok(None);
         }
+        let base = digest(json.pointer("/base/manifestDigest"));
         let Some(src) = digest(json.pointer("/source/manifestDigest")) else {
-            return Ok(());
+            return Ok(base);
         };
         let parse = |d: &Digest| -> Result<Option<serde_json::Value>> {
             if !self.has_blob(d) {
@@ -81,42 +64,22 @@ impl Store {
                 Err(e) => Err(e),
             }
         };
-        let Some(manifest) = parse(&src)? else { return Ok(()) };
+        let Some(manifest) = parse(&src)? else { return Ok(base) };
         live.insert(src);
-        let Some(config_digest) = digest(manifest.pointer("/config/digest")) else {
-            return Ok(());
-        };
-        live.insert(config_digest.clone());
-        if json.get("base").is_none() {
-            return Ok(());
+        if let Some(config) = digest(manifest.pointer("/config/digest")) {
+            live.insert(config);
         }
-        let Some(config) = parse(&config_digest)? else {
-            return Ok(());
-        };
-        let diff_ids = config.pointer("/rootfs/diff_ids").and_then(|v| v.as_array());
-        let layers = manifest.get("layers").and_then(|v| v.as_array());
-        let (Some(diff_ids), Some(layers)) = (diff_ids, layers) else {
-            return Ok(());
-        };
-        if inheriting.is_none() {
-            *inheriting = Some(inheriting_prefixes(self)?);
+        let first_app = json.pointer("/base/sourceLayers").and_then(|v| v.as_u64());
+        if let (Some(first), Some(layers)) = (first_app, manifest.get("layers").and_then(|v| v.as_array())) {
+            let first = usize::try_from(first).unwrap_or(usize::MAX);
+            live.extend(layers.iter().skip(first).filter_map(|l| digest(l.get("digest"))));
         }
-        let prefixes = inheriting.as_ref().expect("just filled");
-        for (layer, diff_id) in layers.iter().zip(diff_ids) {
-            let (Some(layer), Some(diff_id)) = (digest(layer.get("digest")), digest(Some(diff_id))) else {
-                continue;
-            };
-            if prefixes.contains(&format!("{layer}@{}@", diff_id.hex()).replace(':', "_")) {
-                live.insert(layer);
-            }
-        }
-        Ok(())
+        Ok(base)
     }
 
     /// Blobs reachable from refs.
     pub fn live_blobs(&self) -> Result<BTreeSet<Digest>> {
         let mut live = BTreeSet::new();
-        let mut inheriting = None;
         let mut stack: Vec<Digest> = self.refs()?.into_values().collect();
         while let Some(d) = stack.pop() {
             if !live.insert(d.clone()) || !self.has_blob(&d) {
@@ -129,7 +92,7 @@ impl Store {
             };
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 stack.extend(references(&json));
-                self.keep_sources(&json, &mut live, &mut inheriting)?;
+                stack.extend(self.keep_sources(&json, &mut live)?);
             }
         }
         Ok(live)
@@ -299,56 +262,49 @@ mod tests {
         assert_eq!(s.gc().unwrap().blobs_removed, 3);
     }
 
-    /// A kiln config keeps its source manifest and config; one that records a base
-    /// also keeps the tars of its inheriting source layers, and no others.
+    /// A kiln config keeps its source manifest and config. One that records a base
+    /// also keeps the tars above the base, and its base's manifest and what that
+    /// keeps in turn; never the base half's tars.
     #[test]
     fn kiln_configs_keep_what_rebase_needs_of_their_sources() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
-        let (plain, inheriting) = (
-            s.put_bytes(b"plain tar").unwrap(),
-            s.put_bytes(b"inheriting tar").unwrap(),
-        );
-        let (d1, d2) = (Digest::of(b"diff 1"), Digest::of(b"diff 2"));
-        let src_config =
-            serde_json::json!({"rootfs": {"type": "layers", "diff_ids": [d1.to_string(), d2.to_string()]}});
-        let src_config = s.put_bytes(&serde_json::to_vec(&src_config).unwrap()).unwrap();
-        let src = serde_json::json!({
+        let put = |v: serde_json::Value| s.put_bytes(&serde_json::to_vec(&v).unwrap()).unwrap();
+        let tars: Vec<Digest> = (0..3)
+            .map(|i| s.put_bytes(format!("tar {i}").as_bytes()).unwrap())
+            .collect();
+        let src_config = put(serde_json::json!({"rootfs": {"type": "layers", "diff_ids": []}}));
+        let src = put(serde_json::json!({
             "config": {"digest": src_config.to_string()},
-            "layers": [{"digest": plain.to_string()}, {"digest": inheriting.to_string()}],
-        });
-        let src = s.put_bytes(&serde_json::to_vec(&src).unwrap()).unwrap();
-        s.cache_put(CacheKind::Layers, &format!("{plain}@{}@1", d1.hex()), "erofs sha256:00")
-            .unwrap();
-        s.cache_put(
-            CacheKind::Layers,
-            &format!("{inheriting}@{}@1", d2.hex()),
-            "parents [\"61\"]",
-        )
-        .unwrap();
-        let tag = |name: &str, base: bool| {
-            let mut config =
-                serde_json::json!({"erofsFormatVersion": 1, "source": {"manifestDigest": src.to_string()}});
-            if base {
-                config["base"] = serde_json::json!({"layers": 1});
-            }
-            let c = s.put_bytes(&serde_json::to_vec(&config).unwrap()).unwrap();
-            let m = s
-                .put_bytes(
-                    &serde_json::to_vec(&serde_json::json!({"config": {"digest": c.to_string()}, "layers": []}))
-                        .unwrap(),
-                )
-                .unwrap();
-            s.set_ref(name, &m).unwrap();
+            "layers": tars.iter().map(|t| serde_json::json!({"digest": t.to_string()})).collect::<Vec<_>>(),
+        }));
+        let image = |config: serde_json::Value| {
+            let c = put(config);
+            put(serde_json::json!({"config": {"digest": c.to_string()}, "layers": []}))
         };
-        tag("plain", false);
+        let inner_src = put(serde_json::json!({"config": {"digest": src_config.to_string()}, "layers": []}));
+        let inner =
+            image(serde_json::json!({"erofsFormatVersion": 1, "source": {"manifestDigest": inner_src.to_string()}}));
+        let kiln = |base: bool| {
+            let mut c = serde_json::json!({"erofsFormatVersion": 1, "source": {"manifestDigest": src.to_string()}});
+            if base {
+                c["base"] = serde_json::json!({"manifestDigest": inner.to_string(), "layers": 1, "sourceLayers": 1});
+            }
+            image(c)
+        };
+        s.set_ref("plain", &kiln(false)).unwrap();
         let live = s.live_blobs().unwrap();
         assert!(live.contains(&src) && live.contains(&src_config));
-        assert!(!live.contains(&plain) && !live.contains(&inheriting));
-        tag("based", true);
+        assert!(tars.iter().all(|t| !live.contains(t)));
+        assert!(!live.contains(&inner));
+        s.set_ref("based", &kiln(true)).unwrap();
         let live = s.live_blobs().unwrap();
-        assert!(live.contains(&inheriting), "rebase re-finalises it");
-        assert!(!live.contains(&plain), "a cache hit needs no tar");
+        assert!(!live.contains(&tars[0]), "the base half is never re-derived");
+        assert!(live.contains(&tars[1]) && live.contains(&tars[2]), "the app half is");
+        assert!(
+            live.contains(&inner) && live.contains(&inner_src),
+            "the chain is walked"
+        );
     }
 
     #[test]
