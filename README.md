@@ -174,7 +174,7 @@ How the commands move images between registries, local sources, stores and micro
 | `kiln import --from-store DIR NAME [--as NAME]` | Copies an image from another, possibly read-only, store, verifying every blob. |
 | `kiln inspect NAME [--json]` | Shows an image's platforms, process, provenance, boot layers and layers. |
 | `kiln ls [--json]` | Lists tagged images. |
-| `kiln gc` | Removes blobs and cache entries no tag reaches. Pinned kernels and kiln-init stay, so cached runs keep working offline. Each image's source manifest and config stay too, and for images converted with `--base`, the source tars `kiln rebase` re-finalises. |
+| `kiln gc` | Removes blobs and cache entries no tag reaches. Pinned kernels and kiln-init stay, so cached runs keep working offline. Each image's source manifest and config stay too; for images converted with `--base`, so do the source tars of the app half (not the base's), which `kiln rebase` re-derives from, and the base's manifest. |
 | `kiln rebase OLD NEW IMAGE --tag NAME` | Swaps an image's base layers for a patched base without rebuilding, or refuses with the reason. |
 | `kiln run [OPTIONS] IMAGE [CMD...]` | Boots an image in a microVM and runs its command. See [docs/running.md](docs/running.md). |
 | `kiln bench LAYOUT` | Measures cold, warm and changed-top-layer conversions of a local OCI layout and prints JSON. |
@@ -202,7 +202,7 @@ An argument that names an existing path is a local source; anything else must be
 - **Refusals:** the rebase is refused, with the reason, when the platform, the distro release, a `<lang>.version` label's major.minor or the start contract changes, or when `NEW` drops an env var. It is also refused when any file the app layers shadow (copy up, replace or delete) differs between the two bases, which catches `sed -i` over a base config.
 - **Sources:** the image's sources must rebuild its own app layers on `OLD`, or the rebase is refused. `kiln gc` keeps what rebase needs.
 - **Layering:** the image keeps its app layering. `--max-layers N` caps the result's layer count, and without it the app is squashed further only when `NEW` has more layers than `OLD`.
-- **Exit status:** 1 on a refusal or error.
+- **Exit status:** 1 on a refusal or error, 2 on a usage error.
 
 ### `kiln run`
 

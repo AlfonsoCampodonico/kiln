@@ -284,7 +284,9 @@ A `kiln` image is an OCI 1.1 artifact.
   - `source`: `{ manifestDigest, reference? }`. `reference` is present only for registry inputs, normalised (e.g. `docker.io/library/php:8.4-cli`). Local inputs omit it, keeping manifests deterministic.
   - `erofsFormatVersion`
   - `services` (M3d, omitted when empty): processes `kiln-init` starts before the main process, from the source config's `dev.kiln.services` label (§9.8). A config with services has `schemaVersion` 2, one without keeps 1, so a kiln older than M3d refuses an image with services (rev 2.11).
-  - `labels`: the source config's labels, omitted when empty. Recording them gives a labelled source a new image digest even without `--base`; unlabelled sources, and so the golden digests, are unchanged. This was accepted (rev 2.12): the runtime gate (§16.3) needs a base's labels, and the kiln config is where they survive `gc`.
+  - `labels`: the source config's labels. It is **always** written, `{}` when there are none, so an absent field means a config from a kiln that did not record labels, and an empty one means none.
+    - **Why:** the runtime gate (§16.3) must tell "no labels" from "not recorded", which only the field's presence can do once the source config is gone (a pulled base); the kiln config is also where labels survive `gc`.
+    - **Cost, accepted in rev 2.12:** every newly converted image gets a one-time config (and so manifest) digest change, labelled or not, and the golden manifest digest moved with it. Layer blobs and caches are unaffected, and configs without the field still read.
   - `base` (only for `convert --base`, §16.2): `{ name, manifestDigest, layers, sourceLayers }`. The image's bottom `layers` app layers (kernel and init layers never count) are the base's, and they came from its first `sourceLayers` OCI layers.
   - There is **no** kernel cmdline field (T4). There is **no** `kiln` version field, so patch releases that produce identical output produce identical digests.
 - **Layers, in boot order:**
@@ -319,7 +321,10 @@ $KILN_HOME/
 - **Atomic writes:** write to `tmp/`, `fsync`, then `rename`. A cache entry is written only after its blob is committed and verified.
 - **Cache hits** `stat` the target blob. A missing blob counts as a miss.
 - **GC** takes the exclusive lock, marks from `refs.json` and from the pinned artifacts (every blob the compiled table of §8.1 names, and the init layers built from its kiln-init binaries), deletes dangling or unreferenced cache entries **before** blobs, then deletes blobs. The pinned roots keep runs that need no network working after GC.
-  - **Sources kept for rebase (§16.4):** every kiln image config also keeps its source manifest and config, a few KB of JSON. One that records a base also keeps the tars of its source layers that inherit from the layers below (those with a `parents` entry in `cache/layers`), so `kiln rebase` can re-finalise them. That costs the store those tars' compressed size, usually the small app layers that write into base directories. Other source tars are freed.
+  - **Sources kept for rebase (§16.4):** every kiln image config also keeps its source manifest and config, a few KB of JSON. One that records a base also keeps:
+    - the tars of its source layers above the base (`base.sourceLayers` onwards), from which `kiln rebase` re-derives the app half. All of them, not only those that inherit: a squashed app half is re-derived from every layer it merged, and the per-source erofs blobs it was merged from are not referenced. That costs the store the app's compressed source layers, about what pulling the app half costs; the compressed tars are cheaper to keep than the per-source erofs blobs plus their cache entries;
+    - its base's manifest, walked like any other root, so a chain of bases keeps every base's manifest, config and sources.
+  - The base half's tars are never kept: rebase never re-derives them.
 - **`kiln run`** holds the shared lock only during setup. Once the VMM sandbox holds open file descriptors and bind mounts, a GC that deletes a blob cannot affect the running VM on Linux.
 
 ### 5.3 Run state
@@ -943,7 +948,7 @@ The env gate catches that instance. The general fix is the shadowed-path gate: a
   - Only erofs digests are compared, so the match is exact and needs neither `NAME`'s source manifest nor any trust in annotations (T1).
   - **A squashed bottom layer.** When `NAME`'s bottom layer is a squash, the width it merged is suggested by its `dev.kiln.source.digests` annotation and by `NAME`'s source manifest, when that is in the store. With layers above it, also by every width whose layers above match `NAME`'s exactly. A one-layer base gets only the suggested widths, never every prefix.
   - **Checking a width.** Each candidate is squashed and compared by digest; a squash that does not match is discarded, never stored.
-  - **A chained base.** When `NAME` itself records a base, its own base is matched first (recursively, up to 8 deep), then its app half as the upper squash it was (§6.4).
+  - **A chained base.** When `NAME` itself records a base, its own base is matched first (recursively, up to 8 deep), then its app half as the upper squash it was (§6.4). An inner base missing from the store is reported as such, not as "not built on `NAME`"; `gc` keeps inner bases (§5.2).
   - If there is no match, `convert` fails: the image is not built on that base. If `k` is all of `SRC`'s layers, it also fails: there is nothing to rebase.
 - **Alternatives rejected:**
   - A `--base` that takes an OCI reference would resolve and convert a second image on every `convert`. Converting the base once and naming the kiln image is cheaper, and it is what `rebase` needs anyway.
@@ -968,7 +973,7 @@ Each gate is a pure function in `kiln-image` with its own unit tests. `rebase` r
 | `platform` | `OLD`, `NEW` and the `IMAGE` entry differ in os, architecture or variant. A variant is compared only when both sides name one, since single-manifest kiln images do not record it. Every platform of `IMAGE` must exist in `OLD` and `NEW`. |
 | `bottom` | `IMAGE` has no base record; or its bottom `base.layers` layer digests differ from `OLD`'s layers. If the record's `manifestDigest` differs from `OLD`'s but the layers match, the rebase goes ahead: same layers, re-converted config. |
 | `distro` | `/etc/os-release` (or `/usr/lib/os-release`), read from each base's merged view with symlinks followed, shows a different `ID`, or a different release: `VERSION_CODENAME` when both have one, else the first two components of `VERSION_ID`. A file present in only one base also refuses. Neither having one (scratch, distroless) passes. |
-| `runtime` | A label ending in `.version` on `OLD` (`php.version=8.4.12`) is missing on `NEW` or has a different `major.minor`. A base's labels are its kiln config's, else its source config's while that is in the store. A base for which neither says is refused: a base converted before kiln recorded labels cannot be told from one without labels. |
+| `runtime` | A label ending in `.version` on `OLD` (`php.version=8.4.12`) is missing on `NEW` or has a different `major.minor`. A base's labels are its kiln config's, else its source config's while that is in the store. A base for which neither says is refused: only a config written by a kiln before labels, whose source is not in the store, can be in that state (§5.1). The refusal says to use a base converted or pulled from a current kiln, since a pulled base cannot be re-converted locally. |
 | `env` | `NEW` drops an environment variable `OLD` defines. |
 | `process` | `OLD` and `NEW` differ in entrypoint, cmd, user, working directory or stop signal. |
 | `source` | The image's recorded sources do not rebuild its own app layers on `OLD` (§16.4). |
@@ -1002,7 +1007,7 @@ Each gate is a pure function in `kiln-image` with its own unit tests. `rebase` r
 - **Without sources** (a pulled image, or one whose source manifest is gone):
   - When no app layer is annotated `dev.kiln.inherits`, the app layers are kept as they are and the shadowed-path gate walks them. The annotation here decides only whether sources are needed: keeping a layer keeps exactly the image's own bytes, so a missing annotation can at worst keep attributes the image already had.
   - Otherwise rebase fails and says to re-convert.
-- **Missing tars.** If a source tar that a layer needs is not in the store, rebase fails, names the layer, and says to re-convert. `gc` keeps the tars of inheriting layers of images that record a base (§5.2), so this happens only when they were deleted by hand.
+- **Missing tars.** `gc` keeps the app half's tars of images that record a base (§5.2), so tars go missing only when deleted by hand. Then, as without sources, the image's own app layers are kept if none inherits from the base; otherwise rebase fails, names the layer, and says to re-convert.
 - **Layering and report.** The app half keeps `IMAGE`'s own layering: the same number of app layers, its bottom ones merged by the same upper squash.
   - `--max-layers N` lowers that to fit `N` (at least one app layer).
   - Without the flag, the app is squashed further only when `NEW` has more layers than `OLD`, so that the image does not grow.
