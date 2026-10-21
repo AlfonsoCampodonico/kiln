@@ -1,6 +1,6 @@
 # kiln formats
 
-This document is normative. It defines the **kiln image** (schema version 1, provisional until M3 adds kernel and init layers), the **erofs profile** (format version 1), the **guest** that `kiln-init` sets up (devices, init layer, scratch disk, boot sequence) and the **control protocol** (version 1) between `kiln-init` and the host.
+This document is normative. It defines the **kiln image** (schema version 1, provisional until M3 adds kernel and init layers), the **kiln snapshot** (schema version 1) and its lazy index, the **erofs profile** (format version 1), the **guest** that `kiln-init` sets up (devices, init layer, scratch disk, boot sequence) and the **control protocol** (version 1) between `kiln-init` and the host.
 
 ## kiln image, schema version 1
 
@@ -81,6 +81,72 @@ GC keeps every blob reachable from `refs.json`, and also kiln's pinned boot arti
 Keying by the verified `diff_id` as well as the compressed digest ties a cache hit to the decompressed content the image config claims, so a blob listed with a different compression or a wrong `diff_id` misses instead of being served another image's filesystem.
 
 `:` in a cache key is written as `_` in its file name.
+
+## kiln snapshot, schema version 1
+
+A kiln snapshot is a VM snapshot (a vmkit bundle, below) as an OCI 1.1 artifact made of fixed-size, content-addressed chunks. JSON is serialised as for images (sorted keys, no insignificant whitespace) and there are no annotations, so the same bundle and chunk size always give the same manifest digest. Refs share `refs.json` with images.
+
+### Manifest
+
+An OCI image manifest (`mediaType` `application/vnd.oci.image.manifest.v1+json`, `schemaVersion` 2) with:
+- `artifactType`: `application/vnd.kiln.snapshot.v1`. Readers reject manifests without it, and image readers reject manifests with it.
+- `config`: a descriptor with `mediaType` `application/vnd.kiln.snapshot.config.v1+json`.
+- `layers`: one descriptor per **distinct** non-zero chunk, `mediaType` `application/vnd.kiln.snapshot.chunk.v1`, in order of first use (files in config order, chunks in offset order). Each chunk is its own blob, so registry and store GC keep exactly the chunks a tagged snapshot references, and identical chunks are shared within a snapshot, across snapshots and in the registry.
+
+### Config
+
+```json
+{
+  "bundle": { "...": "bundle.json, verbatim as a JSON value" },
+  "chunkSize": 1048576,
+  "files": [
+    { "chunks": ["sha256:…", null, "sha256:…"], "name": "memory", "size": 268435456 }
+  ],
+  "schemaVersion": 1
+}
+```
+- `schemaVersion`: 1.
+- `chunkSize`: a power of two from 65536 (64 KiB) to 16777216 (16 MiB). kiln writes 1 MiB unless told otherwise.
+- `bundle`: the bundle's `bundle.json` as a JSON value. Its `version` must be 1.
+- `files`: every file of the bundle except `bundle.json`, sorted by name. `chunks[i]` covers bytes `[i·chunkSize, min((i+1)·chunkSize, size))`, so a file has `ceil(size / chunkSize)` chunks and an empty file has none. `null` means the chunk is all zero; zero chunks are never stored. A chunk blob's size is the length it covers, so only a file's last chunk may be short.
+- Unknown fields are rejected, at the top level and in `files`.
+
+### Reader's checks
+
+A pulled snapshot is hostile input. Every bound is a typed error that names its limit. A reader, in this order:
+1. Verifies the manifest against its digest, requires the media type, `artifactType` and config media type above, and refuses a config descriptor larger than 4 MiB before fetching it.
+2. Fetches the config through the store's verified path (digest and size), parses it, and checks:
+   - `schemaVersion` is 1 and `bundle.version` is 1;
+   - `chunkSize` is in range;
+   - at most 64 files, each at most 1 TiB, at most 4 TiB in total;
+   - file names match `[a-z0-9][a-z0-9._-]{0,63}`, are not `bundle.json` or `lazy.json`, and are unique, so no file can be written outside the bundle directory;
+   - each file has `ceil(size / chunkSize)` chunks;
+   - every non-null chunk is a layer whose size is the length the chunk covers;
+   - every layer is a chunk, listed once and used by some file.
+3. Only then fetches chunks, each verified against its digest and size before it enters the store (an eager pull), or none (a lazy pull).
+4. Only then tags the snapshot.
+
+The VMM state files inside a snapshot remain untrusted input to the VMM after these checks. vmkit checks the bundle fully again at restore and runs the VMM in its sandbox; the artifact format does not make the VMM state safe.
+
+### Writing a bundle back
+
+- **Eager pull:** every file is created at its full size and only its non-null chunks are written, so zero chunks stay holes; `bundle.json` (pretty-printed, keys sorted) is written last, so a pull that fails part-way never leaves a directory that looks like a whole bundle.
+- **Lazy pull:** only `bundle.json` and the chunk index `lazy.json` are written.
+
+The destination must be missing or an empty directory.
+
+### `lazy.json` (vmkit lazy index format 1)
+
+```json
+{"chunk_size":1048576,"files":{"memory":{"chunks":["sha256:…",null],"size":268435456}},"version":1}
+```
+Canonical JSON with snake_case keys, as in `bundle.json`. `files` maps each file the directory does not hold in full to its size and chunks, with the meaning they have in the config. vmkit serves these files on demand at restore, verifying each chunk; the bounds above apply to it as well, since kiln wrote it from untrusted input.
+
+### The vmkit bundle (informative)
+
+vmkit (bundle format 1) defines the bundle; this summary is informative, and vmkit's own documentation is normative. A bundle directory holds `bundle.json`, the VMM's files (`vmstate` and `memory` for Firecracker; `config.json`, `state.json` and `memory-ranges` for Cloud Hypervisor), and `disk-<n>` for every captured writable disk (sparse). `bundle.json` records `version`, `arch`, `vcpus`, `memory_mib`, `vmm` (`name`, `version`), the `files` and their roles, the `disks` (size, read-only, captured), `net` and `vsock`. Snapshots are not portable across VMMs, VMM versions, architectures or CPU models: vmkit refuses to restore a bundle whose VMM, version or architecture differs from the host's.
+
+When chunking a bundle, kiln opens `bundle.json` (at most 64 KiB) and every file with `O_NOFOLLOW` and requires regular files; anything else in the directory (a subdirectory, a symlink, a FIFO, an invalid name) is an error. The VMM wrote those files and may have planted links to host files, and whatever kiln reads may be pushed.
 
 ## erofs profile, version 1
 
