@@ -410,6 +410,7 @@ fn networking_from_config(backend: Backend) {
             host: port,
             guest: 8080,
         }],
+        ipv6: true,
         ..NetSpec::default()
     };
     let spec = c.spec(&fixtures().base, &config, Some(net));

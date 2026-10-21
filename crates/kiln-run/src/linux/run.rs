@@ -73,7 +73,8 @@ pub fn net_spec(n: &NetOptions) -> NetSpec {
                 guest: p.guest,
             })
             .collect(),
-        ipv6: false,
+        // vmkit leaves it off on a host without IPv6 (`vmkit::net::host_has_ipv6`).
+        ipv6: true,
     }
 }
 
@@ -145,12 +146,14 @@ const RESTRICTED: [(&str, &str); 9] = [
     ("the link-local network 169.254.0.0/16", "169.254.0.0/16"),
     ("everything (::/0)", "::/0"),
     ("the private (ULA) network fc00::/7", "fc00::/7"),
-    ("the link-local network fe80::/10", "fe80::/10"),
+    ("every IPv4 address, IPv4-mapped (::ffff:0:0/96)", "::ffff:0:0/96"),
 ];
 
-/// The cloud metadata service most clouds answer on, and AWS's IPv6 address for it.
-const METADATA: [std::net::IpAddr; 2] = [
+/// The cloud metadata service most clouds answer on, the same IPv4-mapped (an IPv6
+/// exception for it may reach it as IPv4), and AWS's IPv6 address for it.
+const METADATA: [std::net::IpAddr; 3] = [
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
+    std::net::IpAddr::V6(std::net::Ipv4Addr::new(169, 254, 169, 254).to_ipv6_mapped()),
     std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)),
 ];
 
@@ -329,7 +332,13 @@ impl Run {
             // can never reach them (finding 4.1): an exception for one alone is refused,
             // a wider one that includes one is warned about.
             let outbound: Vec<std::net::IpAddr> = (vmkit::net::outbound_address().map(Into::into).into_iter())
-                .chain(vmkit::net::outbound_addresses6().into_iter().map(Into::into))
+                .chain(
+                    vmkit::net::host_has_ipv6()
+                        .then(vmkit::net::outbound_addresses6)
+                        .into_iter()
+                        .flatten()
+                        .map(Into::into),
+                )
                 .collect();
             n.check_allow(&outbound)
                 .map_err(|e| Error::refused(format!("--egress: {e}")))?;
@@ -497,6 +506,7 @@ impl Run {
                 exit_method: exit_method(vmm.as_ref()),
                 window,
                 host_env: config::host_env(std::env::vars_os()),
+                ipv6: vmkit::net::host_has_ipv6(),
             },
         )?;
         check()?;
@@ -659,6 +669,8 @@ mod tests {
         assert_eq!(config::GUEST6, vmkit::net::GUEST6);
         assert_eq!(config::GATEWAY6, vmkit::net::GATEWAY6);
         assert_eq!(config::PREFIX6, vmkit::net::PREFIX6);
+        // `--net` asks vmkit for IPv6 too.
+        assert!(net_spec(&NetOptions::default()).ipv6);
     }
 
     #[test]
@@ -806,18 +818,21 @@ mod tests {
                 && w[0].contains("everything (::/0)")
                 && w[0].contains("cloud metadata (fd00:ec2::254)")
                 && w[0].contains("fc00::/7")
-                && w[0].contains("fe80::/10")
+                && !w[0].contains("fe80::/10")
                 && !w[0].contains("10.0.0.0/8"),
             "{w:?}"
         );
         for (a, want) in [
             ("fd00::/8", "cloud metadata (fd00:ec2::254)"),
-            ("fe80::/10", "the link-local network fe80::/10"),
+            ("::ffff:0:0/96", "every IPv4 address, IPv4-mapped (::ffff:0:0/96)"),
+            ("::ffff:169.254.169.254", "cloud metadata (::ffff:169.254.169.254)"),
         ] {
             let w = warnings("restricted", &[a], &[]);
             assert!(w.len() == 1 && w[0].contains(want), "{a}: {w:?}");
         }
         assert!(warnings("restricted", &["2001:db8::/32"], &[]).is_empty());
+        // Link-local destinations never leave the tap's link, whatever the policy.
+        assert!(warnings("restricted", &["fe80::/10"], &[]).is_empty());
         let outbound6: std::net::IpAddr = "2001:db8:5::15".parse().unwrap();
         let w = warnings("restricted", &["2001:db8::/32"], &[outbound6]);
         assert!(

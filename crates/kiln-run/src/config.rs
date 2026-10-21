@@ -37,6 +37,9 @@ pub struct Runtime {
     pub window: Option<WindowSize>,
     /// kiln's own environment, for `--env KEY` without a value.
     pub host_env: Vec<(String, String)>,
+    /// With `--net`: the VM network carries IPv6 (the host has it), so the guest gets an
+    /// IPv6 address and route.
+    pub ipv6: bool,
 }
 
 /// Builds and checks the guest's `Config`.
@@ -85,7 +88,7 @@ pub fn build(image: &ImageProcess, opts: &RunOptions, rt: &Runtime) -> Result<Co
             prefix_len: PREFIX,
             gateway: GATEWAY,
             dns: vec![GATEWAY],
-            ipv6: Some(Ipv6Network {
+            ipv6: rt.ipv6.then_some(Ipv6Network {
                 address: GUEST6,
                 prefix_len: PREFIX6,
                 gateway: GATEWAY6,
@@ -172,6 +175,7 @@ mod tests {
             exit_method: ExitMethod::Reboot,
             window: None,
             host_env: vec![("HOSTVAR".into(), "hv".into())],
+            ipv6: true,
         }
     }
 
@@ -217,6 +221,9 @@ mod tests {
                 }),
             })
         );
+        // A host without IPv6: the guest gets none either.
+        let no6 = build(&image(), &o, &Runtime { ipv6: false, ..rt() }).unwrap();
+        assert_eq!(no6.network.map(|n| n.ipv6), Some(None));
         assert_eq!(c.shutdown_grace_secs, 3);
     }
 
