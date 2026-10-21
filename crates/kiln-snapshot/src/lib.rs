@@ -9,6 +9,7 @@ mod chunk;
 mod error;
 pub mod format;
 mod load;
+mod registry;
 
 pub use assemble::{LAZY_VERSION, LazyFile, LazyIndex, assemble, write_lazy};
 pub use chunk::{Built, MAX_BUNDLE_JSON, chunk_bundle};
@@ -18,3 +19,4 @@ pub use format::{
     SNAPSHOT_CONFIG, SnapshotConfig, check_name,
 };
 pub use load::{Loaded, is_snapshot, load, load_with, resolve, tag};
+pub use registry::{Fetch, Pulled, TransferReport, fetch_chunks, pull, push};
