@@ -73,6 +73,7 @@ pub fn net_spec(n: &NetOptions) -> NetSpec {
                 guest: p.guest,
             })
             .collect(),
+        ipv6: false,
     }
 }
 
@@ -167,13 +168,13 @@ fn egress_warnings(n: &NetSpec, outbound: Option<std::net::Ipv4Addr>) -> Vec<Str
     for c in &n.allow {
         let covers = |x: &Cidr| c.prefix() <= x.prefix() && c.contains(x.addr());
         let mut opens: Vec<String> = Vec::new();
-        if c.contains(METADATA) {
+        if c.contains(METADATA.into()) {
             opens.push(format!("cloud metadata ({METADATA})"));
         }
         opens.extend(
             RESTRICTED
                 .iter()
-                .filter(|(_, a, p)| Cidr::new((*a).into(), *p).is_some_and(|x| covers(&x)))
+                .filter(|(_, a, p)| Cidr::new(std::net::Ipv4Addr::from(*a), *p).is_some_and(|x| covers(&x)))
                 .map(|(name, _, _)| name.to_string()),
         );
         if !opens.is_empty() {
@@ -182,7 +183,7 @@ fn egress_warnings(n: &NetSpec, outbound: Option<std::net::Ipv4Addr>) -> Vec<Str
                 opens.join(", ")
             ));
         }
-        if let Some(a) = outbound.filter(|a| c.contains(*a)) {
+        if let Some(a) = outbound.filter(|a| c.contains((*a).into())) {
             out.push(format!(
                 "warning: --egress allow={c} includes the host's own address {a}, which the guest can never reach"
             ));
@@ -319,7 +320,7 @@ impl Run {
             // can never reach it (finding 4.1): an exception for it alone is refused,
             // a wider one that includes it is warned about.
             let outbound = vmkit::net::outbound_address();
-            n.check_allow(outbound.as_slice())
+            n.check_allow(&outbound.map(Into::into).into_iter().collect::<Vec<_>>())
                 .map_err(|e| Error::refused(format!("--egress: {e}")))?;
             for w in egress_warnings(n, outbound) {
                 notice(&w);
@@ -669,8 +670,8 @@ mod tests {
         );
         // An exception that is only the host's outbound address is refused before boot;
         // one that includes it still reaches its other addresses.
-        assert!(spec.check_allow(&[Ipv4Addr::new(192, 0, 2, 7)]).is_err());
-        assert!(spec.check_allow(&[Ipv4Addr::new(10, 1, 9, 9)]).is_ok());
+        assert!(spec.check_allow(&[Ipv4Addr::new(192, 0, 2, 7).into()]).is_err());
+        assert!(spec.check_allow(&[Ipv4Addr::new(10, 1, 9, 9).into()]).is_ok());
     }
 
     /// A VMM kiln gave up on keeps its run directory (and run.json, which names
