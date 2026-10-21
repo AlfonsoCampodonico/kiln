@@ -993,7 +993,7 @@ Each gate is a pure function in `kiln-image` with its own unit tests. `rebase` r
 - **Limits:**
   - The refusal lists up to 20 differing paths and the total count.
   - A directory that was implicit and was then described later in the same layer (§6.3 rule 5) is compared by type only, like the implicit ones, so a change to its own header is not caught. This is a documented gap.
-- **Open question, deleted subtrees (for review):** comparing a whiteout's whole subtree refuses common slimming steps such as `RUN rm -rf /usr/share/doc/*` whenever a patched package's docs change, which happens on almost every CVE patch, although a rebuild would show the same view. Today's rule is the safe one. A relaxation, such as comparing only the whited-out paths themselves and not what lies below them, is to be decided.
+- **Deleted subtrees stay strict (decided 2026-10-21):** a whiteout's whole subtree is compared, so a slimming step such as `RUN rm -rf /usr/share/doc/*` refuses the rebase whenever a patched package's docs change, even though a rebuild would show the same view. The rule is kept on purpose. A deletion can be the trace of a file derived from the base and then removed (a rendered config whose template was deleted), and the gate cannot tell that apart from slimming. Such images need a rebuild. Laravel Cloud's registry rebase (laravel/cloud-build-operator#709) makes the same choice.
 
 ### 16.4 Re-finalising app layers
 
