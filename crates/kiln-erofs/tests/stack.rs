@@ -176,3 +176,144 @@ fn tar_supplied_overlay_xattrs_are_dropped() {
     let w = walk(&squash_all(&layers));
     assert!(w.contains_key(&p("d/x")) && w.contains_key(&p("d/y")));
 }
+
+fn squash_upper_all(layers: &[Vec<u8>]) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    let mut imgs: Vec<_> = layers
+        .iter()
+        .map(|l| kiln_erofs::Image::open(Cursor::new(l.as_slice())).unwrap())
+        .collect();
+    let (out, _) = kiln_erofs::squash_upper(&mut imgs, Cursor::new(Vec::new()), dir.path()).unwrap();
+    out.into_inner()
+}
+
+const OPQ: &str = "trusted.overlay.opaque";
+
+/// Merging upper layers must keep what hides the layers below the merge.
+#[test]
+fn upper_squash_keeps_whiteouts_and_opaque_markers() {
+    let l0 = t(TarBuilder::new()
+        .file("etc/a", b"a", &Opts::default())
+        .dir("var", &Opts::default())
+        .opaque("var")
+        .file("var/y", b"y", &Opts::default()));
+    let l1 = t(TarBuilder::new()
+        .whiteout("etc/a")
+        .whiteout("etc/base-only")
+        .dir("var", &Opts::default().mode(0o750))
+        .file("var/z", b"z", &Opts::default()));
+    let w = walk(&squash_upper_all(&convert_stack(&[l0, l1])));
+    for path in ["etc/a", "etc/base-only"] {
+        assert_eq!(
+            (w[&p(path)].kind, w[&p(path)].rdev),
+            ('c', (0, 0)),
+            "{path} stays a whiteout"
+        );
+    }
+    assert_eq!(w[&p("var")].mode, 0o750);
+    assert_eq!(w[&p("var")].xattrs[&p(OPQ)], b"y", "opaque survives a later plain dir");
+    assert!(w.contains_key(&p("var/y")) && w.contains_key(&p("var/z")));
+}
+
+#[test]
+fn upper_squash_makes_a_dir_over_a_non_dir_opaque() {
+    let l0 = t(TarBuilder::new().file("x", b"", &Opts::default()).whiteout("w"));
+    let l1 = t(TarBuilder::new()
+        .dir("x", &Opts::default())
+        .file("x/f", b"", &Opts::default())
+        .dir("w", &Opts::default())
+        .dir("n", &Opts::default()));
+    let w = walk(&squash_upper_all(&convert_stack(&[l0, l1])));
+    assert_eq!(w[&p("x")].xattrs[&p(OPQ)], b"y", "the base's x must not show through");
+    assert_eq!(w[&p("w")].xattrs[&p(OPQ)], b"y", "nor what the whiteout hid");
+    assert!(
+        !w[&p("n")].xattrs.contains_key(&p(OPQ)),
+        "a new dir still merges with the base"
+    );
+}
+
+#[test]
+fn upper_squash_opaque_clears_lower_children_and_keeps_hardlinks() {
+    let l0 = t(TarBuilder::new()
+        .file("d/old", b"o", &Opts::default())
+        .file("a", b"a", &Opts::default())
+        .hardlink("b", "a"));
+    let l1 = t(TarBuilder::new()
+        .dir("d", &Opts::default())
+        .opaque("d")
+        .file("d/new", b"n", &Opts::default()));
+    let w = walk(&squash_upper_all(&convert_stack(&[l0, l1])));
+    assert!(!w.contains_key(&p("d/old")));
+    assert_eq!(w[&p("d")].xattrs[&p(OPQ)], b"y");
+    assert_eq!(w[&p("a")].nid, w[&p("b")].nid);
+}
+
+#[test]
+fn merged_view_lists_and_hides_like_overlayfs() {
+    let l0 = t(TarBuilder::new()
+        .file("etc/a", b"a", &Opts::default())
+        .file("etc/b", b"b", &Opts::default())
+        .file("o/x", b"x", &Opts::default()));
+    let l1 = t(TarBuilder::new()
+        .whiteout("etc/a")
+        .file("etc/c", b"c", &Opts::default())
+        .dir("o", &Opts::default())
+        .opaque("o")
+        .file("o/y", b"y", &Opts::default()));
+    let layers = convert_stack(&[l0, l1]);
+    let imgs = layers
+        .iter()
+        .map(|l| kiln_erofs::Image::open(Cursor::new(l.as_slice())).unwrap())
+        .collect();
+    let mut m = kiln_erofs::Merged::new(imgs);
+    assert_eq!(m.read_dir(b"etc").unwrap(), vec![p("b"), p("c")]);
+    assert!(m.lookup(b"etc/a").unwrap().is_none());
+    assert_eq!(m.lookup(b"etc/b").unwrap().map(|(l, _)| l), Some(0));
+    assert_eq!(m.subtree(b"o").unwrap(), vec![p("o/y")]);
+    assert_eq!(
+        m.subtree(b"").unwrap(),
+        [p("etc"), p("etc/b"), p("etc/c"), p("o"), p("o/y")]
+    );
+    let (layer, nid) = m.lookup(b"etc/c").unwrap().unwrap();
+    assert_eq!(m.image(layer).read_data(nid).unwrap(), b"c");
+}
+
+#[test]
+fn walk_lists_every_path_with_its_nid() {
+    let l = t(TarBuilder::new().file("a/b", b"", &Opts::default()).whiteout("c"));
+    let layers = convert_stack(&[l]);
+    let mut img = kiln_erofs::Image::open(Cursor::new(layers[0].as_slice())).unwrap();
+    let paths: Vec<Vec<u8>> = img.walk().unwrap().into_iter().map(|(p, _)| p).collect();
+    assert_eq!(paths, [p("a"), p("c"), p("a/b")]);
+}
+
+/// Squashing the app half separately must not change what the full stack shows.
+#[test]
+fn base_plus_upper_squash_equals_full_squash() {
+    let base = t(TarBuilder::new()
+        .file("etc/a", b"a", &Opts::default())
+        .file("etc/keep", b"k", &Opts::default())
+        .file("x", b"x", &Opts::default())
+        .file("o/old", b"o", &Opts::default())
+        .file("w/deep", b"d", &Opts::default())
+        .dir("m", &Opts::default().mode(0o700)));
+    let u1 = t(TarBuilder::new()
+        .whiteout("etc/a")
+        .whiteout("w")
+        .dir("o", &Opts::default())
+        .opaque("o")
+        .file("o/new", b"n", &Opts::default())
+        .file("m/f", b"f", &Opts::default()));
+    let u2 = t(TarBuilder::new()
+        .dir("x", &Opts::default())
+        .file("x/in", b"i", &Opts::default())
+        .dir("w", &Opts::default())
+        .file("w/fresh", b"f", &Opts::default())
+        .file("etc/b", b"b", &Opts::default()));
+    let layers = convert_stack(&[base.clone(), u1, u2]);
+    let full = walk(&squash_all(&layers));
+    let upper = squash_upper_all(&layers[1..]);
+    let split = walk(&squash_all(&[layers[0].clone(), upper]));
+    assert_eq!(common::view(&full, true), common::view(&split, true));
+    assert!(!split.contains_key(&p("w/deep")) && !split.contains_key(&p("o/old")));
+}

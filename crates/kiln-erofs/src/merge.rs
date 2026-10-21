@@ -114,6 +114,87 @@ fn merged_lookup<R: Read + Seek>(
     Ok(None)
 }
 
+/// The merged (overlayfs) view of a layer stack, bottom first, for comparing what
+/// two bases show at the same paths (spec §16.3).
+pub struct Merged<R> {
+    layers: Vec<Image<R>>,
+    dirs: DirCache,
+}
+
+impl<R: Read + Seek> Merged<R> {
+    pub fn new(layers: Vec<Image<R>>) -> Self {
+        Self {
+            layers,
+            dirs: DirCache::new(),
+        }
+    }
+
+    /// The topmost `(layer, nid)` showing `path`, or `None` if it is absent or hidden.
+    pub fn lookup(&mut self, path: &[u8]) -> Result<Option<(usize, u64)>> {
+        merged_lookup(&mut self.layers, &mut self.dirs, path)
+    }
+
+    pub fn image(&mut self, layer: usize) -> &mut Image<R> {
+        &mut self.layers[layer]
+    }
+
+    /// Sorted names visible in the merged directory at `path` (empty unless it is one).
+    pub fn read_dir(&mut self, path: &[u8]) -> Result<Vec<Vec<u8>>> {
+        match self.lookup(path)? {
+            Some((layer, nid)) if self.layers[layer].inode(nid)?.is_dir() => {}
+            _ => return Ok(Vec::new()),
+        }
+        let comps: Vec<&[u8]> = components(path).collect();
+        let mut names = std::collections::BTreeSet::new();
+        for layer in 0..self.layers.len() {
+            let img = &mut self.layers[layer];
+            let mut cur = Some(img.root_nid());
+            for c in &comps {
+                cur = match cur {
+                    Some(d) if img.inode(d)?.is_dir() => child_nid(img, &mut self.dirs, layer, d, c)?,
+                    _ => None,
+                };
+            }
+            if let Some(d) = cur.filter(|&d| img.inode(d).is_ok_and(|i| i.is_dir())) {
+                let entries = img.read_dir(d)?;
+                names.extend(entries.into_iter().map(|e| e.name));
+            }
+        }
+        let mut out = Vec::new();
+        for name in names {
+            let child = join(path, &name);
+            if self.lookup(&child)?.is_some() {
+                out.push(name);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every path visible below `path` in the merged view, sorted, `path` excluded.
+    pub fn subtree(&mut self, path: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let mut stack = vec![path.to_vec()];
+        while let Some(dir) = stack.pop() {
+            for name in self.read_dir(&dir)? {
+                let child = join(&dir, &name);
+                stack.push(child.clone());
+                out.push(child);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+}
+
+/// `dir/name`, where `b""` is the root.
+pub(crate) fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    if dir.is_empty() {
+        name.to_vec()
+    } else {
+        [dir, b"/", name].concat()
+    }
+}
+
 /// Reads an image's tree; file data stays in the image (`Data::External`).
 fn tree_from_image<R: Read + Seek>(img: &mut Image<R>, layer: usize) -> Result<Tree> {
     let root_nid = img.root_nid();
@@ -228,6 +309,49 @@ fn overlay(merged: &mut Tree, upper: &Tree) {
     }
 }
 
+/// Applies `upper` on top of `merged`, where both sit above layers that are not
+/// part of the merge (spec §6.4, upper squash). Whiteouts and opaque markers that
+/// may hide those layers are kept, and a directory that replaces a lower
+/// non-directory or whiteout becomes opaque, as overlayfs would show it.
+fn overlay_upper(merged: &mut Tree, upper: &Tree) {
+    let merged_root = merged.root;
+    set_dir_attrs(merged, merged_root, &upper.nodes[upper.root]);
+    let mut mapped: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut queue = VecDeque::from([(upper.root, merged_root)]);
+    while let Some((upper_dir, merged_dir)) = queue.pop_front() {
+        for (name, &uc) in upper.children(upper_dir).expect("queued nodes are directories") {
+            let un = &upper.nodes[uc];
+            if !un.is_dir() {
+                let m = *mapped.entry(uc).or_insert_with(|| merged.add(un.clone()));
+                merged.children_mut(merged_dir).insert(name.clone(), m);
+                continue;
+            }
+            let opaque = is_opaque(&un.xattrs);
+            let (target, keep_opaque) = match merged.child(merged_dir, name) {
+                Some(m) if merged.nodes[m].is_dir() => {
+                    let was = is_opaque(&merged.nodes[m].xattrs);
+                    if opaque {
+                        merged.children_mut(m).clear();
+                    }
+                    (m, was || opaque)
+                }
+                below => {
+                    // A lower non-directory or whiteout ends the lookup in overlayfs,
+                    // so nothing beneath the merge may show through this directory.
+                    let m = merged.add(Node::dir(un.meta.clone(), false));
+                    merged.children_mut(merged_dir).insert(name.clone(), m);
+                    (m, opaque || below.is_some())
+                }
+            };
+            set_dir_attrs(merged, target, un);
+            if keep_opaque {
+                merged.nodes[target].xattrs.insert(XattrKey::opaque(), b"y".to_vec());
+            }
+            queue.push_back((uc, target));
+        }
+    }
+}
+
 struct Sources<'a, R>(&'a mut [Image<R>]);
 
 impl<R: Read + Seek> ExternalData for Sources<'_, R> {
@@ -245,10 +369,30 @@ pub fn squash<R: Read + Seek, W: Read + Write + Seek>(
     out: W,
     spill_dir: &Path,
 ) -> Result<(W, LayerSummary)> {
+    merge_into(layers, out, spill_dir, overlay)
+}
+
+/// Merges `layers` (bottom first) into one layer that still sits above other
+/// layers: unlike [`squash`], it keeps the whiteouts and opaque markers that hide
+/// content below the merged range (spec §6.4).
+pub fn squash_upper<R: Read + Seek, W: Read + Write + Seek>(
+    layers: &mut [Image<R>],
+    out: W,
+    spill_dir: &Path,
+) -> Result<(W, LayerSummary)> {
+    merge_into(layers, out, spill_dir, overlay_upper)
+}
+
+fn merge_into<R: Read + Seek, W: Read + Write + Seek>(
+    layers: &mut [Image<R>],
+    out: W,
+    spill_dir: &Path,
+    apply: fn(&mut Tree, &Tree),
+) -> Result<(W, LayerSummary)> {
     let mut merged = Tree::new(Node::dir(Meta::default_dir(Timestamp::default()), false));
     for (layer, img) in layers.iter_mut().enumerate() {
         let upper = tree_from_image(img, layer)?;
-        overlay(&mut merged, &upper);
+        apply(&mut merged, &upper);
     }
     let base = merged.min_mtime();
     let store = DataStore::new(out, spill_dir)?;
