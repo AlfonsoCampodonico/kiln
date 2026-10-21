@@ -325,6 +325,7 @@ $KILN_HOME/
     - the tars of its source layers above the base (`base.sourceLayers` onwards), from which `kiln rebase` re-derives the app half. All of them, not only those that inherit: a squashed app half is re-derived from every layer it merged, and the per-source erofs blobs it was merged from are not referenced. That costs the store the app's compressed source layers, about what pulling the app half costs; the compressed tars are cheaper to keep than the per-source erofs blobs plus their cache entries;
     - its base's manifest, walked like any other root, so a chain of bases keeps every base's manifest, config and sources.
   - The base half's tars are never kept: rebase never re-derives them.
+  - What a config keeps of its sources is marked live without being walked as a root, and never counts as walked: a hostile config that names another image's manifest as its "source" cannot stop gc from walking that image when its own ref reaches it.
 - **`kiln run`** holds the shared lock only during setup. Once the VMM sandbox holds open file descriptors and bind mounts, a GC that deletes a blob cannot affect the running VM on Linux.
 
 ### 5.3 Run state
@@ -948,7 +949,7 @@ The env gate catches that instance. The general fix is the shadowed-path gate: a
   - Only erofs digests are compared, so the match is exact and needs neither `NAME`'s source manifest nor any trust in annotations (T1).
   - **A squashed bottom layer.** When `NAME`'s bottom layer is a squash, the width it merged is suggested by its `dev.kiln.source.digests` annotation and by `NAME`'s source manifest, when that is in the store. With layers above it, also by every width whose layers above match `NAME`'s exactly. A one-layer base gets only the suggested widths, never every prefix.
   - **Checking a width.** Each candidate is squashed and compared by digest; a squash that does not match is discarded, never stored.
-  - **A chained base.** When `NAME` itself records a base, its own base is matched first (recursively, up to 8 deep), then its app half as the upper squash it was (§6.4). An inner base missing from the store is reported as such, not as "not built on `NAME`"; `gc` keeps inner bases (§5.2).
+  - **A chained base.** When `NAME` itself records a base, its own base is matched first (recursively, up to 8 deep), then its app half as the upper squash it was (§6.4). A base whose layers match layer for layer needs nothing else, so a pulled base without its own base works; only a squashed boundary is rebuilt from the inner base. An inner base missing then is reported as such, not as "not built on `NAME`"; `gc` keeps inner bases (§5.2).
   - If there is no match, `convert` fails: the image is not built on that base. If `k` is all of `SRC`'s layers, it also fails: there is nothing to rebase.
 - **Alternatives rejected:**
   - A `--base` that takes an OCI reference would resolve and convert a second image on every `convert`. Converting the base once and naming the kiln image is cheaper, and it is what `rebase` needs anyway.

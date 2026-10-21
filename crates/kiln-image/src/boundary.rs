@@ -130,6 +130,12 @@ fn match_base_at(
     if want.is_empty() {
         return Ok(None);
     }
+    // Layer for layer, the base needs nothing else: not even its own base, which
+    // a pulled base never brings. Only a squashed boundary is rebuilt from below.
+    let q = want.len();
+    if reports.len() >= q && reports[..q].iter().zip(&want).all(|(r, d)| r.erofs == d.digest) {
+        return Ok(Some((q, reports[..q].to_vec())));
+    }
     let source = source_width(store, base);
     let Some(r) = &base.config.base else {
         let widths = want
