@@ -878,7 +878,15 @@ fn rebase_onto_a_patched_base_and_refuse_a_stale_copy() {
     ] {
         let path = layout_with(&src.path().join(name), rebase_cfg(php), layers);
         let mut c = kiln(home.path());
-        c.args(["convert", "--platform", "linux/arm64", "--tag", &format!("{name}:1")]);
+        c.args([
+            "convert",
+            "--boot-layers",
+            "none",
+            "--platform",
+            "linux/arm64",
+            "--tag",
+            &format!("{name}:1"),
+        ]);
         if name == "app" {
             c.args(["--base", "base1:1"]);
         }
@@ -929,7 +937,15 @@ fn rebase_text_output_and_a_missing_record() {
     for (name, layers) in [("base", base.clone()), ("app", app.clone())] {
         let path = layout_with(&src.path().join(name), rebase_cfg("8.4.1"), layers);
         kiln(home.path())
-            .args(["convert", "--platform", "linux/arm64", "--tag", &format!("{name}:1")])
+            .args([
+                "convert",
+                "--boot-layers",
+                "none",
+                "--platform",
+                "linux/arm64",
+                "--tag",
+                &format!("{name}:1"),
+            ])
             .arg(&path)
             .assert()
             .success();
@@ -943,6 +959,8 @@ fn rebase_text_output_and_a_missing_record() {
     kiln(home.path())
         .args([
             "convert",
+            "--boot-layers",
+            "none",
             "--platform",
             "linux/arm64",
             "--tag",

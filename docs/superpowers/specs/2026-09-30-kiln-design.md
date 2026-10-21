@@ -285,7 +285,7 @@ A `kiln` image is an OCI 1.1 artifact.
   - `erofsFormatVersion`
   - `services` (M3d, omitted when empty): processes `kiln-init` starts before the main process, from the source config's `dev.kiln.services` label (§9.8). A config with services has `schemaVersion` 2, one without keeps 1, so a kiln older than M3d refuses an image with services (rev 2.11).
   - `labels`: the source config's labels, omitted when empty.
-  - `base` (only for `convert --base`, §16.2): `{ name, manifestDigest, layers, sourceLayers }`. The image's bottom `layers` kiln layers are the base's, and they came from its first `sourceLayers` OCI layers.
+  - `base` (only for `convert --base`, §16.2): `{ name, manifestDigest, layers, sourceLayers }`. The image's bottom `layers` app layers (kernel and init layers never count) are the base's, and they came from its first `sourceLayers` OCI layers.
   - There is **no** kernel cmdline field (T4). There is **no** `kiln` version field, so patch releases that produce identical output produce identical digests.
 - **Layers, in boot order:**
   1. Kernel: `application/vnd.kiln.kernel.v1`.
@@ -996,7 +996,7 @@ Each gate is a pure function in `kiln-image` with its own unit tests. `rebase` e
 
 ### 16.5 The rebased image
 
-- **Layers:** `NEW`'s layers, then the app half.
+- **Layers:** `IMAGE`'s own kernel and init layers, then `NEW`'s app layers, then the app half. Boot layers are never part of a base: the boundary match, the record and the gates look at app layers only.
 - **Config:** `IMAGE`'s config with these changes.
   - **`base`:** points at `NEW`.
   - **`source`:** unchanged. The app's provenance is still the source manifest.

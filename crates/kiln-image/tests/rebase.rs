@@ -520,3 +520,59 @@ fn a_missing_source_tar_is_named() {
         "{e}"
     );
 }
+
+/// Images with a kernel layer: the boundary and the gates look at app layers only,
+/// and the rebased image keeps its own kernel layer (spec §5.1, §16.5).
+#[test]
+fn boot_layers_are_not_base_layers() {
+    use kiln_image::artifacts::{ArtifactKind, Pin};
+    use kiln_image::types::{KILN_KERNEL, KILN_LAYER};
+    use kiln_image::{Boot, BootLayers};
+
+    let f = Fixture::new();
+    // Already in the store, so nothing is fetched.
+    let kernel = f.store.put_bytes(b"a kernel Image").unwrap();
+    let pin = Pin {
+        kind: ArtifactKind::Kernel,
+        name: "base",
+        version: "6.18.54",
+        arch: "arm64",
+        repository: "example.invalid/kernels/base",
+        digest: Box::leak(kernel.to_string().into_boxed_str()),
+        size: 14,
+    };
+    let boot = BootLayers::Explicit(Boot {
+        kernel: Some(pin),
+        init: None,
+    });
+    let with_kernel = ConvertOptions {
+        boot: boot.clone(),
+        ..Default::default()
+    };
+    // The old base has a kernel layer, the new one does not: neither counts.
+    f.convert("base:1", &Base::old().layers(), Base::old().config(), &with_kernel);
+    f.base("base:2", &Base::patched());
+    let opts = ConvertOptions {
+        boot,
+        ..f.on_base("base:1")
+    };
+    let mut tars = Base::old().layers();
+    tars.push(app_code());
+    let path = write_layout(&f.root.join("app"), &[arm()], &tars, Base::old().config());
+    convert_local(&f.store, &path, &req(&[arm()], "app:1"), &opts).unwrap();
+    assert_eq!(f.manifest("app:1").config.base.unwrap().layers, 2);
+
+    f.rebase("base:1", "base:2", "app:1", "app:2").unwrap();
+    let m = f.manifest("app:2");
+    let types: Vec<&str> = m.manifest.layers.iter().map(|l| l.media_type.as_str()).collect();
+    assert_eq!(types, [KILN_KERNEL, KILN_LAYER, KILN_LAYER, KILN_LAYER]);
+    assert_eq!(m.manifest.layers[0].digest, kernel);
+    assert_eq!(
+        m.manifest.layers[1..3]
+            .iter()
+            .map(|l| l.digest.clone())
+            .collect::<Vec<_>>(),
+        f.layers("base:2")
+    );
+    assert!(m.config.kernel.is_some(), "the image's own kernel stays");
+}

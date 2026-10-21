@@ -1359,7 +1359,7 @@ fn a_rebased_image_boots_on_the_new_base() {
         let d = b.image(&Platform::host(), &layers, cfg.clone());
         b.add(d, None).finish();
         let mut c = f.kiln();
-        c.args(["convert", "--tag", name]);
+        c.args(["convert", "--boot-layers", "none", "--tag", name]);
         if let Some(base) = base {
             c.args(["--base", base]);
         }
