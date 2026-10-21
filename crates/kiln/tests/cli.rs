@@ -677,7 +677,7 @@ fn run_refuses_bad_flags_with_125() {
         ),
         (
             &["run", "--net", "--egress", "allow=10.0.0.0/40", "img"],
-            "not an IPv4 address or CIDR",
+            "not an IP address or CIDR",
         ),
         (
             &["run", "--net", "-p", "8080:80", "-p", "0.0.0.0:8080:81", "img"],

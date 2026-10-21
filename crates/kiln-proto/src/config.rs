@@ -1,6 +1,6 @@
 //! The `Config` message: everything `kiln-init` needs for one run (spec §9.5, §9.6).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +76,19 @@ pub struct Network {
     pub prefix_len: u8,
     pub gateway: Ipv4Addr,
     pub dns: Vec<Ipv4Addr>,
+    /// `eth0`'s IPv6 address and default route, when the VM has IPv6 egress. DNS stays on
+    /// the IPv4 resolvers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6: Option<Ipv6Network>,
+}
+
+/// `eth0`'s IPv6 side: a unicast address and its gateway in the same `/prefix_len` (64–126).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Ipv6Network {
+    pub address: Ipv6Addr,
+    pub prefix_len: u8,
+    pub gateway: Ipv6Addr,
 }
 
 /// The scratch disk on `vdb`: the guest grows its ext4 to `size_bytes`.
@@ -185,6 +198,44 @@ impl Network {
         if self.dns.len() > MAX_DNS {
             return Err(invalid(format!("{} DNS servers (at most {MAX_DNS})", self.dns.len())));
         }
+        if let Some(n) = &self.ipv6 {
+            n.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl Ipv6Network {
+    fn validate(&self) -> Result<()> {
+        let bad = || {
+            invalid(format!(
+                "IPv6 address {}/{} with gateway {}",
+                self.address, self.prefix_len, self.gateway
+            ))
+        };
+        if !(64..=126).contains(&self.prefix_len) {
+            return Err(invalid(format!("IPv6 network prefix /{}", self.prefix_len)));
+        }
+        let mask = u128::MAX << (128 - u32::from(self.prefix_len));
+        let (addr, gw) = (u128::from(self.address), u128::from(self.gateway));
+        // Unicast, routable beyond the link: not unspecified, loopback, IPv4-mapped,
+        // link-local or multicast. The prefix's first address is the subnet-router anycast.
+        let unicast = |a: Ipv6Addr| {
+            !(a.is_unspecified()
+                || a.is_loopback()
+                || a.to_ipv4_mapped().is_some()
+                || a.is_unicast_link_local()
+                || a.is_multicast())
+        };
+        if addr & mask != gw & mask
+            || addr == gw
+            || addr & !mask == 0
+            || gw & !mask == 0
+            || !unicast(self.address)
+            || !unicast(self.gateway)
+        {
+            return Err(bad());
+        }
         Ok(())
     }
 }
@@ -192,6 +243,18 @@ impl Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v6(c: &mut Config) -> &mut Ipv6Network {
+        c.network.as_mut().unwrap().ipv6.as_mut().unwrap()
+    }
+
+    fn net6(address: &str, prefix_len: u8, gateway: &str) -> Ipv6Network {
+        Ipv6Network {
+            address: address.parse().unwrap(),
+            prefix_len,
+            gateway: gateway.parse().unwrap(),
+        }
+    }
 
     fn config() -> Config {
         Config {
@@ -211,6 +274,11 @@ mod tests {
                 prefix_len: 30,
                 gateway: Ipv4Addr::new(172, 30, 0, 1),
                 dns: vec![Ipv4Addr::new(172, 30, 0, 1)],
+                ipv6: Some(Ipv6Network {
+                    address: "fd76:6d6b:6974::2".parse().unwrap(),
+                    prefix_len: 64,
+                    gateway: "fd76:6d6b:6974::1".parse().unwrap(),
+                }),
             }),
             layers: 3,
             scratch: Scratch { size_bytes: 4 << 30 },
@@ -232,12 +300,26 @@ mod tests {
             "\"sizeBytes\"",
             "\"shutdownGraceSecs\"",
             "\"address\":\"172.30.0.2\"",
+            "\"ipv6\":{\"address\":\"fd76:6d6b:6974::2\",\"prefixLen\":64,\"gateway\":\"fd76:6d6b:6974::1\"}",
         ] {
             assert!(json.contains(key), "{key} missing in {json}");
         }
         assert!(!json.contains("\"tty\""), "unset options are omitted: {json}");
         assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), c);
         assert_eq!(c.process.argv(), ["/bin/sh", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn ipv6_is_optional() {
+        let mut c = config();
+        c.network.as_mut().unwrap().ipv6 = None;
+        c.validate().unwrap();
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("ipv6"), "{json}");
+        assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), c);
+        let mut v = serde_json::to_value(&c).unwrap();
+        v["network"]["ipv6"] = serde_json::Value::Null;
+        assert_eq!(serde_json::from_value::<Config>(v).unwrap(), c);
     }
 
     #[test]
@@ -282,6 +364,25 @@ mod tests {
             (
                 "dns",
                 Box::new(|c| c.network.as_mut().unwrap().dns = vec![Ipv4Addr::LOCALHOST; 4]),
+            ),
+            ("ipv6 prefix 63", Box::new(|c| v6(c).prefix_len = 63)),
+            ("ipv6 prefix 127", Box::new(|c| v6(c).prefix_len = 127)),
+            (
+                "ipv6 gateway",
+                Box::new(|c| v6(c).gateway = "fd76:6d6b:6975::1".parse().unwrap()),
+            ),
+            ("ipv6 address is gateway", Box::new(|c| v6(c).address = v6(c).gateway)),
+            (
+                "ipv6 subnet router",
+                Box::new(|c| v6(c).address = "fd76:6d6b:6974::".parse().unwrap()),
+            ),
+            ("ipv6 link-local", Box::new(|c| *v6(c) = net6("fe80::2", 64, "fe80::1"))),
+            ("ipv6 multicast", Box::new(|c| *v6(c) = net6("ff02::2", 64, "ff02::1"))),
+            ("ipv6 loopback", Box::new(|c| *v6(c) = net6("::1", 64, "::2"))),
+            ("ipv6 unspecified", Box::new(|c| *v6(c) = net6("::", 64, "::1"))),
+            (
+                "ipv6 mapped",
+                Box::new(|c| *v6(c) = net6("::ffff:10.0.0.2", 96, "::ffff:10.0.0.1")),
             ),
         ];
         for (name, mutate) in cases {

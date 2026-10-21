@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.13: 2026-10-22)
-**Status:** Draft rev 2.13, awaiting review
+**Date:** 2026-09-30 (rev 2.14: 2026-10-22)
+**Status:** Draft rev 2.14, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:**
 - `../../../../ROADMAP.md`: the three-repo roadmap (`vmkit`, `kiln`, `potter`).
@@ -105,6 +105,12 @@
   - §6.4 squashes the base and the app separately when a boundary is recorded, so no squashed layer straddles it.
   - Layers that inherited parents are re-finalised against the new base (§16.4).
   - Gates refuse with a reason (§16.3). The shadowed-path gate compares, in both bases' merged views, every path the app layers shadow.
+- **rev 2.14 (2026-10-22):** guests get IPv6 egress (`2026-10-21-guest-ipv6.md`). §1 narrows the IPv6 non-goal, and §3 T5, §9.3 and §9.6 stage 5 cover IPv6:
+  - NAT66 behind a fixed ULA through pasta;
+  - an IPv6 deny list;
+  - IPv6 anti-spoofing;
+  - neighbour discovery handled in the VM's namespace.
+
 ---
 
 ## 1. Goals
@@ -145,7 +151,7 @@ Codenames name internal pieces only. The products are `kiln`, `vmkit` and `potte
 - Auto-delegating `kiln run` to a Lima VM on macOS.
 - Snapshotting guests started by `kiln run`, and forking (sagger, with its own spec). `kiln-init` would have to reconnect its control channel after the vsock reset every restore causes. Snapshot/restore itself (in `vmkit`), snapshot artifacts (sherd) and lazy restore (raku) are in scope since rev 2.12 (`2026-10-21-lazy-restore-design.md`).
 - DNS-name-based egress policy (CIDR policy only in v1).
-- IPv6 inside guests.
+- Inbound IPv6 (port forwards), a global (non-NAT) IPv6 address per guest, and SLAAC or DHCPv6 in guests. Guests have IPv6 egress (§9.3).
 - Windows hosts, GPUs, non-Linux guests.
 
 ---
@@ -203,7 +209,7 @@ The `kiln` and `vmkit` binaries; the pinned digest tables compiled into `kiln`; 
 | T2 | Image content cannot direct host network requests outside the registry: descriptor `urls` are ignored, and redirects to private or link-local destinations are refused. | §4.2 `kiln-registry` |
 | T3 | Untrusted input cannot exhaust host disk, memory or CPU without bound during conversion. | §7.6 |
 | T4 | The kernel and init that boot are the pinned ones unless the user explicitly opts out. Images cannot influence the kernel cmdline. | §8.1, §8.3 |
-| T5 | Default guest egress cannot reach link-local (including cloud metadata), private, loopback-mapped or host addresses, or other VMs. Guests cannot spoof addresses. | §9.3 |
+| T5 | Default guest egress cannot reach link-local (including cloud metadata), private, loopback-mapped or host addresses, or other VMs, over IPv4 or IPv6. Guests cannot spoof addresses or configure the host side through neighbour discovery. | §9.3 |
 | T6 | VMMs run unprivileged in a sandbox that exposes only the files and devices that VM needs. No `kiln` component runs as root. | §9.2 |
 | T7 | Run state lives in a 0700 per-user runtime directory and is never trusted across boots or hosts. | §5.3 |
 | T8 | Every string that comes from the guest or the image and is printed by `kiln` (diagnostics, `inspect`, `ls`, console excerpts) is sanitised. App stdio is passed through unmodified, like `docker run`, and this is documented. | §13 |
@@ -608,23 +614,30 @@ Further constraints:
 
 Inside the VM's own net namespace:
 - A tap device `tap0` with address `172.30.0.1/30`. The guest is `172.30.0.2/30`, gateway `.1`.
+  - IPv6 (`2026-10-21-guest-ipv6.md`): `tap0` also has `fd76:6d6b:6974::1/64`, and the guest is `fd76:6d6b:6974::2/64` with that gateway. The ULA is masqueraded like the IPv4 address.
   - Every VM has its own namespace, so addresses never collide and VMs can't route to each other.
-- `ip_forward=1` is set **in that namespace only**.
+- `ip_forward=1` and IPv6 forwarding are set **in that namespace only**.
+- **Neighbour discovery** stays on the host side:
+  - `tap0` takes no router advertisement or redirect (`accept_ra=0`, `accept_redirects=0`);
+  - the guest's neighbour entry is permanent, never learned from the guest;
+  - the namespace sends the guest no router advertisement.
 - An nftables table in that namespace:
-  - **forward:** accept `iif tap0 ip saddr 172.30.0.2` to the egress interface, subject to the egress policy; drop everything else, including IPv6 and spoofed sources.
-  - **input:** drop every new connection from the guest; DNS to `.1:53` never reaches input, because it is DNAT'd to pasta's DNS forward address. ARP is unaffected, since it isn't IP traffic.
+  - **forward:** accept `iif tap0 ip saddr 172.30.0.2` and `ip6 saddr fd76:6d6b:6974::2` to the egress interface, subject to the egress policy; drop everything else, including spoofed sources.
+  - **input:** drop every new connection from the guest; DNS to `.1:53` never reaches input, because it is DNAT'd to pasta's DNS forward address. ARP is unaffected, since it isn't IP traffic. Of ICMPv6, only neighbour solicitations from `fd76:6d6b:6974::2` with hop limit 255 are accepted (the guest resolving its gateway). Router solicitations and advertisements, redirects, MLD, echo, and solicitations from any other source are dropped, and a prerouting guard drops packets to any other address on the tap's link; both bound the host's shared neighbour table.
   - masquerade on egress.
 - `pasta` attaches to the namespace and provides unprivileged egress through host sockets:
   - `--no-map-gw`: host loopback services are unreachable.
+  - pasta is dual-stack (`--no-ra --no-dhcpv6`; `--config-net` copies the host's IPv6 address and route) when the host has IPv6. On a host without IPv6 the VM network is IPv4-only, as before, and the guest gets no IPv6 configuration; on one without an IPv6 default route the guest's IPv6 connections fail at pasta.
   - DNS from the guest to `.1:53` is DNAT'd to pasta's `--dns-forward` address. pasta queries the host's resolver from the host namespace, so loopback stubs such as `127.0.0.53` work.
 - **Egress policy** (`--egress`):
   - **Default `restricted`:** deny `169.254.0.0/16`, `100.64.0.0/10`, RFC 1918, `0.0.0.0/8`, `127.0.0.0/8`, multicast, and the host's own addresses; allow the rest.
-  - `--egress allow=<cidr>`: adds exceptions (repeatable). pasta copies the host's outbound address (the one on its default route) into the namespace, so the guest can never reach it: an exception that is only that address is refused before boot, and a wider one that includes it is warned about. The host's other addresses can be reached through an exception.
+    - **IPv6:** deny everything outside global unicast `2000::/3`, plus `2001::/23`, `2001:db8::/32`, `3fff::/20` and `2002::/16` inside it. Outside `2000::/3` are loopback, IPv4-mapped, NAT64, ULA, link-local, site-local and multicast; inside, Teredo, documentation and 6to4. Also deny the host's IPv6 addresses and every prefix it reaches without a gateway (its links, read from `/proc/net/ipv6_route`), each widened to its `/56` so the subnets beside it (a cloud VPC's) are denied as RFC 1918 ones are.
+  - `--egress allow=<cidr>`: adds exceptions, IPv4 or IPv6 (repeatable). pasta copies the host's outbound address (the one on its default route) into the namespace, so the guest can never reach it: an exception that is only that address is refused before boot, and a wider one that includes it is warned about. The host's other addresses can be reached through an exception.
   - `--egress deny-all`: blocks everything except DNS and `allow=` exceptions.
   - `--egress open`: removes the default denies, with a warning.
   - The guest cannot modify the policy; it lives outside the guest.
 - **Port forwarding:** `-p [ADDRESS:]HOST:GUEST[/tcp|udp]` (repeatable). The host address `pasta` listens on defaults to `127.0.0.1`, so a published port stays on the host unless an address is given (`0.0.0.0` for all); a host port is published once per protocol whatever its addresses, since the namespace sees only the port. The image owns its listen port: the app must listen on `0.0.0.0` or the guest's address, and a forward to a guest listening on `127.0.0.1` ends at once. Forwarding is `pasta` port forwarding plus DNAT to `.2`, on both of pasta's paths: through its interface (prerouting), and spliced from host loopback as a local connection to the namespace's own address (nat output, with `route_localnet` on `tap0`).
-- **Guest addressing** is delivered in the config message (§9.5). The guest configures `eth0` over netlink.
+- **Guest addressing** is delivered in the config message (§9.5), with the IPv6 side in `network.ipv6`. The guest configures `eth0` over netlink. Port forwards stay IPv4.
 
 ### 9.4 Scratch disk and `--persist`
 
@@ -698,7 +711,7 @@ Each stage reports `Stage { n }`. A failure reports `InitFailed` when the contro
    - `pivot_root(".", ".")`, then detach the old root.
 5. **Identity and network:**
    - Write `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf` as regular files, replacing any symlink at those paths (unlink, then `O_CREAT|O_NOFOLLOW`). Without a network (or DNS servers), `resolv.conf` names `127.0.0.1`, as Docker's `--network none` does, so lookups fail at once.
-   - Bring up `lo`. Configure `eth0` over netlink when there's a network.
+   - Bring up `lo`. Configure `eth0` over netlink when there's a network: the IPv4 address and default route, then with `network.ipv6` the IPv6 address (no DAD) and default route.
 6. **Process:**
    - **User:** resolve `user` against the image's `/etc/passwd` and `/etc/group`. Numeric `uid[:gid]` works without entries.
    - **Groups:** call `setgroups` with the user's supplementary groups.

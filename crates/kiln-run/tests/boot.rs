@@ -7,7 +7,8 @@ mod support;
 use std::time::Duration;
 
 use kiln_proto::{
-    EXIT_CANNOT_INVOKE, EXIT_INFRA, EXIT_NOT_FOUND, HostMessage, MAX_FRAME, Network, Shutdown, Signal, WindowSize,
+    EXIT_CANNOT_INVOKE, EXIT_INFRA, EXIT_NOT_FOUND, HostMessage, Ipv6Network, MAX_FRAME, Network, Shutdown, Signal,
+    WindowSize,
 };
 use support::driver::{Outcome, Reply};
 use support::{BOOT, Case, DEEP_LAYERS, END, STACK_LAYERS, fixtures};
@@ -380,13 +381,15 @@ fn networking_from_config(backend: Backend) {
         );
         return;
     }
-    use vmkit::net::{GATEWAY, GUEST, PREFIX, PortForward, Protocol};
+    use vmkit::net::{GATEWAY, GATEWAY6, GUEST, GUEST6, PREFIX, PREFIX6, PortForward, Protocol};
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
-    let script = "ip -4 addr show eth0 | grep inet; ip route | grep default; cat /etc/resolv.conf; \
+    let script = "ip -4 addr show eth0 | grep inet; ip route | grep default; \
+                  ip -6 addr show eth0 | grep 'inet6 fd'; ip -6 route | grep default; \
+                  grep kiln-guest /etc/hosts; cat /etc/resolv.conf; \
                   echo hello-from-guest | nc -l -p 8080";
     let mut config = sh(&c, script);
     config.network = Some(Network {
@@ -394,6 +397,11 @@ fn networking_from_config(backend: Backend) {
         prefix_len: PREFIX,
         gateway: GATEWAY,
         dns: vec![GATEWAY],
+        ipv6: Some(Ipv6Network {
+            address: GUEST6,
+            prefix_len: PREFIX6,
+            gateway: GATEWAY6,
+        }),
     });
     let net = NetSpec {
         forwards: vec![PortForward {
@@ -402,6 +410,7 @@ fn networking_from_config(backend: Backend) {
             host: port,
             guest: 8080,
         }],
+        ipv6: true,
         ..NetSpec::default()
     };
     let spec = c.spec(&fixtures().base, &config, Some(net));
@@ -428,6 +437,11 @@ fn networking_from_config(backend: Backend) {
     assert!(out.contains(&format!("inet {GUEST}/{PREFIX} ")), "{out}");
     assert!(out.contains(&format!("default via {GATEWAY} dev eth0")), "{out}");
     assert!(out.contains(&format!("nameserver {GATEWAY}")), "{out}");
+    // The IPv6 side: usable at once (no DAD), with its default route.
+    assert!(out.contains(&format!("inet6 {GUEST6}/{PREFIX6} scope global")), "{out}");
+    assert!(!out.contains("tentative"), "{out}");
+    assert!(out.contains(&format!("default via {GATEWAY6} dev eth0")), "{out}");
+    assert!(out.contains(&format!("{GUEST6}\tkiln-guest")), "{out}");
 }
 
 fn a_second_hello_makes_the_host_kill_the_vm(backend: Backend) {

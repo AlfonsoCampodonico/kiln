@@ -2,10 +2,12 @@
 //! options, checked before anything boots: valid, and small enough for one
 //! control frame (D-4). Also the device budget (spec §9.7).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use kiln_image::types::Process as ImageProcess;
-use kiln_proto::{Config, ExitMethod, HostMessage, MAX_FRAME, Network, Process, ProtoError, Scratch, WindowSize};
+use kiln_proto::{
+    Config, ExitMethod, HostMessage, Ipv6Network, MAX_FRAME, Network, Process, ProtoError, Scratch, WindowSize,
+};
 
 use crate::error::{Error, Result};
 use crate::options::RunOptions;
@@ -17,6 +19,12 @@ pub const GUEST: Ipv4Addr = Ipv4Addr::new(172, 30, 0, 2);
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(172, 30, 0, 1);
 /// vmkit's `net::PREFIX`.
 pub const PREFIX: u8 = 30;
+/// The guest's IPv6 address, NAT'd like its IPv4 one (vmkit's `net::GUEST6`).
+pub const GUEST6: Ipv6Addr = Ipv6Addr::new(0xfd76, 0x6d6b, 0x6974, 0, 0, 0, 0, 2);
+/// The guest's IPv6 gateway (vmkit's `net::GATEWAY6`); DNS stays on [`GATEWAY`].
+pub const GATEWAY6: Ipv6Addr = Ipv6Addr::new(0xfd76, 0x6d6b, 0x6974, 0, 0, 0, 0, 1);
+/// vmkit's `net::PREFIX6`.
+pub const PREFIX6: u8 = 64;
 
 /// The run-specific values `Config` needs besides the image and options.
 #[derive(Debug, Clone)]
@@ -29,6 +37,9 @@ pub struct Runtime {
     pub window: Option<WindowSize>,
     /// kiln's own environment, for `--env KEY` without a value.
     pub host_env: Vec<(String, String)>,
+    /// With `--net`: the VM network carries IPv6 (the host has it), so the guest gets an
+    /// IPv6 address and route.
+    pub ipv6: bool,
 }
 
 /// Builds and checks the guest's `Config`.
@@ -71,12 +82,17 @@ pub fn build(image: &ImageProcess, opts: &RunOptions, rt: &Runtime) -> Result<Co
         tty: opts.tty.then(|| rt.window.unwrap_or(WindowSize { rows: 24, cols: 80 })),
         interactive: opts.interactive,
         hostname: rt.hostname.clone(),
-        // `--net`: vmkit's fixed addressing, with DNS through the gateway.
+        // `--net`: vmkit's fixed addressing, IPv4 and IPv6, with DNS through the gateway.
         network: opts.net.as_ref().map(|_| Network {
             address: GUEST,
             prefix_len: PREFIX,
             gateway: GATEWAY,
             dns: vec![GATEWAY],
+            ipv6: rt.ipv6.then_some(Ipv6Network {
+                address: GUEST6,
+                prefix_len: PREFIX6,
+                gateway: GATEWAY6,
+            }),
         }),
         layers: rt.layers,
         scratch: Scratch {
@@ -159,6 +175,7 @@ mod tests {
             exit_method: ExitMethod::Reboot,
             window: None,
             host_env: vec![("HOSTVAR".into(), "hv".into())],
+            ipv6: true,
         }
     }
 
@@ -196,9 +213,17 @@ mod tests {
                 address: GUEST,
                 prefix_len: 30,
                 gateway: GATEWAY,
-                dns: vec![GATEWAY]
+                dns: vec![GATEWAY],
+                ipv6: Some(Ipv6Network {
+                    address: "fd76:6d6b:6974::2".parse().unwrap(),
+                    prefix_len: 64,
+                    gateway: "fd76:6d6b:6974::1".parse().unwrap(),
+                }),
             })
         );
+        // A host without IPv6: the guest gets none either.
+        let no6 = build(&image(), &o, &Runtime { ipv6: false, ..rt() }).unwrap();
+        assert_eq!(no6.network.map(|n| n.ipv6), Some(None));
         assert_eq!(c.shutdown_grace_secs, 3);
     }
 

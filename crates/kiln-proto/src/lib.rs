@@ -18,7 +18,7 @@ mod message;
 pub mod sanitize;
 pub mod signal;
 
-pub use config::{Config, ExitMethod, MAX_LAYERS, MIN_SCRATCH_BYTES, Network, Process, Scratch};
+pub use config::{Config, ExitMethod, Ipv6Network, MAX_LAYERS, MIN_SCRATCH_BYTES, Network, Process, Scratch};
 pub use error::{ProtoError, Result};
 pub use exit::{EXIT_CANNOT_INVOKE, EXIT_INFRA, EXIT_NOT_FOUND};
 pub use frame::{read_message, write_message};

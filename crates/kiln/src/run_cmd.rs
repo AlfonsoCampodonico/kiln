@@ -44,7 +44,7 @@ pub struct RunArgs {
     /// Give the guest a network (eth0, egress through the host).
     #[arg(long)]
     net: bool,
-    /// With --net: restricted (the default), deny-all, open, or allow=CIDR (repeatable).
+    /// With --net: restricted (the default), deny-all, open, or allow=CIDR, IPv4 or IPv6 (repeatable).
     #[arg(long, value_name = "POLICY")]
     egress: Vec<String>,
     /// With --net: publish a guest port on the host, [ADDRESS:]HOST:GUEST[/tcp|udp]

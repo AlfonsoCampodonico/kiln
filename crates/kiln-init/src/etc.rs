@@ -8,12 +8,16 @@ pub fn hostname(name: &str) -> String {
     format!("{name}\n")
 }
 
-/// Docker's layout. Without a network the hostname resolves to 127.0.1.1 (on `lo`).
+/// Docker's layout. Without a network the hostname resolves to 127.0.1.1 (on `lo`); with
+/// IPv6, to the guest's IPv6 address as well.
 pub fn hosts(name: &str, network: Option<&Network>) -> String {
     let addr = network.map_or(Ipv4Addr::new(127, 0, 1, 1), |n| n.address);
+    let v6 = network
+        .and_then(|n| n.ipv6.as_ref())
+        .map_or(String::new(), |v6| format!("{}\t{name}\n", v6.address));
     format!(
         "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\nfe00::\tip6-localnet\n\
-         ff00::\tip6-mcastprefix\nff02::1\tip6-allnodes\nff02::2\tip6-allrouters\n{addr}\t{name}\n"
+         ff00::\tip6-mcastprefix\nff02::1\tip6-allnodes\nff02::2\tip6-allrouters\n{addr}\t{name}\n{v6}"
     )
 }
 
@@ -30,6 +34,8 @@ pub fn resolv_conf(network: Option<&Network>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use kiln_proto::Ipv6Network;
+
     use super::*;
 
     #[test]
@@ -39,6 +45,7 @@ mod tests {
             prefix_len: 30,
             gateway: Ipv4Addr::new(172, 30, 0, 1),
             dns: vec![Ipv4Addr::new(172, 30, 0, 1)],
+            ipv6: None,
         };
         assert!(hosts("box", Some(&net)).ends_with("\n172.30.0.2\tbox\n"));
         assert!(hosts("box", None).ends_with("\n127.0.1.1\tbox\n"));
@@ -48,11 +55,27 @@ mod tests {
             resolv_conf(None),
             "# kiln: this VM has no network\nnameserver 127.0.0.1\n"
         );
-        let no_dns = Network { dns: vec![], ..net };
+        let no_dns = Network {
+            dns: vec![],
+            ..net.clone()
+        };
         assert_eq!(
             resolv_conf(Some(&no_dns)),
             "# kiln: no DNS servers configured\nnameserver 127.0.0.1\n"
         );
         assert_eq!(hostname("box"), "box\n");
+        let v6 = Network {
+            ipv6: Some(Ipv6Network {
+                address: "fd76:6d6b:6974::2".parse().unwrap(),
+                prefix_len: 64,
+                gateway: "fd76:6d6b:6974::1".parse().unwrap(),
+            }),
+            ..net
+        };
+        assert!(
+            hosts("box", Some(&v6)).ends_with("\n172.30.0.2\tbox\nfd76:6d6b:6974::2\tbox\n"),
+            "{}",
+            hosts("box", Some(&v6))
+        );
     }
 }
