@@ -912,9 +912,7 @@ fn rebase_onto_a_patched_base_and_refuse_a_stale_copy() {
         .code(1)
         .stderr(
             predicate::str::contains("kiln: rebase refused:")
-                .and(predicate::str::contains(format!(
-                    "  - shadow: 1 path the app shadows differs"
-                )))
+                .and(predicate::str::contains("  - shadow: 1 path the app shadows differs"))
                 .and(predicate::str::contains(format!("/{FPM}: content differs"))),
         );
     kiln(home.path()).args(["inspect", "app:3"]).assert().failure();
