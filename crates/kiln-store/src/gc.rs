@@ -45,7 +45,11 @@ impl Store {
     /// (`base.sourceLayers..`), from which rebase re-derives the app half (a
     /// squashed app half needs all of them), and its base's manifest, which the
     /// caller then walks like any other (a chain of bases). Returns that manifest.
-    fn keep_sources(&self, json: &serde_json::Value, live: &mut BTreeSet<Digest>) -> Result<Option<Digest>> {
+    ///
+    /// What it keeps goes into `kept`, apart from the walk: a hostile config may
+    /// name another image's manifest as its source, and that manifest must still
+    /// be walked when its own ref reaches it.
+    fn keep_sources(&self, json: &serde_json::Value, kept: &mut BTreeSet<Digest>) -> Result<Option<Digest>> {
         let digest = |v: Option<&serde_json::Value>| v.and_then(|d| d.as_str()).and_then(|s| Digest::parse(s).ok());
         if json.get("erofsFormatVersion").is_none() {
             return Ok(None);
@@ -65,14 +69,14 @@ impl Store {
             }
         };
         let Some(manifest) = parse(&src)? else { return Ok(base) };
-        live.insert(src);
+        kept.insert(src);
         if let Some(config) = digest(manifest.pointer("/config/digest")) {
-            live.insert(config);
+            kept.insert(config);
         }
         let first_app = json.pointer("/base/sourceLayers").and_then(|v| v.as_u64());
         if let (Some(first), Some(layers)) = (first_app, manifest.get("layers").and_then(|v| v.as_array())) {
             let first = usize::try_from(first).unwrap_or(usize::MAX);
-            live.extend(layers.iter().skip(first).filter_map(|l| digest(l.get("digest"))));
+            kept.extend(layers.iter().skip(first).filter_map(|l| digest(l.get("digest"))));
         }
         Ok(base)
     }
@@ -80,6 +84,7 @@ impl Store {
     /// Blobs reachable from refs.
     pub fn live_blobs(&self) -> Result<BTreeSet<Digest>> {
         let mut live = BTreeSet::new();
+        let mut kept = BTreeSet::new();
         let mut stack: Vec<Digest> = self.refs()?.into_values().collect();
         while let Some(d) = stack.pop() {
             if !live.insert(d.clone()) || !self.has_blob(&d) {
@@ -92,9 +97,10 @@ impl Store {
             };
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 stack.extend(references(&json));
-                stack.extend(self.keep_sources(&json, &mut live)?);
+                stack.extend(self.keep_sources(&json, &mut kept)?);
             }
         }
+        live.extend(kept);
         Ok(live)
     }
 
@@ -305,6 +311,36 @@ mod tests {
             live.contains(&inner) && live.contains(&inner_src),
             "the chain is walked"
         );
+    }
+
+    /// A config naming another image's manifest as its "source" must not stop gc
+    /// from walking that image: refs pop in reverse name order, so `zz-evil` comes
+    /// first.
+    #[test]
+    fn a_hostile_source_pointer_cannot_hide_another_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let put = |v: serde_json::Value| s.put_bytes(&serde_json::to_vec(&v).unwrap()).unwrap();
+        let (layer, config) = (
+            s.put_bytes(b"victim layer").unwrap(),
+            put(serde_json::json!({"erofsFormatVersion": 1})),
+        );
+        let victim = put(
+            serde_json::json!({"config": {"digest": config.to_string()}, "layers": [{"digest": layer.to_string()}]}),
+        );
+        s.set_ref("app:1", &victim).unwrap();
+        let evil_config = put(serde_json::json!({
+            "erofsFormatVersion": 1,
+            "source": {"manifestDigest": victim.to_string()},
+            "base": {"manifestDigest": victim.to_string(), "layers": 0, "sourceLayers": 0},
+        }));
+        let evil = put(serde_json::json!({"config": {"digest": evil_config.to_string()}, "layers": []}));
+        s.set_ref("zz-evil:1", &evil).unwrap();
+        let live = s.live_blobs().unwrap();
+        for d in [&victim, &config, &layer] {
+            assert!(live.contains(d), "{d}");
+        }
+        assert_eq!(s.gc().unwrap().blobs_removed, 0);
     }
 
     #[test]
