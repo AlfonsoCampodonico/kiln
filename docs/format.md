@@ -56,7 +56,7 @@ An OCI image manifest (`mediaType` `application/vnd.oci.image.manifest.v1+json`,
 - `source.manifestDigest`: the source OCI manifest. `source.reference` is present only for registry inputs. This is unverified provenance.
 - `erofsFormatVersion`: the erofs profile version of every app layer.
 - `labels`: the source OCI config's labels, omitted when there are none.
-- `base` (only for images converted with `--base` or made by `kiln rebase`): `{ "name", "manifestDigest", "layers", "sourceLayers" }`. The image's bottom `layers` app layers are exactly the layers of the kiln manifest `manifestDigest`, the base, and they came from the first `sourceLayers` layers of the source manifest. No squashed layer spans that boundary: layers above it that are merged keep their whiteouts and opaque markers. `name` is informational. `kiln rebase` refuses images without this record.
+- `base` (only for images converted with `--base` or made by `kiln rebase`): `{ "name", "manifestDigest", "layers", "sourceLayers" }`. The image's bottom `layers` app layers are exactly the app layers of the kiln manifest `manifestDigest`, the base, and they came from the first `sourceLayers` layers of the source manifest. No squashed layer spans that boundary: layers above it that are merged keep their whiteouts and opaque markers. `name` is informational. `kiln rebase` refuses images without this record.
 - There is no kernel command line field and no kiln version field.
 
 ### Local store (informative)
