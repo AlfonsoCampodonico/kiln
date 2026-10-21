@@ -47,7 +47,7 @@ fn eth0(rtnl: &mut Rtnl, net: &Network) -> Result<()> {
         netlink::add_address(seq, eth0, net.address, net.prefix_len)
     })?;
     rtnl.request("add the default route", |seq| {
-        netlink::add_default_route(seq, eth0, net.gateway)
+        netlink::add_default_route(seq, eth0, net.gateway, !net.gateway_in_prefix())
     })?;
     if let Some(v6) = &net.ipv6 {
         rtnl.request("add eth0's IPv6 address", |seq| {

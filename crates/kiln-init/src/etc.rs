@@ -26,7 +26,16 @@ pub fn hosts(name: &str, network: Option<&Network>) -> String {
 /// refused" instead of tools refusing to start without a resolver.
 pub fn resolv_conf(network: Option<&Network>) -> String {
     match network {
-        Some(n) if !n.dns.is_empty() => n.dns.iter().map(|d| format!("nameserver {d}\n")).collect(),
+        Some(n) if !n.dns.is_empty() => {
+            let mut out: String = n.dns.iter().map(|d| format!("nameserver {d}\n")).collect();
+            if !n.search.is_empty() {
+                out += &format!("search {}\n", n.search.join(" "));
+            }
+            if !n.options.is_empty() {
+                out += &format!("options {}\n", n.options.join(" "));
+            }
+            out
+        }
         Some(_) => "# kiln: no DNS servers configured\nnameserver 127.0.0.1\n".to_string(),
         None => "# kiln: this VM has no network\nnameserver 127.0.0.1\n".to_string(),
     }
@@ -45,6 +54,8 @@ mod tests {
             prefix_len: 30,
             gateway: Ipv4Addr::new(172, 30, 0, 1),
             dns: vec![Ipv4Addr::new(172, 30, 0, 1)],
+            search: Vec::new(),
+            options: Vec::new(),
             ipv6: None,
         };
         assert!(hosts("box", Some(&net)).ends_with("\n172.30.0.2\tbox\n"));
@@ -54,6 +65,16 @@ mod tests {
         assert_eq!(
             resolv_conf(None),
             "# kiln: this VM has no network\nnameserver 127.0.0.1\n"
+        );
+        let pod = Network {
+            dns: vec![Ipv4Addr::new(10, 96, 0, 10)],
+            search: vec!["a.svc".into(), "b".into()],
+            options: vec!["ndots:5".into()],
+            ..net.clone()
+        };
+        assert_eq!(
+            resolv_conf(Some(&pod)),
+            "nameserver 10.96.0.10\nsearch a.svc b\noptions ndots:5\n"
         );
         let no_dns = Network {
             dns: vec![],
