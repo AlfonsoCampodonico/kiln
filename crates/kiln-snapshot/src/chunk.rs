@@ -6,7 +6,7 @@ use std::path::Path;
 
 use kiln_oci::media::OCI_MANIFEST;
 use kiln_oci::{Descriptor, ImageManifest, canonical_json};
-use kiln_store::{Digest, Store};
+use kiln_store::{Digest, MAX_METADATA_BLOB, Store};
 
 use crate::error::{Result, SnapshotError};
 use crate::format::{
@@ -117,6 +117,12 @@ fn list_files(dir: &Path, limits: &Limits) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// The fewest config bytes a chunk takes (`null,`).
+const MIN_ENTRY_BYTES: u64 = 5;
+/// The most distinct chunks whose layer descriptors fit a manifest a reader accepts (each
+/// descriptor takes about 150 bytes of canonical JSON).
+const MAX_LAYERS: usize = (MAX_METADATA_BLOB / 160) as usize;
+
 /// Fills `buf` from `r`; fewer bytes only at the end of the stream.
 fn read_full(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut n = 0;
@@ -147,9 +153,10 @@ pub fn chunk_bundle(store: &Store, dir: &Path, chunk_size: u64) -> Result<Built>
     let mut buf = vec![0u8; chunk_size as usize];
     // Compared with `==`, a memcmp: fast even in debug builds.
     let zeros = vec![0u8; chunk_size as usize];
-    let mut layers: Vec<Descriptor> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut files = Vec::with_capacity(names.len());
+    // Every bound a reader applies is checked before anything is read or stored: the file
+    // sizes, their total, and whether the config and manifest could fit at all.
+    let mut opened = Vec::with_capacity(names.len());
+    let (mut total, mut entries) = (0u64, 0u64);
     for name in names {
         let path = dir.join(&name);
         let (file, size) = open_regular(&path)?;
@@ -159,6 +166,27 @@ pub fn chunk_bundle(store: &Store, dir: &Path, chunk_size: u64) -> Result<Built>
                 max: limits.max_file_size,
             });
         }
+        total = total.saturating_add(size);
+        entries = entries.saturating_add(size.div_ceil(chunk_size));
+        opened.push((name, path, file, size));
+    }
+    if total > limits.max_total_size {
+        return Err(SnapshotError::LimitExceeded {
+            what: "snapshot total size",
+            max: limits.max_total_size,
+        });
+    }
+    // Each chunk is at least a `null` in the config.
+    if entries.saturating_mul(MIN_ENTRY_BYTES) > limits.max_config {
+        return Err(SnapshotError::LimitExceeded {
+            what: "chunks per snapshot (use a larger --chunk-size)",
+            max: limits.max_config / MIN_ENTRY_BYTES,
+        });
+    }
+    let mut layers: Vec<Descriptor> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut files = Vec::with_capacity(opened.len());
+    for (name, path, file, size) in opened {
         // Read the size fstat reported, and no more: a file that changes while
         // it is read is an error rather than a torn snapshot.
         let mut r = file.take(size);
@@ -179,7 +207,14 @@ pub fn chunk_bundle(store: &Store, dir: &Path, chunk_size: u64) -> Result<Built>
                 chunks.push(None);
                 continue;
             }
-            let d = store.put_bytes(bytes)?;
+            let d = Digest::of(bytes);
+            if !seen.contains(&d) && layers.len() >= MAX_LAYERS {
+                return Err(SnapshotError::LimitExceeded {
+                    what: "distinct chunks per snapshot (use a larger --chunk-size)",
+                    max: MAX_LAYERS as u64,
+                });
+            }
+            store.put_bytes(bytes)?;
             if seen.insert(d.clone()) {
                 layers.push(Descriptor::new(SNAPSHOT_CHUNK, d.clone(), want as u64));
             }
@@ -196,6 +231,12 @@ pub fn chunk_bundle(store: &Store, dir: &Path, chunk_size: u64) -> Result<Built>
     // What a reader would refuse is not written (the total size, for one).
     config.check(&layers, &limits)?;
     let config_bytes = canonical_json(&config);
+    if config_bytes.len() as u64 > limits.max_config {
+        return Err(SnapshotError::LimitExceeded {
+            what: "snapshot config size (use a larger --chunk-size)",
+            max: limits.max_config,
+        });
+    }
     let config_digest = store.put_bytes(&config_bytes)?;
     let manifest = ImageManifest {
         schema_version: 2,
@@ -205,7 +246,14 @@ pub fn chunk_bundle(store: &Store, dir: &Path, chunk_size: u64) -> Result<Built>
         layers,
         annotations: None,
     };
-    let manifest_digest = store.put_bytes(&canonical_json(&manifest))?;
+    let manifest_bytes = canonical_json(&manifest);
+    if manifest_bytes.len() as u64 > MAX_METADATA_BLOB {
+        return Err(SnapshotError::LimitExceeded {
+            what: "snapshot manifest size (use a larger --chunk-size)",
+            max: MAX_METADATA_BLOB,
+        });
+    }
+    let manifest_digest = store.put_bytes(&manifest_bytes)?;
     Ok(Built {
         manifest_digest,
         config,

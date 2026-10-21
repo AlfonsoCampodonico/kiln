@@ -5,7 +5,7 @@ members = ["crates/*"]
 # The VMMs run on Linux only; elsewhere `kiln run` explains how to use a Lima VM. Pinned to
 # vmkit's snapshot-restore branch: snapshot, restore and lazy restore (lazy-restore design).
 [workspace.dependencies]
-vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "5cfb2f9a4e0bc605bccda93ece7bfa96e49f09b9" }
+vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "630962c470711f194161d8e71bc2c84c13b89897" }
 
 [workspace.package]
 edition = "2024"

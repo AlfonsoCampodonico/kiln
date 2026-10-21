@@ -224,3 +224,38 @@ fn the_built_snapshot_passes_the_readers_checks() {
         .check(&built.manifest.layers, &kiln_snapshot::Limits::default())
         .unwrap();
 }
+
+/// A bundle whose `names` are sparse files of `size` bytes (holes only: nothing to read).
+fn sparse_bundle(dir: &std::path::Path, names: &[&str], size: u64) {
+    bundle(dir, &[]);
+    for name in names {
+        fs::File::create(dir.join(name)).unwrap().set_len(size).unwrap();
+    }
+}
+
+#[test]
+fn a_bundle_over_the_total_size_is_refused_before_anything_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_h, store) = store();
+    sparse_bundle(dir.path(), &["a", "b", "c", "d", "e"], 1 << 40);
+    let start = std::time::Instant::now();
+    match chunk_bundle(&store, dir.path(), 16 << 20) {
+        Err(SnapshotError::LimitExceeded { what, .. }) => assert!(what.contains("total"), "{what}"),
+        other => panic!("expected a limit error, got {other:?}"),
+    }
+    assert!(start.elapsed().as_secs() < 5, "5 TiB of holes were read");
+    assert!(store.list_blobs().unwrap().is_empty());
+}
+
+#[test]
+fn too_many_chunks_for_a_config_are_refused_before_anything_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_h, store) = store();
+    // 64 GiB at 64 KiB is a million chunks: more `null`s than a 4 MiB config holds.
+    sparse_bundle(dir.path(), &["memory"], 64 << 30);
+    match chunk_bundle(&store, dir.path(), K) {
+        Err(SnapshotError::LimitExceeded { what, .. }) => assert!(what.contains("chunk-size"), "{what}"),
+        other => panic!("expected a limit error, got {other:?}"),
+    }
+    assert!(store.list_blobs().unwrap().is_empty());
+}

@@ -26,7 +26,12 @@ impl StoreSource {
     }
 
     /// The bytes of chunk `digest`, which must be `size` bytes long.
+    ///
+    /// Holds the store's shared lock throughout, so a `kiln gc` cannot remove the chunk (or
+    /// the staged download) between fetching and reading it. A lazy bundle directory keeps
+    /// its chunks in the store only while its snapshot is tagged.
     pub fn chunk(&self, digest: &Digest, size: u64) -> Result<Vec<u8>> {
+        let _lock = self.store.lock_shared()?;
         if !self.store.has_blob(digest)
             && let Some((client, repo)) = &self.remote
         {
