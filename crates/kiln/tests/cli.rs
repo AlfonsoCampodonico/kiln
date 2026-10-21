@@ -78,12 +78,13 @@ fn convert_ls_inspect_gc_import() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(v["images"][0]["config"]["process"]["cmd"][0], "php");
-    // GC frees the source OCI blobs (layer, config, manifest) but keeps the kiln image.
+    // GC frees the source layer but keeps the kiln image, and the source manifest
+    // and config that `kiln rebase` reads (spec §5.2).
     kiln(home.path())
         .arg("gc")
         .assert()
         .success()
-        .stdout(predicate::str::contains("removed 3 blobs"));
+        .stdout(predicate::str::contains("removed 1 blobs"));
     kiln(home.path()).args(["inspect", "app:latest"]).assert().success();
     kiln(home.path())
         .arg("gc")
@@ -818,6 +819,171 @@ fn pinned_boot_layers_are_fetched_from_the_registry() {
     assert_eq!(std::fs::metadata(&blob).unwrap().len(), pin.size);
     kiln(home.path()).arg("gc").assert().success();
     assert!(blob.exists(), "gc removed the pinned kernel");
+}
+
+const FPM: &str = "usr/local/etc/php-fpm.d/laravel-cloud-fpm.conf";
+
+/// A two-layer base: `var/` with `var_mode`, nginx, and the php-fpm config.
+fn rebase_base(nginx: &[u8], var_mode: u32, fpm: &[u8]) -> Vec<Vec<u8>> {
+    vec![
+        TarBuilder::new()
+            .file("etc/os-release", b"ID=debian\nVERSION_ID=12\n", &Opts::default())
+            .dir("var", &Opts::default().mode(var_mode))
+            .finish(),
+        TarBuilder::new()
+            .file("usr/sbin/nginx", nginx, &Opts::default().mode(0o755))
+            .file(FPM, fpm, &Opts::default())
+            .finish(),
+    ]
+}
+
+fn rebase_cfg(php: &str) -> ContainerConfig {
+    ContainerConfig {
+        cmd: Some(vec!["php-fpm".into()]),
+        env: Some(vec![
+            format!("PHP_VERSION={php}"),
+            "PHP_FPM_REQUEST_TERMINATE_TIMEOUT=60".into(),
+        ]),
+        labels: Some([("php.version".to_string(), php.to_string())].into()),
+        ..Default::default()
+    }
+}
+
+/// End to end: convert a base and an app on it, rebase onto a patched base, then
+/// see the shadowed-path gate catch a copied-up config the next base changed.
+#[test]
+fn rebase_onto_a_patched_base_and_refuse_a_stale_copy() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let fpm = b"request_terminate_timeout = ${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}\n";
+    let old = rebase_base(b"nginx 1.30.4", 0o755, fpm);
+    let patched = rebase_base(b"nginx 1.30.6", 0o750, fpm);
+    let fpm_changed = rebase_base(b"nginx 1.30.6", 0o755, b"request_terminate_timeout = 30\n");
+    let mut app = old.clone();
+    // A code layer with implicit parents, and the template's `sed -i` copy-up.
+    app.push(
+        TarBuilder::new()
+            .file("var/www/index.php", b"<?php echo 'hi';", &Opts::default())
+            .finish(),
+    );
+    app.push(
+        TarBuilder::new()
+            .file(FPM, b"request_terminate_timeout = 120\n", &Opts::default())
+            .finish(),
+    );
+    for (name, layers, php) in [
+        ("base1", old, "8.4.12"),
+        ("base2", patched, "8.4.14"),
+        ("base3", fpm_changed, "8.4.14"),
+        ("app", app, "8.4.12"),
+    ] {
+        let path = layout_with(&src.path().join(name), rebase_cfg(php), layers);
+        let mut c = kiln(home.path());
+        c.args([
+            "convert",
+            "--boot-layers",
+            "none",
+            "--platform",
+            "linux/arm64",
+            "--tag",
+            &format!("{name}:1"),
+        ]);
+        if name == "app" {
+            c.args(["--base", "base1:1"]);
+        }
+        c.arg(&path).assert().success();
+    }
+    kiln(home.path())
+        .args(["inspect", "app:1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("base:       base1:1"));
+
+    let out = kiln(home.path())
+        .args(["rebase", "base1:1", "base2:1", "app:1", "--tag", "app:2", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let img = &v["images"][0];
+    assert_eq!(img["baseLayers"], 2);
+    assert_eq!(img["reresolved"], 2, "both app layers have implicit parents");
+    assert_eq!(img["app"][0]["changed"], true, "var/www inherits the patched /var");
+    assert_eq!(img["app"][1]["changed"], false, "the copy-up layer is reused as is");
+    kiln(home.path()).args(["inspect", "app:2"]).assert().success().stdout(
+        predicate::str::contains("base:       base2:1").and(predicate::str::contains("env:        PHP_VERSION=8.4.14")),
+    );
+
+    kiln(home.path())
+        .args(["rebase", "base1:1", "base3:1", "app:1", "--tag", "app:3"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(
+            predicate::str::contains("kiln: rebase refused:")
+                .and(predicate::str::contains("  - shadow: 1 path the app shadows differs"))
+                .and(predicate::str::contains(format!("/{FPM}: content differs"))),
+        );
+    kiln(home.path()).args(["inspect", "app:3"]).assert().failure();
+}
+
+#[test]
+fn rebase_text_output_and_a_missing_record() {
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let fpm = b"x\n";
+    let base = rebase_base(b"nginx 1", 0o755, fpm);
+    let mut app = base.clone();
+    app.push(TarBuilder::new().file("srv/app", b"a", &Opts::default()).finish());
+    for (name, layers) in [("base", base.clone()), ("app", app.clone())] {
+        let path = layout_with(&src.path().join(name), rebase_cfg("8.4.1"), layers);
+        kiln(home.path())
+            .args([
+                "convert",
+                "--boot-layers",
+                "none",
+                "--platform",
+                "linux/arm64",
+                "--tag",
+                &format!("{name}:1"),
+            ])
+            .arg(&path)
+            .assert()
+            .success();
+    }
+    kiln(home.path())
+        .args(["rebase", "base:1", "base:1", "app:1", "--tag", "x:1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bottom: the image records no base"));
+    // Usage errors are clap's 2; refusals and other errors are 1 (spec §16.6).
+    kiln(home.path()).args(["rebase", "base:1", "base:1"]).assert().code(2);
+    let path = layout_with(&src.path().join("app2"), rebase_cfg("8.4.1"), app);
+    kiln(home.path())
+        .args([
+            "convert",
+            "--boot-layers",
+            "none",
+            "--platform",
+            "linux/arm64",
+            "--tag",
+            "app:2",
+            "--base",
+            "base:1",
+        ])
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bottom 2 from base base:1"));
+    kiln(home.path())
+        .args(["rebase", "base:1", "base:1", "app:2", "--tag", "x:1"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("2 base layers, 1 app layer (0 changed, 1 re-resolved)")
+                .and(predicate::str::contains("  reused   sha256:"))
+                .and(predicate::str::contains("x:1 → sha256:")),
+        );
 }
 
 /// A small vmkit bundle: `bundle.json` and three files, one with zero chunks.

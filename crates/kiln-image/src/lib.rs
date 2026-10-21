@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod artifacts;
+mod boundary;
 mod convert;
 mod ctx;
 mod decompress;
@@ -11,14 +12,18 @@ mod import;
 mod init;
 mod load;
 mod pipeline;
+pub mod rebase;
 mod registry;
 pub mod scratch;
 pub mod types;
 
-pub use convert::{Boot, BootLayers, ConvertOptions, Converted, LayerReport, LayerSource, StoredLayers, convert_image};
+pub use convert::{
+    BaseImage, Boot, BootLayers, ConvertOptions, Converted, LayerReport, LayerSource, StoredLayers, convert_image,
+};
 pub use error::{ImageError, Result};
 pub use import::{ImportReport, import_image, import_untagged};
 pub use init::init_layer;
 pub use load::{KilnManifest, Loaded, load, load_manifest, resolve_name};
 pub use pipeline::{LocalRequest, Output, convert_local, convert_resolved};
+pub use rebase::{RebaseRequest, Rebased, rebase};
 pub use registry::{RegistryRequest, TransferReport, convert_registry, pull_image, push_image};

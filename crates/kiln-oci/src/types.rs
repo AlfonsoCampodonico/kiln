@@ -105,6 +105,8 @@ pub struct ContainerConfig {
     pub working_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
