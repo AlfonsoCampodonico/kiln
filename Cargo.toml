@@ -2,6 +2,11 @@
 resolver = "3"
 members = ["crates/*"]
 
+# The VMMs run on Linux only; elsewhere `kiln run` explains how to use a Lima VM. Pinned to
+# vmkit main where snapshot, restore and lazy restore merged (vmkit PR #11).
+[workspace.dependencies]
+vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "d2fb6215b15e8611da0eb1af6543d2c892816932" }
+
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
