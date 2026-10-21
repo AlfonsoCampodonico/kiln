@@ -1,5 +1,7 @@
 //! The kiln image format (spec §5.1).
 
+use std::collections::BTreeMap;
+
 use kiln_oci::ContainerConfig;
 use kiln_store::Digest;
 use serde::{Deserialize, Serialize};
@@ -32,6 +34,24 @@ pub struct KilnConfig {
     pub init: Option<InitRef>,
     pub source: SourceRef,
     pub erofs_format_version: u32,
+    /// The source config's labels.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// The base/app boundary, set by `convert --base` (spec §16.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<BaseRecord>,
+}
+
+/// The image's bottom `layers` kiln layers are `manifest_digest`'s, built from its
+/// first `source_layers` OCI layers (spec §16.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaseRecord {
+    /// The name the base was given as (informational).
+    pub name: String,
+    pub manifest_digest: Digest,
+    pub layers: usize,
+    pub source_layers: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,10 +159,16 @@ mod tests {
                 reference: None,
             },
             erofs_format_version: 1,
+            labels: BTreeMap::new(),
+            base: None,
         };
         let s = String::from_utf8(kiln_oci::canonical_json(&c)).unwrap();
         assert!(
-            !s.contains("kernel") && !s.contains("init") && !s.contains("reference"),
+            !s.contains("kernel")
+                && !s.contains("init")
+                && !s.contains("reference")
+                && !s.contains("labels")
+                && !s.contains("base"),
             "{s}"
         );
         assert!(s.contains("\"erofsFormatVersion\":1"));
