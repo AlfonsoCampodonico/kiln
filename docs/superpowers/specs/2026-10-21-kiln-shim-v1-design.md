@@ -101,7 +101,7 @@ The shim composes kiln-run's public functions rather than calling `Run::start`. 
   - `Create` of a container task while another container task of the same pod is created or running is refused (`FailedPrecondition`, "kiln runs one container per pod at a time"). An init container that has exited (stopped, or deleted) no longer counts.
   - So init containers run in sequence, each in its own VM: the "VM rebooted between images" of D2.
   - The app container follows them.
-  - Sidecars, native sidecars and multi-container pods are refused at the second `Create`. That fails the pod visibly, rather than silently running containers that can't share `localhost`.
+  - Sidecars, native sidecars and multi-container pods are refused at the second task `Create`, which CRI issues when that container *starts* (`StartContainer`). That fails the pod visibly, rather than silently running containers that can't share `localhost`.
 - **The containerd sandbox API** (`sandboxer = "shim"`) is not used in v1. It would let the pod be the VM. It needs the multi-rootfs guest work deferred in D2, and the Rust crate does not serve that service.
 
 ---
@@ -168,7 +168,7 @@ Before the first container VM of a pod netns starts, the shim runs this from a t
    - **Why stateless:** guest traffic is redirected before the pod netns's IP stack or netfilter sees it, so nftables in the pod netns can't filter it.
    - **Why rule 3 matches only new connections:** the guest must still be able to *answer* kubelet, whose probes come from a node address. Dropping only those packet types blocks new connections to the node and lets replies through.
    - **What D4 delegates elsewhere:** private and cluster ranges are not denied. Routing policy belongs to the CNI and NetworkPolicy.
-5. **Recording the result.** The attachment is written to `<shim state>/net/<netns inode>.json`. A second container in the same netns, such as the app after its init containers, reuses it without touching the netns again.
+5. **Remembering the result.** The shim keeps the attachment in memory, keyed by the netns's device and inode. One shim serves one pod, so the record lives exactly as long as the pod's shim. A second container in the same netns, such as the app after its init containers, reuses it without touching the netns again. A netns that already has `kiln0` is only read.
 
 When the pod netns is deleted, the tap and the filters go with it. The shim removes nothing itself.
 
@@ -259,7 +259,7 @@ The service-account token is a projected volume. It is not inside the guest in v
 
 ### 7.4 The worker and its control channel
 
-The worker is the shim binary re-executed as `containerd-shim-kiln-v1 vm` (§8). The shim talks to it over a Unix socketpair on its fd 3, in JSON lines, one object per line, each capped at 64 KiB.
+The worker is the shim binary re-executed as `containerd-shim-kiln-v1 vm` (§8). The shim talks to it over a Unix socketpair whose worker end is inherited at the fd named by `KILN_SHIM_FD`. The protocol is JSON lines, one object per line. The first line is the worker's plan (at most 1 MiB); each message after it is capped at 64 KiB. Children are spawned one at a time, so the inheritable end reaches no other child.
 
 | Direction | Message | Meaning |
 |---|---|---|
@@ -321,13 +321,15 @@ containerd starts shims as root. kiln's T6 says no kiln component runs as root, 
 
 | Path | Owner, mode | What |
 |---|---|---|
-| `/run/kiln-shim/<ns>/<task id>/` | root, 0700 | The shim's per-task state |
-| `/run/kiln-shim/net/<netns inode>.json` | root, 0600 | The pod attachment (§6.1) |
-| `/run/kiln-shim/vm/<ns>-<task id>/` | kiln, 0700 | The worker's directory: `layers/<n>.erofs` mount points, the init layer |
-| `/run/kiln-shim/user/` | kiln, 0700 | The worker's `XDG_RUNTIME_DIR`: kiln-run's run directories (`kiln/<run id>/`) |
-| `store` from the config (e.g. `/var/lib/kiln`) | kiln | `KILN_HOME`: scratch disks (`kiln run`'s scratch directories) |
+| `/run/kiln-shim/`, `/run/kiln-shim/vm/` | root, 0711 | Traversable, not listable, by the kiln user |
+| `/run/kiln-shim/vm/<ns>-<task id>/` | kiln, 0700 | The worker's directory: `layers/<n>.erofs` mount points, `init.erofs`, and `run/` (vmkit's run directory: the VMM's sockets, logs and console FIFO) |
+| `<store>/shim-scratch/<ns>-<task id>/scratch.img` | kiln | The VM's scratch disk, on the store's filesystem rather than the `/run` tmpfs |
+
+Both of a task's directories are removed by the shim when its worker has exited. The worker's layer mounts went with its mount namespace.
 
 The kiln user gets no systemd user session (no lingering). `vmkit::cgroups_available()` is false, so the VMM stays in the pod's cgroup where the worker put it.
+
+containerd's Rust shim crate reaps every child on `SIGCHLD` unless told not to. The shim runs it with `no_reaper` and `no_sub_reaper`, and waits for its pause and worker processes itself.
 
 ---
 
@@ -477,7 +479,7 @@ The vmkit `TapAttach` mode has its own contract test in vmkit. Its guest boots w
 | hostPath, CSI, NFS | No shared filesystems in kiln | Refused (spec §4.5) |
 | `Stats`, OOM → `OOMKilled` | Needs guest resource signals | Spec §4.2 |
 | In-place resize (`Update`) | Needs hotplug and balloon | Spec §4.3 |
-| More than one container VM at once (sidecars) | D2 | Refused at the second `Create` |
+| More than one container VM at once (sidecars) | D2 | Refused when the second container starts |
 | containerd sandbox API | Needs the multi-rootfs guest (D2) | Later |
 | IPv6 inside the guest | kiln-proto `Network` is IPv4. The tap's ingress drops IPv6. | After kiln's IPv6 work lands |
 | Squashing over the device budget | Not needed for typical images on Cloud Hypervisor or Firecracker aarch64 | Spec §3.1 |

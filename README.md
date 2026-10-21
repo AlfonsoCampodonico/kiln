@@ -19,7 +19,8 @@ kiln is at milestone M3b. There are no releases yet; build from source.
 | Networking (`--net`, `--egress`, `-p`) and persistent disks (`--persist`) | Works |
 | Pinned kernel | vmkit's `base` 6.18.54 for arm64 and amd64, added by `kiln convert` |
 | Pinned kiln-init | Not yet: no kiln-init release exists, so `kiln run` needs `--init PATH --allow-custom-init` |
-| `kiln build`, services in kiln-init, a containerd shim | Designed in the [spec](docs/superpowers/specs/2026-09-30-kiln-design.md), not implemented |
+| A containerd shim (`containerd-shim-kiln-v1`, RuntimeClass `kiln`) | v1: one container VM per pod at a time on the pod IP, logs, exit codes and stop; no exec or volumes yet ([kubernetes.md](docs/kubernetes.md)) |
+| `kiln build`, services in kiln-init | Designed in the [spec](docs/superpowers/specs/2026-09-30-kiln-design.md), not implemented |
 
 ## Quick start
 
