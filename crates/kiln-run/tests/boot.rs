@@ -179,7 +179,8 @@ fn missing_and_non_executable_entrypoints(backend: Backend) {
         assert_eq!(o.exit_code(), code, "{argv:?}: {f:?}");
         assert!(!o.running());
         assert!(
-            c.console().contains(&format!("kiln-init: process: exec {}", argv[0])),
+            c.init_console()
+                .contains(&format!("kiln-init: process: exec {}", argv[0])),
             "{}",
             c.tail()
         );
@@ -209,7 +210,7 @@ fn init_failures_are_sanitised_on_the_host(backend: Backend) {
     assert_eq!(o.init_failed().map(|f| f.stage), Some(3), "{o:?}");
     assert_eq!(o.exit_code(), EXIT_INFRA);
     assert!(
-        c.console().contains("kiln-init: storage: mount layer /dev/vdd"),
+        c.init_console().contains("kiln-init: storage: mount layer /dev/vdd"),
         "{}",
         c.tail()
     );
@@ -267,7 +268,7 @@ fn user_groups_env_and_workdir(backend: Backend) {
     assert!(!o.running());
     assert_eq!(o.exit_code(), EXIT_INFRA, "{o:?}");
     assert!(
-        c.console()
+        c.init_console()
             .contains("kiln-init: process: unable to find user nobody: no matching entries in passwd file"),
         "{}",
         c.tail()
@@ -474,7 +475,7 @@ fn host_protocol_violations_end_the_guest(backend: Backend) {
         assert_eq!(f.stage, 2);
         assert!(f.message.contains(needle), "{f:?}");
         assert!(
-            c.console().contains("kiln-init: control: protocol violation"),
+            c.init_console().contains("kiln-init: control: protocol violation"),
             "{}",
             c.tail()
         );
@@ -676,6 +677,25 @@ boot_tests!(
     a_guest_not_reading_control_is_killed,
     the_boot_timeout_kills_a_stuck_guest,
 );
+
+/// The kernel prints on the same serial console as kiln-init, so its records can land inside
+/// one of init's lines (seen on CI: the `reboot:` record in the middle of a stage-3 failure).
+#[test]
+fn kernel_records_are_taken_out_of_inits_console_lines() {
+    let console = "[    0.101000] Run /init as init process\n\
+                   kiln-init: storage: mount layer /dev[    0.113590] reboot: Restarting system\n\
+                   /vdd: No such file or directory (os error 2)\r\n\
+                   kiln-init: control: protocol vi[    1.2] x\r\nolation\n\
+                   [12345.678901] reboot: Restarting system";
+    assert_eq!(
+        support::without_kernel_records(console),
+        "kiln-init: storage: mount layer /dev/vdd: No such file or directory (os error 2)\r\n\
+         kiln-init: control: protocol violation\n"
+    );
+    // Brackets that are not a kernel timestamp stay.
+    let text = "kiln-init: process: exec /bin/[2J31mevil: [x] [1] [1.] [.5] [ 1.5]x\n";
+    assert_eq!(support::without_kernel_records(text), text);
+}
 
 /// Boot-to-`Running` and whole-run times, sequentially (run with `--ignored --nocapture`).
 #[test]

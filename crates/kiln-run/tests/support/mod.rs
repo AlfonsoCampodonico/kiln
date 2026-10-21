@@ -353,10 +353,49 @@ impl Case {
         std::fs::read_to_string(self.dir.path().join("console.log")).unwrap_or_default()
     }
 
+    /// The console without the kernel's records, for checks of kiln-init's own lines.
+    pub fn init_console(&self) -> String {
+        without_kernel_records(&self.console())
+    }
+
     /// The end of the console, for failure messages.
     pub fn tail(&self) -> String {
         let console = self.console();
         let lines: Vec<&str> = console.lines().collect();
         lines[lines.len().saturating_sub(40)..].join("\n")
     }
+}
+
+/// `console` without the kernel's printk records (`[    0.113590] text` up to and including
+/// the end of its line), wherever they start: the kernel and kiln-init share the serial
+/// console, so a record can land in the middle of one of init's lines.
+pub fn without_kernel_records(console: &str) -> String {
+    let mut out = String::with_capacity(console.len());
+    let mut rest = console;
+    while let Some(at) = rest.find('[') {
+        out.push_str(&rest[..at]);
+        let candidate = &rest[at..];
+        match kernel_record_len(candidate) {
+            Some(len) => rest = &candidate[len..],
+            None => {
+                out.push('[');
+                rest = &candidate[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The length of the kernel record at the start of `s` (through its `\n`), if one is there:
+/// `[`, spaces, digits, `.`, digits, `] `.
+fn kernel_record_len(s: &str) -> Option<usize> {
+    let close = s.find(']')?;
+    let stamp = s[1..close].trim_start_matches(' ');
+    let (secs, frac) = stamp.split_once('.')?;
+    let digits = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
+    if !digits(secs) || !digits(frac) || s.as_bytes().get(close + 1) != Some(&b' ') {
+        return None;
+    }
+    Some(s.find('\n').map_or(s.len(), |nl| nl + 1))
 }
