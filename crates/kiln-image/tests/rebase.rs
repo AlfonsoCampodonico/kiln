@@ -11,7 +11,7 @@ use kiln_image::{
     BaseImage, ConvertOptions, ImageError, Output, RebaseRequest, convert_local, load, rebase, resolve_name,
 };
 use kiln_oci::testlayout::{LayoutBuilder, TestLayer};
-use kiln_oci::{ContainerConfig, Platform};
+use kiln_oci::{ContainerConfig, ImageConfig, ImageManifest, Platform, canonical_json};
 use kiln_store::{Digest, Store};
 
 const FPM: &str = "usr/local/etc/php-fpm.d/laravel-cloud-fpm.conf";
@@ -190,6 +190,7 @@ impl Fixture {
             new,
             image,
             tag: Some(tag),
+            max_layers: None,
         };
         rebase(&self.store, &req, &ConvertOptions::default())
     }
@@ -309,15 +310,23 @@ fn convert_with_base_refuses_images_not_built_on_it() {
     assert!(matches!(e, ImageError::NotOnBase(..)), "{e}");
     let e = f.app("app:2", "base:1", &Base::old(), &[]).unwrap_err();
     assert!(e.to_string().contains("no layers above the base"), "{e}");
+}
+
+/// A base that fills `--max-layers` leaves the app one layer instead of refusing.
+#[test]
+fn a_base_that_fills_max_layers_leaves_one_app_layer() {
+    let f = Fixture::new();
+    f.base("base:1", &Base::old());
     let mut tars = Base::old().layers();
-    tars.push(app_code());
-    let path = write_layout(&f.root.join("app3"), &[arm()], &tars, Base::old().config());
+    tars.extend([app_code(), app_bin()]);
+    let path = write_layout(&f.root.join("app"), &[arm()], &tars, Base::old().config());
     let opts = ConvertOptions {
         max_layers: 2,
         ..f.on_base("base:1")
     };
-    let e = convert_local(&f.store, &path, &req(&[arm()], "app:3"), &opts).unwrap_err();
-    assert!(e.to_string().contains("--max-layers must be more than 2"), "{e}");
+    let out = convert_local(&f.store, &path, &req(&[arm()], "app:1"), &opts).unwrap();
+    assert_eq!(out.images[0].layers.len(), 3);
+    assert_eq!(out.images[0].squashed, 2);
 }
 
 #[test]
@@ -575,4 +584,304 @@ fn boot_layers_are_not_base_layers() {
         f.layers("base:2")
     );
     assert!(m.config.kernel.is_some(), "the image's own kernel stays");
+}
+
+/// Rewrites a tagged image's kiln config, as an older kiln or a hostile store might
+/// have written it.
+fn rewrite_config(f: &Fixture, name: &str, edit: impl FnOnce(&mut kiln_image::types::KilnConfig)) {
+    let km = f.manifest(name);
+    let mut config = km.config.clone();
+    edit(&mut config);
+    let bytes = canonical_json(&config);
+    let mut manifest = km.manifest.clone();
+    manifest.config.digest = f.store.put_bytes(&bytes).unwrap();
+    manifest.config.size = bytes.len() as u64;
+    let d = f.store.put_bytes(&canonical_json(&manifest)).unwrap();
+    f.store.set_ref(name, &d).unwrap();
+}
+
+fn source_of(f: &Fixture, name: &str) -> (ImageManifest, ImageConfig) {
+    let d = f.manifest(name).config.source.manifest_digest;
+    let m: ImageManifest = serde_json::from_slice(&f.store.read_metadata(&d).unwrap()).unwrap();
+    let c: ImageConfig = serde_json::from_slice(&f.store.read_metadata(&m.config.digest).unwrap()).unwrap();
+    (m, c)
+}
+
+/// Stores a source manifest and config; returns the manifest's digest.
+fn put_source(f: &Fixture, mut m: ImageManifest, c: &ImageConfig) -> Digest {
+    let bytes = canonical_json(c);
+    m.config.digest = f.store.put_bytes(&bytes).unwrap();
+    m.config.size = bytes.len() as u64;
+    f.store.put_bytes(&canonical_json(&m)).unwrap()
+}
+
+/// A base converted before kiln recorded labels: its runtime labels come from its
+/// source config, and when that is gone too the rebase is refused, not waved through.
+#[test]
+fn labels_of_an_older_base_come_from_its_source_or_refuse() {
+    let f = Fixture::new();
+    f.base("base:1", &Base::old());
+    rewrite_config(&f, "base:1", |c| c.labels.clear());
+    f.base(
+        "base:2",
+        &Base {
+            php: "8.5.0",
+            ..Base::patched()
+        },
+    );
+    f.base("base:3", &Base::patched());
+    f.app("app:1", "base:1", &Base::old(), &[app_code()]).unwrap();
+    let reason = only(&refusals(f.rebase("base:1", "base:2", "app:1", "x")), "runtime");
+    assert!(reason.contains("from 8.4.12 to 8.5.0"), "{reason}");
+    f.rebase("base:1", "base:3", "app:1", "app:3").unwrap();
+    assert_eq!(
+        f.manifest("app:3").config.labels["php.version"],
+        "8.4.14",
+        "labels follow the new base"
+    );
+
+    let src = f.manifest("base:1").config.source.manifest_digest;
+    std::fs::remove_file(f.store.blob_path(&src)).unwrap();
+    let reason = only(&refusals(f.rebase("base:1", "base:3", "app:1", "x")), "runtime");
+    assert!(reason.contains("old base's labels are unknown"), "{reason}");
+}
+
+/// The recorded sources must rebuild the image's own app layers on the old base.
+#[test]
+fn a_source_that_does_not_rebuild_the_image_is_refused() {
+    let f = Fixture::new();
+    f.base("base:1", &Base::old());
+    f.base("base:2", &Base::patched());
+    f.app("app:1", "base:1", &Base::old(), &[app_code()]).unwrap();
+    let (mut m, mut c) = source_of(&f, "app:1");
+    let other = app_bin();
+    m.layers[2] = kiln_oci::Descriptor::new(
+        &m.layers[2].media_type,
+        f.store.put_bytes(&other).unwrap(),
+        other.len() as u64,
+    );
+    c.rootfs.diff_ids[2] = Digest::of(&other);
+    let fake = put_source(&f, m.clone(), &c);
+    rewrite_config(&f, "app:1", |k| k.source.manifest_digest = fake);
+    let reason = only(&refusals(f.rebase("base:1", "base:2", "app:1", "x")), "source");
+    assert!(reason.contains("do not rebuild its app layers"), "{reason}");
+
+    // A descriptor whose size understates its blob fails as any input would (§6.1),
+    // so the expansion-ratio limit cannot be dodged.
+    let bigger = TarBuilder::new()
+        .file("var/www/big", &vec![0u8; 1 << 20], &Opts::default())
+        .finish();
+    m.layers[2] = kiln_oci::Descriptor::new(&m.layers[2].media_type, f.store.put_bytes(&bigger).unwrap(), 1024);
+    c.rootfs.diff_ids[2] = Digest::of(&bigger);
+    let lying = put_source(&f, m, &c);
+    rewrite_config(&f, "app:1", |k| k.source.manifest_digest = lying);
+    let e = f.rebase("base:1", "base:2", "app:1", "x").unwrap_err();
+    assert!(e.to_string().contains("size"), "{e}");
+}
+
+/// gc keeps what rebase needs: the source manifest and config, and the tars of
+/// layers that inherit from the base.
+#[test]
+fn rebase_still_works_after_gc() {
+    let f = Fixture::new();
+    f.base("base:1", &Base::old());
+    f.base("base:2", &Base::patched());
+    f.app("app:1", "base:1", &Base::old(), &[app_code(), app_bin()])
+        .unwrap();
+    let removed = f.store.gc().unwrap().blobs_removed;
+    assert!(removed > 0, "the bases' and app_bin's tars go");
+    assert!(!f.store.has_blob(&Digest::of(&app_bin())));
+    let out = f.rebase("base:1", "base:2", "app:1", "app:2").unwrap();
+    assert!(out.images[0].app[0].changed() && !out.images[0].app[1].changed());
+}
+
+/// Without its sources (a pulled image), an image whose app layers inherit nothing
+/// is rebased with those layers as they are; one that inherits cannot be.
+#[test]
+fn without_sources_only_non_inheriting_layers_are_kept() {
+    let f = Fixture::new();
+    f.base("base:1", &Base::old());
+    f.base("base:2", &Base::patched());
+    f.app("app:1", "base:1", &Base::old(), &[app_bin()]).unwrap();
+    f.app("app:2", "base:1", &Base::old(), &[app_code()]).unwrap();
+    for name in ["app:1", "app:2"] {
+        let src = f.manifest(name).config.source.manifest_digest;
+        std::fs::remove_file(f.store.blob_path(&src)).unwrap();
+    }
+    let out = f.rebase("base:1", "base:2", "app:1", "x:1").unwrap();
+    assert!(!out.images[0].app[0].changed());
+    let e = f.rebase("base:1", "base:2", "app:2", "x:2").unwrap_err();
+    assert!(matches!(e, ImageError::SourceMissing(_)), "{e}");
+}
+
+fn with_layer(b: &Base, extra: Vec<u8>) -> Vec<Vec<u8>> {
+    let mut tars = b.layers();
+    tars.push(extra);
+    tars
+}
+
+/// An implicit parent the new base turns into a symlink would mask it.
+#[test]
+fn refuses_when_an_implicit_parent_becomes_a_non_directory() {
+    let f = Fixture::new();
+    let old = with_layer(
+        &Base::old(),
+        TarBuilder::new().dir("var/run", &Opts::default()).finish(),
+    );
+    let new = with_layer(
+        &Base::patched(),
+        TarBuilder::new().symlink("var/run", "/run", &Opts::default()).finish(),
+    );
+    f.convert("base:1", &old, Base::old().config(), &ConvertOptions::default());
+    f.convert("base:2", &new, Base::patched().config(), &ConvertOptions::default());
+    let mut tars = old.clone();
+    tars.push(
+        TarBuilder::new()
+            .file("var/run/app.pid", b"1", &Opts::default())
+            .finish(),
+    );
+    f.convert_for("app:1", &[arm()], &tars, Base::old().config(), &f.on_base("base:1"))
+        .unwrap();
+    let reason = only(&refusals(f.rebase("base:1", "base:2", "app:1", "x")), "shadow");
+    assert!(
+        reason.contains("/var/run: the new base has a non-directory"),
+        "{reason}"
+    );
+}
+
+/// An opaque directory without its own header still hides the base's subtree.
+#[test]
+fn an_implicit_opaque_dir_still_compares_what_it_hides() {
+    let f = Fixture::new();
+    let conf = |extra: bool| {
+        let mut t = TarBuilder::new();
+        t.file("etc/conf.d/a", b"a", &Opts::default());
+        if extra {
+            t.file("etc/conf.d/b", b"b", &Opts::default());
+        }
+        t.finish()
+    };
+    let old = with_layer(&Base::old(), conf(false));
+    let new = with_layer(&Base::patched(), conf(true));
+    f.convert("base:1", &old, Base::old().config(), &ConvertOptions::default());
+    f.convert("base:2", &new, Base::patched().config(), &ConvertOptions::default());
+    let mut tars = old.clone();
+    tars.push(
+        TarBuilder::new()
+            .opaque("etc/conf.d")
+            .file("etc/conf.d/mine", b"m", &Opts::default())
+            .finish(),
+    );
+    f.convert_for("app:1", &[arm()], &tars, Base::old().config(), &f.on_base("base:1"))
+        .unwrap();
+    let reason = only(&refusals(f.rebase("base:1", "base:2", "app:1", "x")), "shadow");
+    assert!(reason.contains("/etc/conf.d/b: the new base adds it"), "{reason}");
+}
+
+fn squash_entries(f: &Fixture) -> usize {
+    std::fs::read_dir(f.store.root().join("cache/squash")).unwrap().count()
+}
+
+/// A one-layer (squashed) base is matched by its hint alone: an image not on it
+/// costs no squash of every prefix.
+#[test]
+fn a_one_layer_base_tries_only_plausible_squashes() {
+    let f = Fixture::new();
+    let mut base = Base::old().layers();
+    base.push(TarBuilder::new().file("usr/share/doc", b"d", &Opts::default()).finish());
+    let one = ConvertOptions {
+        max_layers: 1,
+        ..Default::default()
+    };
+    f.convert("base:1", &base, Base::old().config(), &one);
+    assert_eq!(f.layers("base:1").len(), 1);
+    let before = squash_entries(&f);
+    let unrelated: Vec<Vec<u8>> = (0..12)
+        .map(|i| {
+            TarBuilder::new()
+                .file(&format!("l{i}"), b"x", &Opts::default())
+                .finish()
+        })
+        .collect();
+    let e = f
+        .convert_for(
+            "app:1",
+            &[arm()],
+            &unrelated,
+            Base::old().config(),
+            &f.on_base("base:1"),
+        )
+        .unwrap_err();
+    assert!(matches!(e, ImageError::NotOnBase(..)), "{e}");
+    assert_eq!(squash_entries(&f), before, "no squash was kept");
+    let mut tars = base.clone();
+    tars.push(app_code());
+    f.convert_for("app:2", &[arm()], &tars, Base::old().config(), &f.on_base("base:1"))
+        .unwrap();
+    assert_eq!(f.manifest("app:2").config.base.unwrap().source_layers, 3);
+}
+
+/// A base that is itself built on a base, with its app half squashed, is matched
+/// layered as it was: bottom squash below, upper squash above (spec §16.2).
+#[test]
+fn a_chained_base_is_matched() {
+    let f = Fixture::new();
+    f.base("base:0", &Base::old());
+    let mid: Vec<Vec<u8>> = (0..3)
+        .map(|i| {
+            TarBuilder::new()
+                .file(&format!("opt/mid/{i}"), b"m", &Opts::default())
+                .finish()
+        })
+        .collect();
+    let mut mid_tars = Base::old().layers();
+    mid_tars.extend(mid.clone());
+    let three = ConvertOptions {
+        max_layers: 3,
+        ..f.on_base("base:0")
+    };
+    f.convert_for("mid:1", &[arm()], &mid_tars, Base::old().config(), &three)
+        .unwrap();
+    assert_eq!(f.layers("mid:1").len(), 3, "base 2 + the mid app squashed into 1");
+    let mut tars = mid_tars.clone();
+    tars.push(app_code());
+    f.convert_for("app:1", &[arm()], &tars, Base::old().config(), &f.on_base("mid:1"))
+        .unwrap();
+    let r = f.manifest("app:1").config.base.unwrap();
+    assert_eq!((r.layers, r.source_layers), (3, 5));
+    assert_eq!(f.layers("app:1")[..3], f.layers("mid:1")[..]);
+}
+
+/// Rebase keeps the image's app layering and reports reuse by digest.
+#[test]
+fn rebase_keeps_the_image_app_layering() {
+    let f = Fixture::new();
+    f.base("base:1", &Base::old());
+    f.base("base:2", &Base::patched());
+    let extra = TarBuilder::new().file("srv/x", b"x", &Opts::default()).finish();
+    let mut tars = Base::old().layers();
+    tars.extend([app_code(), extra, app_bin()]);
+    let mut cfg = Base::old().config();
+    cfg.labels.as_mut().unwrap().insert("app".into(), "demo".into());
+    let opts = ConvertOptions {
+        max_layers: 4,
+        ..f.on_base("base:1")
+    };
+    f.convert_for("app:1", &[arm()], &tars, cfg, &opts).unwrap();
+    let before = f.layers("app:1");
+    assert_eq!(before.len(), 4);
+    let out = f.rebase("base:1", "base:2", "app:1", "app:2").unwrap();
+    let app = &out.images[0].app;
+    assert_eq!(app.len(), 2, "two app layers in, two out");
+    assert!(app[0].changed(), "the squash holds var/www, which inherits /var");
+    assert!(!app[1].changed() && app[1].erofs == before[3]);
+    let req = RebaseRequest {
+        old: "base:1",
+        new: "base:2",
+        image: "app:1",
+        tag: Some("app:3"),
+        max_layers: Some(3),
+    };
+    let out = rebase(&f.store, &req, &ConvertOptions::default()).unwrap();
+    assert_eq!(out.images[0].app.len(), 1, "--max-layers squashes further");
 }

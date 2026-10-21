@@ -161,9 +161,11 @@ enum Cmd {
         /// Name for the result.
         #[arg(long)]
         tag: String,
-        /// Squash the bottom app layers when the new base leaves fewer slots.
-        #[arg(long, default_value_t = 10)]
-        max_layers: usize,
+        /// The most layers the result may have. By default the image keeps its own
+        /// app layering, squashed further only when the new base has more layers
+        /// than the old one.
+        #[arg(long)]
+        max_layers: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -661,11 +663,9 @@ fn run(cli: Cli) -> Result<()> {
                 new,
                 image,
                 tag: Some(tag),
-            };
-            let opts = ConvertOptions {
                 max_layers: *max_layers,
-                ..Default::default()
             };
+            let opts = ConvertOptions::default();
             let out = match rebase(&store, &req, &opts) {
                 Err(ImageError::RebaseRefused(refusals)) => {
                     // One sanitised line per gate, so image text cannot forge lines.
@@ -690,7 +690,7 @@ fn run(cli: Cli) -> Result<()> {
                         "squashed": r.squashed,
                         "app": r.app.iter().map(|l| json!({
                             "erofs": l.erofs.to_string(),
-                            "was": l.was.as_ref().map(ToString::to_string),
+                            "reused": l.reused,
                             "changed": l.changed(),
                         })).collect::<Vec<_>>(),
                     })).collect::<Vec<_>>(),
@@ -717,8 +717,9 @@ fn run(cli: Cli) -> Result<()> {
             println!("{} → {}", clean_line(tag), out.digest);
         }
         Cmd::Gc => {
-            // Source OCI blobs are not referenced by kiln images, so GC frees them;
-            // a later convert re-verifies them from the source. Pinned kernels and
+            // Source layer tars are not referenced by kiln images, so GC frees them
+            // (except those `kiln rebase` re-finalises); a later convert re-verifies
+            // them from the source. Pinned kernels and
             // kiln-init stay, so cached runs keep working offline (spec §5.2).
             let r = open_store(&cli)?.gc_with_roots(kiln_image::artifacts::gc_roots)?;
             println!(

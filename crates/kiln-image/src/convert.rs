@@ -13,6 +13,7 @@ use kiln_oci::{Descriptor, ImageManifest, Platform, ResolvedImage, canonical_jso
 use kiln_store::{CacheKind, Digest, HashingReader, Store, TmpBlob};
 
 use crate::artifacts::{self, Pin, RegistryFetcher};
+use crate::boundary;
 use crate::ctx::{ctx_hash, parents_entry, parse_parents};
 use crate::decompress::{Budget, Tripped, layer_limit, open_bounded};
 use crate::error::{ImageError, Result};
@@ -387,7 +388,7 @@ pub(crate) enum SquashKind {
     Upper,
 }
 
-fn squash_key(layers: &[LayerReport], kind: SquashKind) -> String {
+pub(crate) fn squash_key(layers: &[LayerReport], kind: SquashKind) -> String {
     let mut joined: Vec<String> = layers.iter().map(|l| l.erofs.to_string()).collect();
     if kind == SquashKind::Upper {
         joined.insert(0, "upper".into());
@@ -403,8 +404,6 @@ fn squash_key(layers: &[LayerReport], kind: SquashKind) -> String {
 fn squash_bottom(store: &Store, layers: Vec<LayerReport>, k: usize, kind: SquashKind) -> Result<Vec<LayerReport>> {
     let (bottom, rest) = layers.split_at(k);
     let key = squash_key(bottom, kind);
-    let sources: Vec<Digest> = bottom.iter().flat_map(|l| l.sources.clone()).collect();
-    let warnings: Vec<String> = bottom.iter().flat_map(|l| l.warnings.iter().cloned()).collect();
     let (erofs, cached) = match store.cache_get_blob(CacheKind::Squash, &key)? {
         Some(d) => (d, true),
         None => {
@@ -422,18 +421,29 @@ fn squash_bottom(store: &Store, layers: Vec<LayerReport>, k: usize, kind: Squash
             (d, false)
         }
     };
-    let size = store.blob_size(&erofs)?;
-    let mut out = vec![LayerReport {
-        sources,
-        erofs,
-        size,
-        cached,
-        inherits: false,
-        warnings,
-        implicit: Vec::new(),
-    }];
+    let mut out = vec![squash_report(store, bottom, kind, erofs, cached)?];
     out.extend_from_slice(rest);
     Ok(out)
+}
+
+/// The report for `layers` merged into `erofs`. An upper squash still inherits
+/// whatever its layers inherited from below the merge; a bottom one has no lowers.
+pub(crate) fn squash_report(
+    store: &Store,
+    layers: &[LayerReport],
+    kind: SquashKind,
+    erofs: Digest,
+    cached: bool,
+) -> Result<LayerReport> {
+    Ok(LayerReport {
+        sources: layers.iter().flat_map(|l| l.sources.clone()).collect(),
+        size: store.blob_size(&erofs)?,
+        erofs,
+        cached,
+        inherits: kind == SquashKind::Upper && layers.iter().any(|l| l.inherits),
+        warnings: layers.iter().flat_map(|l| l.warnings.iter().cloned()).collect(),
+        implicit: Vec::new(),
+    })
 }
 
 /// Squashes `layers` down to `max` when there are more (spec §6.4); returns how
@@ -519,38 +529,6 @@ pub(crate) fn convert_layers(
     Ok(reports)
 }
 
-/// The base's layers inside `reports` (spec §16.2): the `k` such that `reports[..k]`,
-/// squashed as the base was, are exactly `base`'s layers. Returns `k` and those
-/// layers. Only erofs digests are compared; the base's source annotation is only a
-/// hint for how many layers its bottom squash merged.
-fn match_base(
-    store: &Store,
-    reports: &[LayerReport],
-    base: &[Descriptor],
-) -> Result<Option<(usize, Vec<LayerReport>)>> {
-    let (n, m) = (reports.len(), base.len());
-    let same = |a: &[LayerReport], b: &[Descriptor]| a.iter().zip(b).all(|(r, d)| r.erofs == d.digest);
-    if m == 0 || n < m {
-        return Ok(None);
-    }
-    if same(&reports[..m], base) {
-        return Ok(Some((m, reports[..m].to_vec())));
-    }
-    let hint = base[0].annotation(ANN_SOURCE_DIGESTS).map(|s| s.split(',').count());
-    let mut tried = std::collections::HashSet::new();
-    for j in hint.into_iter().chain(2..=n + 1 - m) {
-        let k = j + m - 1;
-        if j < 2 || k > n || !tried.insert(j) || !same(&reports[j..k], &base[1..]) {
-            continue;
-        }
-        let squashed = squash_bottom(store, reports[..k].to_vec(), j, SquashKind::Bottom)?;
-        if squashed[0].erofs == base[0].digest {
-            return Ok(Some((k, squashed)));
-        }
-    }
-    Ok(None)
-}
-
 /// The base's manifest for `platform`: same os and architecture, and the same
 /// variant when both name one (single-manifest kiln images record none).
 pub(crate) fn platform_entry<'a>(loaded: &'a Loaded, platform: &Platform) -> Option<&'a KilnManifest> {
@@ -593,14 +571,8 @@ pub fn convert_image(
         Some(b) => {
             let bm = platform_entry(&b.image, &platform)
                 .ok_or_else(|| ImageError::NotOnBase(b.name.clone(), format!("it has no {platform} image")))?;
-            let base_layers = app_layers(&bm.manifest);
-            let m = base_layers.len();
-            if opts.max_layers <= m {
-                return Err(ImageError::BadOption(format!(
-                    "the base has {m} layers, so --max-layers must be more than {m}"
-                )));
-            }
-            let Some((k, mut layers)) = match_base(store, &reports, &base_layers)? else {
+            let m = app_layers(&bm.manifest).len();
+            let Some((k, mut layers)) = boundary::match_base(store, &reports, bm)? else {
                 return Err(ImageError::NotOnBase(
                     b.name.clone(),
                     "the image's layers do not start with the base's".into(),
@@ -613,7 +585,7 @@ pub fn convert_image(
                 ));
             }
             let app = reports[k..].to_vec();
-            let (app, squashed) = squash_to(store, app, opts.max_layers - m, SquashKind::Upper)?;
+            let (app, squashed) = squash_to(store, app, app_budget(opts.max_layers, m), SquashKind::Upper)?;
             layers.extend(app);
             let record = BaseRecord {
                 name: b.name.clone(),
@@ -678,6 +650,13 @@ pub fn convert_image(
         base: config.base,
         boot,
     })
+}
+
+/// How many app layers may sit above a base of `base` layers: what `max_layers`
+/// leaves, but always at least one. A base cannot shrink, so an image on a base
+/// that fills `--max-layers` exceeds it by one (spec §6.4).
+pub(crate) fn app_budget(max_layers: usize, base: usize) -> usize {
+    max_layers.saturating_sub(base).max(1)
 }
 
 /// An image's app layers: its erofs layers, without the kernel and init (spec §5.1).

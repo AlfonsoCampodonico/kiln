@@ -78,12 +78,13 @@ fn convert_ls_inspect_gc_import() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(v["images"][0]["config"]["process"]["cmd"][0], "php");
-    // GC frees the source OCI blobs (layer, config, manifest) but keeps the kiln image.
+    // GC frees the source layer but keeps the kiln image, and the source manifest
+    // and config that `kiln rebase` reads (spec §5.2).
     kiln(home.path())
         .arg("gc")
         .assert()
         .success()
-        .stdout(predicate::str::contains("removed 3 blobs"));
+        .stdout(predicate::str::contains("removed 1 blobs"));
     kiln(home.path()).args(["inspect", "app:latest"]).assert().success();
     kiln(home.path())
         .arg("gc")

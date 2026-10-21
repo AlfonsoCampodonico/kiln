@@ -120,7 +120,23 @@ pub fn distro(old: Option<&str>, new: Option<&str>) -> Gate {
 }
 
 /// `runtime`: every `<lang>.version` label of the old base keeps its major.minor.
-pub fn runtime(old: &BTreeMap<String, String>, new: &BTreeMap<String, String>) -> Gate {
+/// `None` is a base whose labels are unknown (converted before kiln recorded
+/// them, with its source config gone): it is refused, since an absent label set
+/// cannot be told from an empty one.
+pub fn runtime(old: Option<&BTreeMap<String, String>>, new: Option<&BTreeMap<String, String>>) -> Gate {
+    let (old, new) = match (old, new) {
+        (Some(o), Some(n)) => (o, n),
+        (o, _) => {
+            let which = if o.is_none() { "old" } else { "new" };
+            return refuse(
+                "runtime",
+                format!(
+                    "the {which} base's labels are unknown (converted before kiln recorded labels, and its source \
+                     config is gone); re-convert it"
+                ),
+            );
+        }
+    };
     for (k, v) in old.iter().filter(|(k, _)| k.ends_with(".version")) {
         match new.get(k) {
             None => return refuse("runtime", format!("the new base drops the label {k}")),
@@ -248,10 +264,13 @@ pub trait BaseView {
 
 /// A path an app layer contains. `hides` is set for whiteouts, opaque directories
 /// and non-directories, which hide the base's whole subtree at that path.
+/// `implicit` marks a directory the layer created only for its children: its
+/// attributes are re-derived from the new base, so only its type is compared.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Shadowed {
     pub path: Vec<u8>,
     pub hides: bool,
+    pub implicit: bool,
 }
 
 /// How many differing paths a `shadow` refusal names.
@@ -260,17 +279,34 @@ pub const SHADOW_REPORT_MAX: usize = 20;
 /// `shadow`: every base path the app shadows is identical in both bases. Returns
 /// the gate's verdict; reading a base can still fail.
 pub fn shadow(shadowed: &[Shadowed], old: &mut dyn BaseView, new: &mut dyn BaseView) -> Result<Gate> {
-    let mut paths = BTreeSet::new();
+    // Path → whether it is compared in full (false: only its type, for implicit dirs).
+    let mut paths: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
     for s in shadowed {
-        paths.insert(s.path.clone());
+        *paths.entry(s.path.clone()).or_default() |= !s.implicit;
         if s.hides {
-            paths.extend(old.subtree(&s.path)?);
-            paths.extend(new.subtree(&s.path)?);
+            for p in old.subtree(&s.path)?.into_iter().chain(new.subtree(&s.path)?) {
+                paths.insert(p, true);
+            }
         }
     }
     let mut diffs = Vec::new();
-    for p in &paths {
-        let reason = match (old.sig(p)?, new.sig(p)?) {
+    for (p, full) in &paths {
+        let (a, b) = (old.sig(p)?, new.sig(p)?);
+        if !full {
+            // An implicit directory masks whatever the new base has there; only a
+            // directory merges with it as before.
+            match (&a, &b) {
+                (_, Some(n)) if n.kind != kiln_erofs::ondisk::S_IFDIR && a.as_ref().map(|o| o.kind) != Some(n.kind) => {
+                    diffs.push(format!(
+                        "/{}: the new base has a non-directory where the app's layers create a directory",
+                        String::from_utf8_lossy(p)
+                    ));
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let reason = match (a, b) {
             (None, None) => continue,
             (Some(_), None) => "the new base removes it".to_string(),
             (None, Some(_)) => "the new base adds it".to_string(),
@@ -447,12 +483,27 @@ mod tests {
     #[test]
     fn runtime_keeps_major_minor() {
         let old = m(&[("php.version", "8.4.12"), ("node.version", "24.1.0"), ("other", "1")]);
-        assert!(runtime(&old, &m(&[("php.version", "8.4.14"), ("node.version", "24.1.5")])).is_ok());
-        let r = runtime(&old, &m(&[("php.version", "8.5.0"), ("node.version", "24.1.0")])).unwrap_err();
+        let ok = m(&[("php.version", "8.4.14"), ("node.version", "24.1.5")]);
+        assert!(runtime(Some(&old), Some(&ok)).is_ok());
+        let r = runtime(
+            Some(&old),
+            Some(&m(&[("php.version", "8.5.0"), ("node.version", "24.1.0")])),
+        )
+        .unwrap_err();
         assert!(r.reason.contains("php.version changes from 8.4.12 to 8.5.0"), "{r}");
-        let r = runtime(&old, &m(&[("php.version", "8.4.12")])).unwrap_err();
+        let r = runtime(Some(&old), Some(&m(&[("php.version", "8.4.12")]))).unwrap_err();
         assert!(r.reason.contains("drops the label node.version"), "{r}");
-        assert!(runtime(&BTreeMap::new(), &BTreeMap::new()).is_ok());
+        let empty = BTreeMap::new();
+        assert!(runtime(Some(&empty), Some(&empty)).is_ok());
+        // Unknown is not empty: a base converted before labels were recorded.
+        let r = runtime(None, Some(&ok)).unwrap_err();
+        assert!(r.reason.contains("old base's labels are unknown"), "{r}");
+        assert!(
+            runtime(Some(&old), None)
+                .unwrap_err()
+                .reason
+                .contains("new base's labels")
+        );
     }
 
     #[test]
@@ -570,7 +621,68 @@ mod tests {
         Shadowed {
             path: path.as_bytes().to_vec(),
             hides,
+            implicit: false,
         }
+    }
+
+    fn implicit(path: &str, hides: bool) -> Shadowed {
+        Shadowed {
+            implicit: true,
+            ..sh(path, hides)
+        }
+    }
+
+    fn symlink(target: &[u8]) -> PathSig {
+        PathSig {
+            kind: kiln_erofs::ondisk::S_IFLNK,
+            size: 0,
+            content: None,
+            target: Some(target.to_vec()),
+            ..file(b"", 0o777)
+        }
+    }
+
+    #[test]
+    fn shadow_compares_only_the_type_of_implicit_dirs() {
+        let mut old = view(&[("var", dir(0o755)), ("var/run", dir(0o755))]);
+        let mut new = view(&[("var", dir(0o750)), ("var/run", symlink(b"/run"))]);
+        // The mode change of an implicit dir is re-derived, not refused.
+        assert!(shadow(&[implicit("var", false)], &mut old, &mut new).unwrap().is_ok());
+        // A symlink the implicit dir would mask is.
+        let r = shadow(
+            &[implicit("var", false), implicit("var/run", false)],
+            &mut old,
+            &mut new,
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(r.reason.contains("/var/run: the new base has a non-directory"), "{r}");
+        // Absent before and a directory now merges as usual.
+        let mut fresh = view(&[("var", dir(0o755)), ("var/run", dir(0o755))]);
+        let mut none = view(&[("var", dir(0o755))]);
+        assert!(
+            shadow(&[implicit("var/run", false)], &mut none, &mut fresh)
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn shadow_expands_an_implicit_opaque_dir() {
+        let mut old = view(&[("etc/conf.d", dir(0o755)), ("etc/conf.d/a", file(b"a", 0o644))]);
+        let mut new = view(&[
+            ("etc/conf.d", dir(0o700)),
+            ("etc/conf.d/a", file(b"a", 0o644)),
+            ("etc/conf.d/b", file(b"b", 0o644)),
+        ]);
+        let r = shadow(&[implicit("etc/conf.d", true)], &mut old, &mut new)
+            .unwrap()
+            .unwrap_err();
+        assert!(r.reason.contains("/etc/conf.d/b: the new base adds it"), "{r}");
+        assert!(
+            !r.reason.contains("/etc/conf.d: mode"),
+            "its own attributes are re-derived: {r}"
+        );
     }
 
     #[test]
