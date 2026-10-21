@@ -426,6 +426,10 @@ The bounds of §5.4 apply to `lazy.json` too, since kiln wrote it from untrusted
 
 ## 8. Findings during implementation (rev 1, 2026-10-21)
 
+**Results.**
+- x86_64 (vmkit CI): all ten snapshot tests pass on both VMMs.
+- aarch64 (Lima, nested): all Firecracker tests pass. A lazy Firecracker restore fetched 3 MiB before the guest ran, out of 40 MiB of memory data. kiln's end-to-end test (registry, lazy pull, restore) fetched 38 of 42 chunks.
+
 **What the guest touches.** A restored busybox guest with 256 MiB of memory had 40 MiB of non-zero memory, in 1 MiB chunks.
 - Five ticks after resume it had fetched 37 MiB of those 40 MiB.
 - A Linux guest's kernel, page tables and slabs spread over nearly every chunk of the memory it uses.
@@ -438,6 +442,7 @@ The bounds of §5.4 apply to `lazy.json` too, since kiln wrote it from untrusted
 
 **Cloud Hypervisor 53 under aarch64 nested virtualization**
 - A `Copy` restore of 256 MiB took about four minutes in the Lima template. Snapshot and restore calls get a ten-minute timeout.
+- A restored guest does not run after `resume`: it printed nothing for a minute, also with plain `cloud-hypervisor` and `ch-remote`. CH restore tests are therefore judged on x86_64, where all of them pass (vmkit CI). On aarch64 the bundle checks pass, and every Firecracker test passes.
 - Restoring a VM snapshotted before its guest had activated its virtio devices (mid-boot) panics CH: `GuestMemory(InvalidGuestAddress)` in `pci_device.rs`. The tests snapshot a guest only after it runs. vmkit does not guard against this; it reports the VMM's early exit.
 
 **userfaultfd.** On the Lima template, `vm.unprivileged_userfaultfd` is 0 and `/dev/userfaultfd` is root-only. CH's `OnDemand` restore fails there with `EPERM`, as §3 predicted, so vmkit uses `Copy` unless the caller may open `/dev/userfaultfd` (for example through an ACL) or the sysctl is 1.
