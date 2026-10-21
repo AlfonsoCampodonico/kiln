@@ -13,8 +13,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use kiln_image::ImageError;
 use kiln_image::{
-    BootLayers, ConvertOptions, LocalRequest, Output, RegistryRequest, convert_local, convert_registry, import_image,
-    load, pull_image, push_image, resolve_name,
+    BaseImage, BootLayers, ConvertOptions, LocalRequest, Output, RebaseRequest, RegistryRequest, convert_local,
+    convert_registry, import_image, load, pull_image, push_image, rebase, resolve_name,
 };
 use kiln_oci::{OciError, Platform};
 use kiln_registry::{Client, DockerConfig, Reference, RegistryError};
@@ -104,6 +104,10 @@ enum Cmd {
         /// normalised reference for a registry image).
         #[arg(long)]
         tag: Option<String>,
+        /// A kiln image this one is built on (usually the converted FROM image).
+        /// Records the base/app boundary that `kiln rebase` needs.
+        #[arg(long, value_name = "NAME")]
+        base: Option<String>,
         #[command(flatten)]
         args: ConvertArgs,
         /// Print a JSON summary.
@@ -145,6 +149,24 @@ enum Cmd {
     },
     /// List tagged images.
     Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Swap the base layers under IMAGE from OLD to NEW (usually a patched build
+    /// of the same base) without rebuilding. Refuses, naming each failed gate,
+    /// when the swap is unsafe.
+    Rebase {
+        old: String,
+        new: String,
+        image: String,
+        /// Name for the result.
+        #[arg(long)]
+        tag: String,
+        /// The most layers the result may have. By default the image keeps its own
+        /// app layering, squashed further only when the new base has more layers
+        /// than the old one.
+        #[arg(long)]
+        max_layers: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -374,6 +396,7 @@ fn convert_summary(out: &Output, tag: &str) -> serde_json::Value {
                 "kernel": b.kernel.as_ref().map(|k| format!("{}@{}", k.name, k.version)),
                 "init": b.init.as_ref().map(|i| i.version),
             })),
+            "base": c.base,
             "layers": c.layers.iter().map(|l| json!({
                 "erofs": l.erofs.to_string(),
                 "size": l.size,
@@ -392,6 +415,7 @@ fn run(cli: Cli) -> Result<()> {
             source,
             source_ref,
             tag,
+            base,
             args,
             json,
         } => {
@@ -409,6 +433,15 @@ fn run(cli: Cli) -> Result<()> {
                 Source::Registry(r, _) => reference_tag(tag.as_deref(), r)?,
             };
             let store = open_store(&cli)?;
+            let mut opts = args.options();
+            if let Some(name) = base {
+                let image = load(&store, &resolve_name(&store, name)?)
+                    .with_context(|| format!("loading the base {}", clean_line(name)))?;
+                opts.base = Some(BaseImage {
+                    name: name.clone(),
+                    image,
+                });
+            }
             let out = match &source {
                 Source::Local(path) => {
                     let req = LocalRequest {
@@ -416,14 +449,14 @@ fn run(cli: Cli) -> Result<()> {
                         platforms: &platforms,
                         tag: Some(&tag),
                     };
-                    convert_local(&store, path, &req, &args.options())?
+                    convert_local(&store, path, &req, &opts)?
                 }
                 Source::Registry(r, client) => {
                     let req = RegistryRequest {
                         platforms: &platforms,
                         tag: Some(&tag),
                     };
-                    convert_registry(&store, client, r, &req, &args.options()).map_err(|e| {
+                    convert_registry(&store, client, r, &req, &opts).map_err(|e| {
                         if matches!(e, ImageError::KilnRemote(_)) {
                             // Already names the reference and says what to do.
                             return anyhow::Error::from(e);
@@ -459,8 +492,15 @@ fn run(cli: Cli) -> Result<()> {
                     c.layers.len(),
                     plural(c.layers.len())
                 );
-                if c.squashed > 0 {
-                    print!(", bottom {} squashed", c.squashed);
+                match (&c.base, c.squashed) {
+                    (Some(b), _) => {
+                        print!(", bottom {} from base {}", b.layers, clean_line(&b.name));
+                        if c.squashed > 0 {
+                            print!(", bottom {} app layers squashed", c.squashed);
+                        }
+                    }
+                    (None, 0) => {}
+                    (None, n) => print!(", bottom {n} squashed"),
                 }
                 println!();
                 for w in c.layers.iter().flat_map(|l| &l.warnings) {
@@ -573,6 +613,15 @@ fn run(cli: Cli) -> Result<()> {
                     m.config.source.manifest_digest
                 );
                 println!("  boot:       {}", boot_line(&m.config));
+                if let Some(b) = &m.config.base {
+                    println!(
+                        "  base:       {} {} (bottom {} layer{})",
+                        clean_line(&b.name),
+                        b.manifest_digest,
+                        b.layers,
+                        plural(b.layers)
+                    );
+                }
                 println!("  layers:");
                 for l in &m.manifest.layers {
                     let inherits = if l.annotation(kiln_image::types::ANN_INHERITS).is_some() {
@@ -627,9 +676,78 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{n:<32} {:<19} {k:<8} {p:<24} {}", &d.to_string()[..19], human_size(s));
             }
         }
+        Cmd::Rebase {
+            old,
+            new,
+            image,
+            tag,
+            max_layers,
+            json,
+        } => {
+            kiln_store::check_ref_name(tag).with_context(|| format!("invalid --tag {}", clean_line(tag)))?;
+            let store = open_store(&cli)?;
+            let req = RebaseRequest {
+                old,
+                new,
+                image,
+                tag: Some(tag),
+                max_layers: *max_layers,
+            };
+            let opts = ConvertOptions::default();
+            let out = match rebase(&store, &req, &opts) {
+                Err(ImageError::RebaseRefused(refusals)) => {
+                    // One sanitised line per gate, so image text cannot forge lines.
+                    eprintln!("kiln: rebase refused:");
+                    for r in &refusals {
+                        eprintln!("  - {}", clean_line(&r.to_string()));
+                    }
+                    bail!("rebase refused by {} gate{}", refusals.len(), plural(refusals.len()));
+                }
+                r => r?,
+            };
+            if *json {
+                let v = json!({
+                    "tag": tag,
+                    "digest": out.digest.to_string(),
+                    "mediaType": out.media_type,
+                    "images": out.images.iter().map(|r| json!({
+                        "platform": r.platform.to_string(),
+                        "manifest": r.manifest_digest.to_string(),
+                        "baseLayers": r.base_layers,
+                        "reresolved": r.reresolved,
+                        "squashed": r.squashed,
+                        "app": r.app.iter().map(|l| json!({
+                            "erofs": l.erofs.to_string(),
+                            "reused": l.reused,
+                            "changed": l.changed(),
+                        })).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            for r in &out.images {
+                let changed = r.app.iter().filter(|l| l.changed()).count();
+                println!(
+                    "{}  {}  {} base layer{}, {} app layer{} ({changed} changed, {} re-resolved)",
+                    clean_line(&r.platform.to_string()),
+                    r.manifest_digest,
+                    r.base_layers,
+                    plural(r.base_layers),
+                    r.app.len(),
+                    plural(r.app.len()),
+                    r.reresolved
+                );
+                for l in &r.app {
+                    println!("  {:<8} {}", if l.changed() { "changed" } else { "reused" }, l.erofs);
+                }
+            }
+            println!("{} → {}", clean_line(tag), out.digest);
+        }
         Cmd::Gc => {
-            // Source OCI blobs are not referenced by kiln images, so GC frees them;
-            // a later convert re-verifies them from the source. Pinned kernels and
+            // Source layer tars are not referenced by kiln images, so GC frees them
+            // (except those `kiln rebase` re-finalises); a later convert re-verifies
+            // them from the source. Pinned kernels and
             // kiln-init stay, so cached runs keep working offline (spec §5.2).
             let r = open_store(&cli)?.gc_with_roots(kiln_image::artifacts::gc_roots)?;
             println!(

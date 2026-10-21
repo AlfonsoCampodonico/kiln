@@ -294,6 +294,30 @@ impl<R: Read + Seek> Image<R> {
         Ok(out)
     }
 
+    /// Every path below the root with its nid, breadth-first in name order.
+    pub fn walk(&mut self) -> Result<Vec<(Vec<u8>, u64)>> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::from([self.root_nid()]);
+        let mut queue = std::collections::VecDeque::from([(Vec::new(), self.root_nid())]);
+        while let Some((dir, nid)) = queue.pop_front() {
+            for e in self.read_dir(nid)? {
+                let path = if dir.is_empty() {
+                    e.name
+                } else {
+                    [dir.as_slice(), b"/", &e.name].concat()
+                };
+                if self.inode(e.nid)?.is_dir() {
+                    if !seen.insert(e.nid) {
+                        return Err(corrupt(format!("directory nid {} is linked twice", e.nid)));
+                    }
+                    queue.push_back((path.clone(), e.nid));
+                }
+                out.push((path, e.nid));
+            }
+        }
+        Ok(out)
+    }
+
     /// Resolves a normalized path (`b""` is the root).
     pub fn lookup(&mut self, path: &[u8]) -> Result<Option<u64>> {
         let mut cur = self.root_nid();
