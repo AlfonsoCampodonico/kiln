@@ -1060,3 +1060,39 @@ fn a_chained_base_survives_gc_and_names_a_missing_inner_base() {
     assert!(matches!(e, ImageError::BaseMissing { .. }), "{e}");
     assert!(e.to_string().contains(&inner.to_string()), "{e}");
 }
+
+/// gc after a hostile image names another image's manifest as its source: the
+/// other image keeps every blob.
+#[test]
+fn a_hostile_source_pointer_cannot_make_gc_delete_another_image() {
+    let f = Fixture::new();
+    f.base("base:1", &Base::old());
+    f.base("base:2", &Base::patched());
+    f.app("app:1", "base:1", &Base::old(), &[app_code()]).unwrap();
+    let victim = f.manifest("app:1");
+    f.store.set_ref("zz-evil:1", &f.manifest("base:2").digest).unwrap();
+    rewrite_config(&f, "zz-evil:1", |c| c.source.manifest_digest = victim.digest.clone());
+    f.store.gc().unwrap();
+    for d in std::iter::once(&victim.manifest.config.digest).chain(victim.manifest.layers.iter().map(|l| &l.digest)) {
+        assert!(f.store.has_blob(d), "{d} of app:1 was deleted");
+    }
+}
+
+/// A base that records its own base but matches layer for layer needs nothing
+/// else, so one pulled without its inner base still works with `--base`.
+#[test]
+fn a_chained_base_matching_exactly_needs_no_inner_base() {
+    let f = Fixture::new();
+    f.base("b1:1", &Base::old());
+    let mut b2 = Base::old().layers();
+    b2.push(TarBuilder::new().file("opt/b2", b"b", &Opts::default()).finish());
+    f.convert_for("b2:1", &[arm()], &b2, Base::old().config(), &f.on_base("b1:1"))
+        .unwrap();
+    let inner = f.manifest("b1:1").digest;
+    std::fs::remove_file(f.store.blob_path(&inner)).unwrap();
+    let mut tars = b2.clone();
+    tars.push(app_code());
+    f.convert_for("app:1", &[arm()], &tars, Base::old().config(), &f.on_base("b2:1"))
+        .unwrap();
+    assert_eq!(f.manifest("app:1").config.base.unwrap().layers, 3);
+}
