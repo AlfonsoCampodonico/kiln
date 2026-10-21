@@ -956,6 +956,8 @@ fn rebase_text_output_and_a_missing_record() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("bottom: the image records no base"));
+    // Usage errors are clap's 2; refusals and other errors are 1 (spec §16.6).
+    kiln(home.path()).args(["rebase", "base:1", "base:1"]).assert().code(2);
     let path = layout_with(&src.path().join("app2"), rebase_cfg("8.4.1"), app);
     kiln(home.path())
         .args([
