@@ -68,12 +68,13 @@ fn a_warm_convert_downloads_no_layers_even_with_inherited_parents() {
     assert_eq!(warm.layers_downloaded, 0);
     assert_eq!(reg.blob_requests("GET"), blob_gets, "no blob is fetched at all");
 
-    // GC frees the source blobs; a re-convert fetches the config again, but no layer.
+    // GC frees the source layers but keeps the source manifest and config (spec
+    // §5.2, for `kiln rebase`), so a re-convert fetches no blob at all.
     store.gc().unwrap();
     let after_gc = convert_registry(&store, &c, &r, &registry_req(&[arm()], "a"), &opts).unwrap();
     assert_eq!(after_gc.digest, cold.digest);
     assert_eq!(after_gc.layers_downloaded, 0);
-    assert_eq!(reg.blob_requests("GET"), blob_gets + 1);
+    assert_eq!(reg.blob_requests("GET"), blob_gets);
 }
 
 #[test]

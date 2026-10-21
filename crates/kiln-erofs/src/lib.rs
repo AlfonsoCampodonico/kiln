@@ -19,7 +19,7 @@ mod writer;
 
 pub use error::{Error, Result};
 pub use limits::Limits;
-pub use merge::{resolve_inherited, squash};
+pub use merge::{Merged, resolve_inherited, squash, squash_upper};
 pub use reader::{DataReader, DirEntry, Image, InodeInfo};
 pub use tree::{DirAttrs, Meta, Timestamp, XattrKey, Xattrs};
 pub use writer::{LayerSummary, LayerWriter};

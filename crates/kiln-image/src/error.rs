@@ -41,6 +41,14 @@ pub enum ImageError {
     KilnRemote(String),
     #[error("no image named {0:?}")]
     RefNotFound(String),
+    #[error("the base {base} is built on {inner}, which is no longer in the store; convert that base again")]
+    BaseMissing { base: Digest, inner: Digest },
+    #[error("the image is not built on {0}: {1}")]
+    NotOnBase(String, String),
+    #[error("rebase refused:{}", .0.iter().map(|r| format!("\n  - {r}")).collect::<String>())]
+    RebaseRefused(Vec<crate::rebase::gates::Refusal>),
+    #[error("{0}; re-convert the image (with --base) to restore its sources")]
+    SourceMissing(String),
     #[error("invalid option: {0}")]
     BadOption(String),
     #[error("fetching the pinned {what}: {source}")]
