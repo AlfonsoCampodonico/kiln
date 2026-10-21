@@ -4,13 +4,17 @@
 //! and the config is bounded and checked before anything is fetched or tagged.
 #![forbid(unsafe_code)]
 
+mod assemble;
 mod chunk;
 mod error;
 pub mod format;
+mod load;
 
+pub use assemble::{LAZY_VERSION, LazyFile, LazyIndex, assemble, write_lazy};
 pub use chunk::{Built, MAX_BUNDLE_JSON, chunk_bundle};
 pub use error::{Result, SnapshotError};
 pub use format::{
     BUNDLE_JSON, ChunkedFile, DEFAULT_CHUNK_SIZE, LAZY_JSON, Limits, SCHEMA_VERSION, SNAPSHOT_ARTIFACT, SNAPSHOT_CHUNK,
     SNAPSHOT_CONFIG, SnapshotConfig, check_name,
 };
+pub use load::{Loaded, is_snapshot, load, load_with, resolve, tag};

@@ -145,6 +145,8 @@ pub fn chunk_bundle(store: &Store, dir: &Path, chunk_size: u64) -> Result<Built>
     let bundle = read_bundle_json(dir)?;
     let names = list_files(dir, &limits)?;
     let mut buf = vec![0u8; chunk_size as usize];
+    // Compared with `==`, a memcmp: fast even in debug builds.
+    let zeros = vec![0u8; chunk_size as usize];
     let mut layers: Vec<Descriptor> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut files = Vec::with_capacity(names.len());
@@ -173,7 +175,7 @@ pub fn chunk_bundle(store: &Store, dir: &Path, chunk_size: u64) -> Result<Built>
             }
             left -= want as u64;
             let bytes = &buf[..want];
-            if bytes.iter().all(|&b| b == 0) {
+            if bytes == &zeros[..want] {
                 chunks.push(None);
                 continue;
             }

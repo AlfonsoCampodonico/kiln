@@ -51,3 +51,7 @@ pub enum SnapshotError {
 }
 
 pub type Result<T> = std::result::Result<T, SnapshotError>;
+
+pub(crate) fn json<T: serde::de::DeserializeOwned>(what: &'static str, bytes: &[u8]) -> Result<T> {
+    serde_json::from_slice(bytes).map_err(|source| SnapshotError::Json { what, source })
+}
