@@ -143,12 +143,20 @@ fn prepare(plan: &WorkerPlan) -> Result<Prepared, Fail> {
         )?;
         layers.push(target);
     }
+    // Only now, with the root work done in a directory only root could write to, does the
+    // kiln user get it; never following a link, in case one appeared.
     let own = |p: &Path| {
-        rustix::fs::chown(p, Some(Uid::from_raw(a.uid)), Some(Gid::from_raw(a.gid)))
-            .map_err(|e| format!("chown {}: {e}", p.display()))
+        rustix::fs::chownat(
+            rustix::fs::CWD,
+            p,
+            Some(Uid::from_raw(a.uid)),
+            Some(Gid::from_raw(a.gid)),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|e| format!("chown {}: {e}", p.display()))
     };
-    own(&plan.vm_dir)?;
     own(&layer_dir)?;
+    own(&plan.vm_dir)?;
     // The drop, for good: groups, then gid, then uid (a credential change clears the
     // parent death signal, so it is set again).
     let groups: Vec<Gid> = a.groups.iter().map(|&g| Gid::from_raw(g)).collect();

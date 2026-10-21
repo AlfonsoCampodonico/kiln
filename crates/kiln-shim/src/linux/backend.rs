@@ -265,13 +265,12 @@ impl LinuxBackend {
         dir(&state.join("vm"), 0o711)?;
         let name = crate::service::task_dir_name(&v.namespace, &v.task_id);
         let vm_dir = state.join("vm").join(&name);
-        dir(&vm_dir, 0o700)?;
-        rustix::fs::chown(
-            &vm_dir,
-            Some(rustix::process::Uid::from_raw(account.uid)),
-            Some(rustix::process::Gid::from_raw(account.gid)),
-        )
-        .map_err(|e| Error::Internal(format!("chown {}: {e}", vm_dir.display())))?;
+        // The worker does root work in it (the layer mount points) before it hands it to the
+        // kiln user, so it starts fresh and root's own: a leftover (a crashed shim's) may hold
+        // that user's symlinks, and `create` fails rather than reuse whatever raced in.
+        // `remove_dir_all` does not follow symlinks.
+        let _ = fs::remove_dir_all(&vm_dir);
+        fs::DirBuilder::new().mode(0o700).create(&vm_dir)?;
         let plan = WorkerPlan {
             task_id: v.task_id.clone(),
             account: account.clone(),

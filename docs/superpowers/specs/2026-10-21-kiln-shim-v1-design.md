@@ -322,8 +322,10 @@ containerd starts shims as root. kiln's T6 says no kiln component runs as root, 
 | Path | Owner, mode | What |
 |---|---|---|
 | `/run/kiln-shim/`, `/run/kiln-shim/vm/` | root, 0711 | Traversable, not listable, by the kiln user |
-| `/run/kiln-shim/vm/<ns>-<task id>/` | kiln, 0700 | The worker's directory: `layers/<n>.erofs` mount points, `init.erofs`, and `run/` (vmkit's run directory: the VMM's sockets, logs and console FIFO) |
+| `/run/kiln-shim/vm/<ns>-<task id>/` | root, then kiln; 0700 | The worker's directory: `layers/<n>.erofs` mount points, `init.erofs`, and `run/` (vmkit's run directory: the VMM's sockets, logs and console FIFO) |
 | `<store>/shim-scratch/<ns>-<task id>/scratch.img` | kiln | The VM's scratch disk, on the store's filesystem rather than the `/run` tmpfs |
+
+The worker's directory is created fresh and root-only. The worker makes `layers/` and the bind-mount targets inside it while it is still root. Only then does it hand `layers/` and the directory itself to the kiln user, with a `chown` that does not follow symlinks. So that user never controls a directory in which root still creates files or mounts. A leftover directory (a crashed shim's) is removed first, without following its links.
 
 Both of a task's directories are removed by the shim when its worker has exited. The worker's layer mounts went with its mount namespace.
 
