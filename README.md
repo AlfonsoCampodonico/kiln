@@ -175,6 +175,7 @@ How the commands move images between registries, local sources, stores and micro
 | `kiln inspect NAME [--json]` | Shows an image's platforms, process, provenance, boot layers and layers. |
 | `kiln ls [--json]` | Lists tagged images. |
 | `kiln gc` | Removes blobs and cache entries no tag reaches. Pinned kernels and kiln-init stay, so cached runs keep working offline. |
+| `kiln rebase OLD NEW IMAGE --tag NAME` | Swaps an image's base layers for a patched base without rebuilding, or refuses with the reason. |
 | `kiln run [OPTIONS] IMAGE [CMD...]` | Boots an image in a microVM and runs its command. See [docs/running.md](docs/running.md). |
 | `kiln bench LAYOUT` | Measures cold, warm and changed-top-layer conversions of a local OCI layout and prints JSON. |
 
@@ -188,9 +189,18 @@ Global: `--store DIR` (or `$KILN_HOME`) selects the store; the default is `~/.lo
 - `--max-layers N` (default 10): with `n` app layers and `n > N`, the bottom `n - N + 1` are squashed into one, leaving exactly `N`. The kernel and init layers don't count. Each app layer becomes a virtio-blk disk at run time, so `N` plus the init and scratch disks, vsock and the NIC must fit the VMM's devices (Firecracker: 17 on x86_64, 92 on aarch64; Cloud Hypervisor: 30 usable). The squashed layer is cached under the ordered erofs digests it merges, and the layers above it are converted against the unsquashed stack first, so they are the same blobs with or without the squash (`crates/kiln-image/tests/squash.rs`).
 - `--jobs N`: layers converted in parallel (default: the available CPUs).
 - `--boot-layers pinned|none` (default `pinned`): `none` makes a provisional image without kernel or kiln-init layers, for offline use or behind a proxy kiln cannot use; `kiln run` then needs `--kernel PATH --allow-custom-kernel`.
+- `--base NAME`: records that the image is built on the kiln image `NAME` (usually the converted `FROM` image), which `kiln rebase` needs. Squashing then stays on each side of that boundary: the base keeps its own layers and the app layers get `N` minus the base's count.
 - `--json`: a machine-readable summary.
 
 An argument that names an existing path is a local source; anything else must be an image reference. An argument starting with `./`, `../`, `/` or `~`, or ending in `.tar`, `.tar.gz` or `.tgz`, is always taken as a local path, and a full reference such as `docker.io/library/php` forces the registry. Registry behaviour, credentials and address rules are in [docs/registries.md](docs/registries.md).
+
+### `kiln rebase`
+
+`kiln rebase OLD NEW IMAGE --tag NAME [--max-layers N] [--json]` swaps `IMAGE`'s base layers from `OLD` to `NEW`, usually a patched build of the same base, without rebuilding.
+- **What is reused:** app layers that inherited directory attributes from the base are re-finalised from their cached source tars, and every other app layer is reused byte for byte.
+- **Env and labels:** values the image inherited unchanged follow `NEW`.
+- **Refusals:** the rebase is refused, with the reason, when the platform, the distro release, a `<lang>.version` label's major.minor or the start contract changes, or when `NEW` drops an env var. It is also refused when any file the app layers shadow (copy up, replace or delete) differs between the two bases, which catches `sed -i` over a base config.
+- **Sources:** rebasing needs the app's source tars until the next `kiln gc`.
 
 ### `kiln run`
 
