@@ -168,7 +168,6 @@ struct Worker {
     tx: Mutex<UnixStream>,
     heard: Arc<(Mutex<Heard>, Condvar)>,
     vm_dir: PathBuf,
-    scratch_dir: PathBuf,
 }
 
 impl Worker {
@@ -225,9 +224,10 @@ impl Process for Worker {
         while !h.closed {
             h = cv.wait(h).unwrap_or_else(|e| e.into_inner());
         }
-        // The worker's mounts went with its mount namespace; its directories are ours.
+        // The worker's mounts went with its mount namespace, and it removed its scratch disk
+        // itself (as the kiln user: root deletes nothing in that user's store). Its directory
+        // here is under root's own.
         let _ = fs::remove_dir_all(&self.vm_dir);
-        let _ = fs::remove_dir_all(&self.scratch_dir);
         // Only the worker's own report is the guest's exit: a worker that crashed (or
         // was killed) without it says nothing about the guest.
         let _ = status;
@@ -370,7 +370,6 @@ impl LinuxBackend {
             tx: Mutex::new(ours),
             heard,
             vm_dir: plan.vm_dir,
-            scratch_dir: plan.scratch_dir,
         }))
     }
 }

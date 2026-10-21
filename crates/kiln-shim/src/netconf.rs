@@ -4,9 +4,10 @@
 //!
 //! Guest traffic is redirected by tc before the pod netns's IP stack sees it, so the
 //! fixed deny list (cloud metadata and the node's own addresses, D4) is tc filters on
-//! the tap's ingress, not nftables. They are stateless: towards the node they drop only
-//! what opens a connection (TCP SYN without ACK, UDP, ICMP echo requests), so the guest
-//! still answers kubelet's probes, which come from a node address.
+//! the tap's ingress, not nftables. They are stateless: towards the node only replies
+//! pass (TCP with ACK set, ICMP echo replies and unreachables), so the guest still
+//! answers kubelet's probes, which come from a node address, but opens nothing there,
+//! over any protocol.
 
 use std::net::Ipv4Addr;
 
@@ -167,8 +168,9 @@ pub fn tap_commands(net: &PodNet, tap: &str, uid: u32, gid: u32) -> Vec<Vec<Stri
 }
 
 /// `tc` commands, in order: everything the CNI delivers to the pod goes to the tap; from
-/// the tap, the deny list (after the `allow` exceptions), then only the pod's own IPv4 and
-/// ARP to the pod interface, and nothing else (IPv6, spoofed sources).
+/// the tap, the `allow` exceptions, the deny list, then only the pod's own IPv4 and ARP to
+/// the pod interface, and nothing else (IPv6, spoofed sources). Every redirect of IPv4
+/// requires the pod's own source address.
 pub fn tc_commands(net: &PodNet, tap: &str, allow: &[Cidr], node: &[Ipv4Addr]) -> Vec<Vec<String>> {
     let pod = net.ifname.as_str();
     let mut out = vec![
@@ -188,36 +190,27 @@ pub fn tc_commands(net: &PodNet, tap: &str, allow: &[Cidr], node: &[Ipv4Addr]) -
         out.push(f);
     };
     let to_pod = ["action", "mirred", "egress", "redirect", "dev", pod];
+    let own = format!("{}/32", net.address);
+    let from_pod = ["protocol", "ip", "flower", "src_ip", own.as_str()];
     for c in allow {
         let cidr = format!("{}/{}", c.addr, c.prefix);
-        filter(&[&["protocol", "ip", "flower", "dst_ip", &cidr][..], &to_pod].concat());
+        filter(&[&from_pod[..], &["dst_ip", &cidr], &to_pod].concat());
     }
     filter(&["protocol", "ip", "flower", "dst_ip", "169.254.0.0/16", "action", "drop"]);
     for a in node {
         let a = format!("{a}/32");
-        filter(&[
-            "protocol",
-            "ip",
-            "flower",
-            "ip_proto",
-            "tcp",
-            "dst_ip",
-            &a,
-            "tcp_flags",
-            "0x2/0x12",
-            "action",
-            "drop",
-        ]);
-        filter(&[
-            "protocol", "ip", "flower", "ip_proto", "udp", "dst_ip", &a, "action", "drop",
-        ]);
-        filter(&[
-            "protocol", "ip", "flower", "ip_proto", "icmp", "dst_ip", &a, "type", "8", "action", "drop",
-        ]);
+        // Replies only: to connections the node opened, and ICMP answers.
+        for reply in [
+            &["ip_proto", "tcp", "tcp_flags", "0x10/0x10"][..],
+            &["ip_proto", "icmp", "type", "0"],
+            &["ip_proto", "icmp", "type", "3"],
+        ] {
+            filter(&[&from_pod[..], &["dst_ip", &a], reply, &to_pod].concat());
+        }
+        filter(&["protocol", "ip", "flower", "dst_ip", &a, "action", "drop"]);
     }
-    let own = format!("{}/32", net.address);
-    filter(&[&["protocol", "ip", "flower", "src_ip", &own][..], &to_pod].concat());
-    filter(&[&["protocol", "arp", "flower", "arp_sip", &own][..], &to_pod].concat());
+    filter(&[&from_pod[..], &to_pod].concat());
+    filter(&[&["protocol", "arp", "flower", "arp_sip", own.as_str()][..], &to_pod].concat());
     filter(&["protocol", "all", "matchall", "action", "drop"]);
     out
 }
@@ -332,14 +325,15 @@ mod tests {
                 "qdisc replace dev eth0 clsact",
                 "filter add dev eth0 ingress pref 1 protocol all matchall action mirred egress redirect dev kiln0",
                 "qdisc replace dev kiln0 clsact",
-                "filter add dev kiln0 ingress pref 1 protocol ip flower dst_ip 169.254.20.10/32 action mirred egress redirect dev eth0",
+                "filter add dev kiln0 ingress pref 1 protocol ip flower src_ip 10.88.0.5/32 dst_ip 169.254.20.10/32 action mirred egress redirect dev eth0",
                 "filter add dev kiln0 ingress pref 2 protocol ip flower dst_ip 169.254.0.0/16 action drop",
-                "filter add dev kiln0 ingress pref 3 protocol ip flower ip_proto tcp dst_ip 192.168.5.15/32 tcp_flags 0x2/0x12 action drop",
-                "filter add dev kiln0 ingress pref 4 protocol ip flower ip_proto udp dst_ip 192.168.5.15/32 action drop",
-                "filter add dev kiln0 ingress pref 5 protocol ip flower ip_proto icmp dst_ip 192.168.5.15/32 type 8 action drop",
-                "filter add dev kiln0 ingress pref 6 protocol ip flower src_ip 10.88.0.5/32 action mirred egress redirect dev eth0",
-                "filter add dev kiln0 ingress pref 7 protocol arp flower arp_sip 10.88.0.5/32 action mirred egress redirect dev eth0",
-                "filter add dev kiln0 ingress pref 8 protocol all matchall action drop",
+                "filter add dev kiln0 ingress pref 3 protocol ip flower src_ip 10.88.0.5/32 dst_ip 192.168.5.15/32 ip_proto tcp tcp_flags 0x10/0x10 action mirred egress redirect dev eth0",
+                "filter add dev kiln0 ingress pref 4 protocol ip flower src_ip 10.88.0.5/32 dst_ip 192.168.5.15/32 ip_proto icmp type 0 action mirred egress redirect dev eth0",
+                "filter add dev kiln0 ingress pref 5 protocol ip flower src_ip 10.88.0.5/32 dst_ip 192.168.5.15/32 ip_proto icmp type 3 action mirred egress redirect dev eth0",
+                "filter add dev kiln0 ingress pref 6 protocol ip flower dst_ip 192.168.5.15/32 action drop",
+                "filter add dev kiln0 ingress pref 7 protocol ip flower src_ip 10.88.0.5/32 action mirred egress redirect dev eth0",
+                "filter add dev kiln0 ingress pref 8 protocol arp flower arp_sip 10.88.0.5/32 action mirred egress redirect dev eth0",
+                "filter add dev kiln0 ingress pref 9 protocol all matchall action drop",
             ]
         );
     }

@@ -158,15 +158,16 @@ Before the first container VM of a pod netns starts, the shim runs this from a t
 
    | Priority | Match | Action |
    |---|---|---|
-   | 1 | IPv4 to each `egress_allow` CIDR from the config | redirect to `eth0` |
+   | 1 | IPv4 from the pod IP to each `egress_allow` CIDR from the config | redirect to `eth0` |
    | 2 | IPv4 to `169.254.0.0/16` (cloud metadata, link-local) | drop |
-   | 3 | TCP SYN without ACK, UDP, or ICMP echo request, to each of the node's own IPv4 addresses | drop |
-   | 4 | IPv4 from the pod IP | redirect to `eth0` |
-   | 5 | ARP with sender IP = pod IP | redirect to `eth0` |
-   | 6 | anything else (IPv6, spoofed sources) | drop |
+   | 3 | From the pod IP to each of the node's own IPv4 addresses: TCP with ACK set, ICMP echo reply, ICMP destination unreachable | redirect to `eth0` |
+   | 4 | Any other IPv4 to each of the node's own addresses, whatever the protocol | drop |
+   | 5 | IPv4 from the pod IP | redirect to `eth0` |
+   | 6 | ARP with sender IP = pod IP | redirect to `eth0` |
+   | 7 | anything else (IPv6, spoofed sources) | drop |
 
    - **Why stateless:** guest traffic is redirected before the pod netns's IP stack or netfilter sees it, so nftables in the pod netns can't filter it.
-   - **Why rule 3 matches only new connections:** the guest must still be able to *answer* kubelet, whose probes come from a node address. Dropping only those packet types blocks new connections to the node and lets replies through.
+   - **Why rules 3 and 4 let only replies through:** the guest must still be able to *answer* kubelet, whose probes come from a node address. Passing only replies (a TCP segment with ACK set, an ICMP answer), and dropping the rest over any protocol, means the guest can open nothing on the node.
    - **What D4 delegates elsewhere:** private and cluster ranges are not denied. Routing policy belongs to the CNI and NetworkPolicy.
 5. **Remembering the result.** The shim keeps the attachment in memory, keyed by the netns's device and inode. One shim serves one pod, so the record lives exactly as long as the pod's shim. A second container in the same netns, such as the app after its init containers, reuses it without touching the netns again. A netns that already has `kiln0` is only read.
 
@@ -205,7 +206,7 @@ The pod netns is owned by the host's initial user namespace, so an unprivileged 
 
 ### 6.5 DNS
 
-The pod's `resolv.conf` is the source of the container spec's mount whose destination is `/etc/resolv.conf`. The shim reads it as root, then:
+The pod's `resolv.conf` is the source of the container spec's mount whose destination is `/etc/resolv.conf`. The shim reads it as root, so it reads only the file CRI wrote for the task's own sandbox: its path must end in `sandboxes/<sandbox id>/resolv.conf`, and it must be a regular file opened without following a symlink, read up to 64 KiB. A pod's own hostPath volume at `/etc/resolv.conf` could otherwise hand the guest lines of any host file, or hang the shim on a FIFO. The shim then:
 - puts its IPv4 `nameserver`s into `Config.network.dns`;
 - puts its `search` domains into the new `Config.network.search`;
 - puts its `options` into the new `Config.network.options`.
@@ -327,7 +328,7 @@ containerd starts shims as root. kiln's T6 says no kiln component runs as root, 
 
 The worker's directory is created fresh and root-only. The worker makes `layers/` and the bind-mount targets inside it while it is still root. Only then does it hand `layers/` and the directory itself to the kiln user, with a `chown` that does not follow symlinks. So that user never controls a directory in which root still creates files or mounts. A leftover directory (a crashed shim's) is removed first, without following its links.
 
-Both of a task's directories are removed by the shim when its worker has exited. The worker's layer mounts went with its mount namespace.
+The worker removes its scratch disk itself, as the kiln user, before it exits: root deletes nothing inside that user's store. The shim removes the worker's directory under `/run/kiln-shim/vm/` once the worker has exited; the worker's layer mounts went with its mount namespace.
 
 The kiln user gets no systemd user session (no lingering). `vmkit::cgroups_available()` is false, so the VMM stays in the pod's cgroup where the worker put it.
 

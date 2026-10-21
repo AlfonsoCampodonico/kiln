@@ -134,6 +134,33 @@ fn runtime_options(req: &api::CreateTaskRequest) -> Result<Option<RuntimeOptions
     }
 }
 
+/// The largest resolv.conf read.
+const MAX_RESOLV_CONF: u64 = 64 << 10;
+
+/// The pod's resolv.conf, read as root, so only the one CRI wrote for the task's own
+/// sandbox (`…/sandboxes/<sandbox id>/resolv.conf`): a regular file, not through a
+/// symlink, and bounded. Anything else at `/etc/resolv.conf` (a pod's hostPath volume
+/// there) is not read: it would hand the guest lines of an arbitrary host file, or hang
+/// on a FIFO.
+pub fn read_resolv_conf(path: &Path, sandbox_id: Option<&str>) -> Option<String> {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::Read;
+    let sandbox_id = sandbox_id?;
+    let mut parts = path.components().rev();
+    let (file, id, dir) = (parts.next()?, parts.next()?, parts.next()?);
+    if file.as_os_str() != "resolv.conf" || id.as_os_str() != sandbox_id || dir.as_os_str() != "sandboxes" {
+        return None;
+    }
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let f = std::fs::File::from(rustix::fs::open(path, flags, Mode::empty()).ok()?);
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    f.take(MAX_RESOLV_CONF).read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
 /// What a create request runs (design §7.1, §7.2, §5.2). `pod_hostname` is the
 /// hostname of the task's pod sandbox; `load` finds the settings.
 pub fn launch(
@@ -167,8 +194,8 @@ pub fn launch(
     let layers = rootfs::layers(&snapshot)?;
     let resolv = checked
         .resolv_conf
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .as_deref()
+        .and_then(|p| read_resolv_conf(p, spec.group()))
         .map(|t| netconf::resolv(&t))
         .unwrap_or_default();
     Ok(Launch::Vm(Box::new(VmLaunch {
@@ -274,7 +301,16 @@ impl containerd_shim::Task for Service {
 
     fn kill(&self, _ctx: &TtrpcContext, req: api::KillRequest) -> TtrpcResult<api::Empty> {
         no_exec(&req.exec_id)?;
-        self.tasks.kill(&req.id, req.signal as i32).map_err(status)?;
+        match req.signal {
+            // As kill(2): signal 0 only checks that the task is there.
+            0 => {
+                self.tasks.state(&req.id).map_err(status)?;
+            }
+            // kiln-proto forwards 1-31; anything else would be a protocol violation, which
+            // kills the VM.
+            1..=31 => self.tasks.kill(&req.id, req.signal as i32).map_err(status)?,
+            sig => return Err(status(Error::invalid(format!("signal {sig} (kiln forwards 1-31)")))),
+        }
         Ok(api::Empty::new())
     }
 
@@ -598,6 +634,29 @@ mod tests {
     }
 
     #[test]
+    fn kill_signal_zero_checks_and_out_of_range_is_refused() {
+        let (s, backend) = service();
+        let dir = bundle(CONTAINER);
+        s.create(&ctx(), create_req("c1", dir.path(), vec![mount("erofs", "/l")]))
+            .unwrap();
+        let kill = |sig: u32, id: &str| {
+            let mut k = api::KillRequest::new();
+            k.id = id.into();
+            k.signal = sig;
+            s.kill(&ctx(), k)
+        };
+        kill(0, "c1").unwrap();
+        assert_eq!(code(kill(0, "nope").unwrap_err()), Code::NOT_FOUND);
+        assert_eq!(code(kill(64, "c1").unwrap_err()), Code::INVALID_ARGUMENT);
+        assert!(
+            backend.get("c1").signals.lock().unwrap().is_empty(),
+            "nothing reached the VM"
+        );
+        kill(15, "c1").unwrap();
+        assert_eq!(backend.get("c1").signals.lock().unwrap().as_slice(), [15]);
+    }
+
+    #[test]
     fn a_sandbox_with_the_hosts_network_is_refused() {
         let (s, _) = service();
         let dir = bundle(
@@ -636,6 +695,27 @@ mod tests {
         assert_eq!(v.process.entrypoint, ["echo", "hi"]);
         assert!(v.tty && v.interactive);
         assert_eq!((v.namespace.as_str(), v.task_id.as_str()), ("k8s.io", "c1"));
+    }
+
+    #[test]
+    fn only_the_sandboxs_own_resolv_conf_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("sandboxes/s1");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("resolv.conf"), "search a.svc\n").unwrap();
+        assert_eq!(
+            read_resolv_conf(&own.join("resolv.conf"), Some("s1")).as_deref(),
+            Some("search a.svc\n")
+        );
+        // Another pod's, a file of another name, no sandbox: not read.
+        assert_eq!(read_resolv_conf(&own.join("resolv.conf"), Some("s2")), None);
+        assert_eq!(read_resolv_conf(&own.join("resolv.conf"), None), None);
+        std::fs::write(own.join("shadow"), "search secret\n").unwrap();
+        assert_eq!(read_resolv_conf(&own.join("shadow"), Some("s1")), None);
+        // A directory in its place.
+        let d = dir.path().join("sandboxes/s3/resolv.conf");
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(read_resolv_conf(&d, Some("s3")), None);
     }
 
     #[test]

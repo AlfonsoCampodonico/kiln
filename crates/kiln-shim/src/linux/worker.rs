@@ -68,18 +68,18 @@ pub fn main() -> ! {
         Ok(p) => p,
         Err(message) => {
             let _ = send(&mut tx, &FromWorker::Failed { message });
-            std::process::exit(EXIT_INFRA);
+            end(&plan, EXIT_INFRA);
         }
     };
     if send(&mut tx, &FromWorker::Ready {}).is_err() {
-        std::process::exit(EXIT_INFRA);
+        end(&plan, EXIT_INFRA);
     }
     // Until Start, a signal ends the container as it would a runc container's init.
     loop {
         match lines.read::<ToWorker>() {
             Ok(Some(ToWorker::Start {})) => break,
-            Ok(Some(ToWorker::Kill {})) | Ok(None) | Err(_) => std::process::exit(128 + 9),
-            Ok(Some(ToWorker::Signal(sig))) => std::process::exit(128 + sig),
+            Ok(Some(ToWorker::Kill {})) | Ok(None) | Err(_) => end(&plan, 128 + 9),
+            Ok(Some(ToWorker::Signal(sig))) => end(&plan, 128 + sig),
             Ok(Some(_)) => {}
         }
     }
@@ -90,6 +90,16 @@ pub fn main() -> ! {
             EXIT_INFRA
         }
     };
+    end(&plan, code)
+}
+
+/// Removes the scratch disk and exits. Only as the kiln user, whose store it is in: root
+/// never deletes inside a directory another user controls (and before the drop to that
+/// user, the disk does not exist yet).
+fn end(plan: &WorkerPlan, code: i32) -> ! {
+    if !rustix::process::geteuid().is_root() {
+        let _ = fs::remove_dir_all(&plan.scratch_dir);
+    }
     std::process::exit(code)
 }
 
