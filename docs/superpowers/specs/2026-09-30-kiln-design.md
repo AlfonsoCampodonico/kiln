@@ -992,7 +992,7 @@ Each gate is a pure function in `kiln-image` with its own unit tests. `rebase` e
 - **Missing sources.** If a source tar a layer needs is no longer in the store, rebase fails, names the layer, and says to re-convert. `gc` drops source blobs today, so an inheriting layer's tar survives only until the next `gc`. Making `gc` keep the sources of inheriting layers of images that record a base is a follow-up.
 - **Squash and report.** The app half is squashed again for the new base's layer count (§6.4).
   - Rebase reports, per app layer, whether it was reused or changed.
-  - It reports how many source layers were re-finalised.
+  - It reports how many source layers have implicit parents and were re-resolved, whether or not their bytes changed.
 
 ### 16.5 The rebased image
 

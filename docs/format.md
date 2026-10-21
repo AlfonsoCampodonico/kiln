@@ -55,6 +55,8 @@ An OCI image manifest (`mediaType` `application/vnd.oci.image.manifest.v1+json`,
 - `kernel` (`{ "profile", "version" }`) and `init` (`{ "version" }`): set when the image has that boot layer, omitted otherwise. `kiln run` verifies the kernel layer against the digest kiln pins for `kernel` and the image's architecture (a `custom` profile needs `--allow-custom-kernel`); `init` is informational, since the init layer is always replaced.
 - `source.manifestDigest`: the source OCI manifest. `source.reference` is present only for registry inputs. This is unverified provenance.
 - `erofsFormatVersion`: the erofs profile version of every app layer.
+- `labels`: the source OCI config's labels, omitted when there are none.
+- `base` (only for images converted with `--base` or made by `kiln rebase`): `{ "name", "manifestDigest", "layers", "sourceLayers" }`. The image's bottom `layers` app layers are exactly the layers of the kiln manifest `manifestDigest`, the base, and they came from the first `sourceLayers` layers of the source manifest. No squashed layer spans that boundary: layers above it that are merged keep their whiteouts and opaque markers. `name` is informational. `kiln rebase` refuses images without this record.
 - There is no kernel command line field and no kiln version field.
 
 ### Local store (informative)
@@ -72,7 +74,7 @@ $KILN_HOME/
 `$KILN_HOME` (default `~/.local/share/kiln`) holds `blobs/sha256/<hex>`, `refs.json` (`{"refs": {"<name>": "<digest>"}}`), and five caches of small text files. Each entry is written only after the layer it describes has been verified and committed:
 - `cache/layers/<source layer digest>@<hex diff_id>@<format version>`: `erofs <digest>` for a layer that depends only on its tar, or `parents <JSON list of hex-encoded implicit paths>`.
 - `cache/layers-ctx/<source layer digest>@<hex diff_id>@<format version>@<ctx>`: the erofs digest for a layer with implicit parents. `ctx` is the hex SHA-256 of the JSON list, in implicit-path order, of `[hex(path), null]` (absent in the lowers, or not a directory) or `[hex(path), [mode, uid, gid, mtime_sec, mtime_nsec, [[xattr_index, hex(name), hex(value)], …]]]`.
-- `cache/squash/<hex SHA-256 of the newline-joined erofs digests>@<format version>`: a squashed bottom layer.
+- `cache/squash/<hex SHA-256 of the newline-joined erofs digests>@<format version>`: a squashed bottom layer. A squash above a recorded base, which keeps overlay markers, prefixes the joined list with the line `upper`.
 - `cache/warnings/<layer cache key>`: the JSON list of warnings converting that layer produced, so a cache hit reports them too. Removed by GC together with the `cache/layers/` entry of the same name.
 - `cache/init-layers/<kiln-init binary digest>@<format version>`: the digest of the init layer built around that `kiln-init` binary (see Init layer below).
 
@@ -154,7 +156,7 @@ The image ends at a 4096-byte boundary.
 - A whiteout is a character device 0:0, mode 0, uid and gid 0.
 - An opaque directory carries `trusted.overlay.opaque = "y"`. Only `.wh.` entries produce markers: `trusted.overlay.*` xattrs supplied by the tar are dropped.
 - When merging (parent inheritance and squash), a directory is opaque only when `trusted.overlay.opaque` is exactly `"y"`, and a root-level opaque marker has no effect on the merged view, as in overlayfs.
-- Squashed images contain no markers.
+- Squashed bottom layers contain no markers. A squash of app layers above a recorded base keeps whiteouts and opaque markers, and marks opaque any directory that replaces a lower non-directory or whiteout.
 
 ### Layer semantics (applying one tar)
 

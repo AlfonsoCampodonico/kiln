@@ -54,7 +54,7 @@ pub struct RebasedImage {
     pub base_layers: usize,
     pub app: Vec<AppLayer>,
     /// App source layers that inherit parent attributes, re-resolved in the new base.
-    pub refinalised: usize,
+    pub reresolved: usize,
     /// How many app layers were merged into the bottom app layer (0: none).
     pub squashed: usize,
 }
@@ -328,7 +328,7 @@ fn rebase_one(
             "the new base has {m} layers, so --max-layers must be more than {m}"
         )));
     }
-    let refinalised = app.iter().filter(|l| l.inherits).count();
+    let reresolved = app.iter().filter(|l| l.inherits).count();
     let (app, squashed) = squash_to(store, app, opts.max_layers - m, SquashKind::Upper)?;
     let was = &app_layers(&im.manifest)[record.layers..];
     let app_layers = app
@@ -365,7 +365,7 @@ fn rebase_one(
         manifest_digest,
         base_layers: m,
         app: app_layers,
-        refinalised,
+        reresolved,
         squashed,
     }))
 }

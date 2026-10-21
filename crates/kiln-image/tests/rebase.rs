@@ -333,7 +333,7 @@ fn rebase_swaps_the_base_and_refinalises_inheriting_layers() {
     let out = f.rebase("base:1", "base:2", "app:1", "app:2").unwrap();
     let r = &out.images[0];
     assert_eq!(r.base_layers, 2);
-    assert_eq!(r.refinalised, 1);
+    assert_eq!(r.reresolved, 1);
     assert!(r.app[0].changed(), "var/www inherits /var from the base");
     assert!(
         !r.app[1].changed(),
