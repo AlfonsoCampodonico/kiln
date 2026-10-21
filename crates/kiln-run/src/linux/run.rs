@@ -136,24 +136,30 @@ pub fn vmm_identity(run_dir: &Path) -> Option<Identity> {
 }
 
 /// What `restricted` blocks that an `allow=` exception can open whole, by name.
-const RESTRICTED: [(&str, [u8; 4], u8); 6] = [
-    ("everything (0.0.0.0/0)", [0, 0, 0, 0], 0),
-    ("the private network 10.0.0.0/8", [10, 0, 0, 0], 8),
-    ("the private network 172.16.0.0/12", [172, 16, 0, 0], 12),
-    ("the private network 192.168.0.0/16", [192, 168, 0, 0], 16),
-    ("the shared (CGNAT) network 100.64.0.0/10", [100, 64, 0, 0], 10),
-    ("the link-local network 169.254.0.0/16", [169, 254, 0, 0], 16),
+const RESTRICTED: [(&str, &str); 9] = [
+    ("everything (0.0.0.0/0)", "0.0.0.0/0"),
+    ("the private network 10.0.0.0/8", "10.0.0.0/8"),
+    ("the private network 172.16.0.0/12", "172.16.0.0/12"),
+    ("the private network 192.168.0.0/16", "192.168.0.0/16"),
+    ("the shared (CGNAT) network 100.64.0.0/10", "100.64.0.0/10"),
+    ("the link-local network 169.254.0.0/16", "169.254.0.0/16"),
+    ("everything (::/0)", "::/0"),
+    ("the private (ULA) network fc00::/7", "fc00::/7"),
+    ("the link-local network fe80::/10", "fe80::/10"),
 ];
 
-/// The cloud metadata service most clouds answer on.
-const METADATA: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
+/// The cloud metadata service most clouds answer on, and AWS's IPv6 address for it.
+const METADATA: [std::net::IpAddr; 2] = [
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
+    std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)),
+];
 
 /// The warnings `--egress` gets before boot: `open`, and `allow=` exceptions that
 /// are ignored under it; under `restricted` (or `deny-all`), exceptions that open
 /// cloud metadata or a whole range `restricted` exists to block (as `open` does), and those that
 /// include the host's outbound address, which the guest can never reach (finding
 /// 4.1).
-fn egress_warnings(n: &NetSpec, outbound: Option<std::net::Ipv4Addr>) -> Vec<String> {
+fn egress_warnings(n: &NetSpec, outbound: &[std::net::IpAddr]) -> Vec<String> {
     use vmkit::net::{Cidr, Egress};
     let mut out = Vec::new();
     if n.egress == Egress::Open {
@@ -168,14 +174,17 @@ fn egress_warnings(n: &NetSpec, outbound: Option<std::net::Ipv4Addr>) -> Vec<Str
     for c in &n.allow {
         let covers = |x: &Cidr| c.prefix() <= x.prefix() && c.contains(x.addr());
         let mut opens: Vec<String> = Vec::new();
-        if c.contains(METADATA.into()) {
-            opens.push(format!("cloud metadata ({METADATA})"));
-        }
+        opens.extend(
+            METADATA
+                .iter()
+                .filter(|m| c.contains(**m))
+                .map(|m| format!("cloud metadata ({m})")),
+        );
         opens.extend(
             RESTRICTED
                 .iter()
-                .filter(|(_, a, p)| Cidr::new(std::net::Ipv4Addr::from(*a), *p).is_some_and(|x| covers(&x)))
-                .map(|(name, _, _)| name.to_string()),
+                .filter(|(_, r)| r.parse::<Cidr>().is_ok_and(|x| covers(&x)))
+                .map(|(name, _)| name.to_string()),
         );
         if !opens.is_empty() {
             out.push(format!(
@@ -183,7 +192,7 @@ fn egress_warnings(n: &NetSpec, outbound: Option<std::net::Ipv4Addr>) -> Vec<Str
                 opens.join(", ")
             ));
         }
-        if let Some(a) = outbound.filter(|a| c.contains((*a).into())) {
+        for a in outbound.iter().filter(|a| c.contains(**a)) {
             out.push(format!(
                 "warning: --egress allow={c} includes the host's own address {a}, which the guest can never reach"
             ));
@@ -316,13 +325,15 @@ impl Run {
         opts.check()?;
         let net = opts.net.as_ref().map(net_spec);
         if let Some(n) = &net {
-            // pasta gives the VM's namespace the host's outbound address, so the guest
-            // can never reach it (finding 4.1): an exception for it alone is refused,
-            // a wider one that includes it is warned about.
-            let outbound = vmkit::net::outbound_address();
-            n.check_allow(&outbound.map(Into::into).into_iter().collect::<Vec<_>>())
+            // pasta gives the VM's namespace the host's outbound addresses, so the guest
+            // can never reach them (finding 4.1): an exception for one alone is refused,
+            // a wider one that includes one is warned about.
+            let outbound: Vec<std::net::IpAddr> = (vmkit::net::outbound_address().map(Into::into).into_iter())
+                .chain(vmkit::net::outbound_addresses6().into_iter().map(Into::into))
+                .collect();
+            n.check_allow(&outbound)
                 .map_err(|e| Error::refused(format!("--egress: {e}")))?;
-            for w in egress_warnings(n, outbound) {
+            for w in egress_warnings(n, &outbound) {
                 notice(&w);
             }
         }
@@ -645,6 +656,9 @@ mod tests {
         assert_eq!(config::GUEST, vmkit::net::GUEST);
         assert_eq!(config::GATEWAY, vmkit::net::GATEWAY);
         assert_eq!(config::PREFIX, vmkit::net::PREFIX);
+        assert_eq!(config::GUEST6, vmkit::net::GUEST6);
+        assert_eq!(config::GATEWAY6, vmkit::net::GATEWAY6);
+        assert_eq!(config::PREFIX6, vmkit::net::PREFIX6);
     }
 
     #[test]
@@ -672,6 +686,9 @@ mod tests {
         // one that includes it still reaches its other addresses.
         assert!(spec.check_allow(&[Ipv4Addr::new(192, 0, 2, 7).into()]).is_err());
         assert!(spec.check_allow(&[Ipv4Addr::new(10, 1, 9, 9).into()]).is_ok());
+        // IPv6 exceptions reach vmkit as IPv6 networks.
+        n.add_egress("allow=2001:db8::/32", &mut set).unwrap();
+        assert_eq!(net_spec(&n).allow[2].to_string(), "2001:db8::/32");
     }
 
     /// A VMM kiln gave up on keeps its run directory (and run.json, which names
@@ -739,7 +756,7 @@ mod tests {
     #[test]
     fn egress_warnings_name_what_an_exception_opens() {
         use std::net::Ipv4Addr;
-        let warnings = |egress: &str, allow: &[&str], outbound: Option<Ipv4Addr>| {
+        let warnings = |egress: &str, allow: &[&str], outbound: &[std::net::IpAddr]| {
             let mut n = NetOptions::default();
             let mut set = false;
             n.add_egress(egress, &mut set).unwrap();
@@ -749,9 +766,9 @@ mod tests {
             egress_warnings(&net_spec(&n), outbound)
         };
         // Narrow exceptions under restricted: nothing to say.
-        assert!(warnings("restricted", &["10.1.0.0/16", "203.0.113.7"], None).is_empty());
+        assert!(warnings("restricted", &["10.1.0.0/16", "203.0.113.7"], &[]).is_empty());
         // Whole ranges restricted blocks, and cloud metadata, are named.
-        let w = warnings("restricted", &["0.0.0.0/0"], None);
+        let w = warnings("restricted", &["0.0.0.0/0"], &[]);
         assert!(
             w.len() == 1 && w[0].contains("everything (0.0.0.0/0)") && w[0].contains("cloud metadata"),
             "{w:?}"
@@ -765,21 +782,46 @@ mod tests {
             ("169.254.0.0/16", "169.254.0.0/16"),
             ("169.254.169.254", "cloud metadata (169.254.169.254)"),
         ] {
-            let w = warnings("restricted", &[a], None);
+            let w = warnings("restricted", &[a], &[]);
             assert!(w.len() == 1 && w[0].contains(want), "{a}: {w:?}");
         }
         // The same under deny-all; under open the exceptions are ignored.
-        let w = warnings("deny-all", &["10.0.0.0/8"], None);
+        let w = warnings("deny-all", &["10.0.0.0/8"], &[]);
         assert!(w.len() == 1 && w[0].contains("10.0.0.0/8"), "{w:?}");
-        let w = warnings("open", &["10.0.0.0/8"], None);
+        let w = warnings("open", &["10.0.0.0/8"], &[]);
         assert!(
             w.len() == 2 && w[0].starts_with("warning: --egress open:") && w[1].contains("is ignored"),
             "{w:?}"
         );
         // An exception wider than the host's outbound address: its other addresses work.
-        let w = warnings("restricted", &["192.0.2.0/24"], Some(Ipv4Addr::new(192, 0, 2, 7)));
+        let w = warnings("restricted", &["192.0.2.0/24"], &[Ipv4Addr::new(192, 0, 2, 7).into()]);
         assert!(
             w.len() == 1 && w[0].contains("includes the host's own address 192.0.2.7"),
+            "{w:?}"
+        );
+        // IPv6: the ranges restricted blocks, cloud metadata, and the host's outbound address.
+        let w = warnings("restricted", &["::/0"], &[]);
+        assert!(
+            w.len() == 1
+                && w[0].contains("everything (::/0)")
+                && w[0].contains("cloud metadata (fd00:ec2::254)")
+                && w[0].contains("fc00::/7")
+                && w[0].contains("fe80::/10")
+                && !w[0].contains("10.0.0.0/8"),
+            "{w:?}"
+        );
+        for (a, want) in [
+            ("fd00::/8", "cloud metadata (fd00:ec2::254)"),
+            ("fe80::/10", "the link-local network fe80::/10"),
+        ] {
+            let w = warnings("restricted", &[a], &[]);
+            assert!(w.len() == 1 && w[0].contains(want), "{a}: {w:?}");
+        }
+        assert!(warnings("restricted", &["2001:db8::/32"], &[]).is_empty());
+        let outbound6: std::net::IpAddr = "2001:db8:5::15".parse().unwrap();
+        let w = warnings("restricted", &["2001:db8::/32"], &[outbound6]);
+        assert!(
+            w.len() == 1 && w[0].contains("includes the host's own address 2001:db8:5::15"),
             "{w:?}"
         );
     }

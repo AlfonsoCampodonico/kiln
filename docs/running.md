@@ -48,14 +48,14 @@ The host side of one `kiln run` and the control protocol between kiln and kiln-i
 
 ## Networking
 
-- `--net` gives the guest `eth0` (`172.30.0.2/30`, gateway and DNS `172.30.0.1`) in the VM's own network namespace, with egress through the host by `pasta`. Without `--net` the guest has only loopback, and its `/etc/resolv.conf` names `127.0.0.1`, so lookups fail at once.
+- `--net` gives the guest `eth0` (`172.30.0.2/30`, gateway and DNS `172.30.0.1`; and `fd76:6d6b:6974::2/64`, gateway `fd76:6d6b:6974::1`) in the VM's own network namespace, with egress through the host by `pasta`. Both are NAT'd: the guest reaches IPv6 destinations when the host has IPv6, and resolvers prefer IPv4 for names that have both. DNS is on the IPv4 gateway and still answers AAAA queries. Without `--net` the guest has only loopback, and its `/etc/resolv.conf` names `127.0.0.1`, so lookups fail at once.
 - `--egress` sets what the guest may reach:
-  - `restricted` (the default): no private, link-local or cloud metadata, CGNAT, loopback or multicast ranges, and none of the host's own addresses;
+  - `restricted` (the default): no private, link-local or cloud metadata, CGNAT, loopback or multicast ranges, and none of the host's own addresses. For IPv6: nothing outside global unicast `2000::/3` (ULA, link-local, multicast, loopback, IPv4-mapped, NAT64), no Teredo, 6to4 or documentation prefixes, none of the host's IPv6 addresses, and none of the networks the host reaches directly (its LANs);
   - `deny-all`: DNS only;
   - `open`: everything, with a warning;
-  - `allow=CIDR` exceptions (repeatable). One that opens cloud metadata or a whole private, CGNAT or link-local range, or everything, is warned about as `open` is; exceptions given with `open` are ignored, with a warning.
-- pasta gives the VM's namespace the host's outbound address (the one on its default route), so the guest can never reach that address: an exception for it alone is refused, and a wider one that includes it is warned about. The host's other addresses can be reached through an exception.
-- `-p [ADDRESS:]HOST:GUEST[/tcp|udp]` (repeatable, with `--net`) publishes a guest port on the host. The address defaults to `127.0.0.1`, unlike Docker's `0.0.0.0`: a published port stays on this machine unless you give `-p 0.0.0.0:8080:8080` (or another of the host's addresses). A host port below 1024 needs privileges kiln does not have (pasta binds it as you): publish a high port, `-p 8080:80`, rather than `-p 80:80`. The image decides which port its app listens on, and the app must listen on `0.0.0.0` (or the guest's address) at the guest port: a forward to an app listening on `127.0.0.1` cannot work, and its connections end at once.
+  - `allow=CIDR` exceptions, IPv4 or IPv6 (repeatable). One that opens cloud metadata or a whole private, CGNAT or link-local range, or everything, is warned about as `open` is; exceptions given with `open` are ignored, with a warning.
+- pasta gives the VM's namespace the host's outbound addresses (the ones on its IPv4 and IPv6 default routes), so the guest can never reach them: an exception for one alone is refused, and a wider one that includes one is warned about. The host's other addresses can be reached through an exception.
+- `-p [ADDRESS:]HOST:GUEST[/tcp|udp]` (repeatable, with `--net`) publishes a guest port on the host, over IPv4 only. The address defaults to `127.0.0.1`, unlike Docker's `0.0.0.0`: a published port stays on this machine unless you give `-p 0.0.0.0:8080:8080` (or another of the host's addresses). A host port below 1024 needs privileges kiln does not have (pasta binds it as you): publish a high port, `-p 8080:80`, rather than `-p 80:80`. The image decides which port its app listens on, and the app must listen on `0.0.0.0` (or the guest's address) at the guest port: a forward to an app listening on `127.0.0.1` cannot work, and its connections end at once.
 
 ## Persistent disks
 

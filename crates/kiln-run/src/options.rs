@@ -1,7 +1,7 @@
 //! What the user asked for (`kiln run`'s flags, spec §9.7), and parsing the values
 //! that have their own syntax: sizes, `--egress` and `-p`.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -107,10 +107,10 @@ impl FromStr for PortSpec {
     }
 }
 
-/// An IPv4 network for `--egress allow=`; a bare address is a /32.
+/// An IPv4 or IPv6 network for `--egress allow=`; a bare address is a /32 or a /128.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cidr {
-    pub addr: Ipv4Addr,
+    pub addr: IpAddr,
     pub prefix: u8,
 }
 
@@ -118,13 +118,15 @@ impl FromStr for Cidr {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, String> {
-        let bad = || format!("{s:?} is not an IPv4 address or CIDR");
-        let (a, p) = s.split_once('/').unwrap_or((s, "32"));
-        let prefix = p.parse::<u8>().ok().filter(|&p| p <= 32).ok_or_else(bad)?;
-        Ok(Cidr {
-            addr: a.parse().map_err(|_| bad())?,
-            prefix,
-        })
+        let bad = || format!("{s:?} is not an IP address or CIDR");
+        let (a, p) = s.split_once('/').map_or((s, None), |(a, p)| (a, Some(p)));
+        let addr: IpAddr = a.parse().map_err(|_| bad())?;
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = match p {
+            Some(p) => p.parse::<u8>().ok().filter(|&p| p <= max).ok_or_else(bad)?,
+            None => max,
+        };
+        Ok(Cidr { addr, prefix })
     }
 }
 
@@ -386,12 +388,24 @@ mod tests {
         assert_eq!(
             n.allow[1],
             Cidr {
-                addr: Ipv4Addr::new(1, 1, 1, 1),
+                addr: Ipv4Addr::new(1, 1, 1, 1).into(),
                 prefix: 32
             }
         );
         assert!(n.add_egress("open", &mut set).unwrap_err().contains("two policies"));
         assert!(n.add_egress("allow=10.0.0.0/33", &mut set).is_err());
+        // IPv6 exceptions; a bare IPv6 address is a /128.
+        n.add_egress("allow=2001:db8:1::/48", &mut set).unwrap();
+        n.add_egress("allow=fd00:ec2::254", &mut set).unwrap();
+        assert_eq!(
+            n.allow[3],
+            Cidr {
+                addr: "fd00:ec2::254".parse().unwrap(),
+                prefix: 128
+            }
+        );
+        assert!(n.add_egress("allow=fd00::/129", &mut set).is_err());
+        assert!(n.add_egress("allow=[::1]", &mut set).is_err());
         assert!(
             n.add_egress("everything", &mut set)
                 .unwrap_err()
