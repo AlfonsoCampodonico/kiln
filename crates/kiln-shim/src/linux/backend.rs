@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 
-use rustix::process::{Pid, Signal, kill_process};
+use std::os::fd::OwnedFd;
+
+use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
 use super::plan::WorkerPlan;
 use super::{FD_ENV, STATE, attach};
@@ -101,12 +103,19 @@ fn code(status: ExitStatus) -> u32 {
     }
 }
 
-fn signal_pid(pid: u32, sig: i32) -> Result<()> {
-    let pid = Pid::from_raw(pid as i32).ok_or_else(|| Error::Internal("no pid".into()))?;
+/// A pidfd for a child just spawned (not yet reaped, so the pid is still its own).
+fn pidfd(pid: u32) -> Result<OwnedFd> {
+    let p = Pid::from_raw(pid as i32).ok_or_else(|| Error::Internal("no pid".into()))?;
+    pidfd_open(p, PidfdFlags::empty()).map_err(|e| Error::Internal(format!("pidfd for {pid}: {e}")))
+}
+
+/// Signals a child through its pidfd: once it is reaped the pidfd stays its own, and a
+/// signal can never reach another process that reused the pid.
+fn signal_pidfd(fd: &OwnedFd, sig: i32) -> Result<()> {
     let sig = Signal::from_named_raw(sig).ok_or_else(|| Error::invalid(format!("signal {sig}")))?;
-    match kill_process(pid, sig) {
+    match pidfd_send_signal(fd, sig) {
         Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-        Err(e) => Err(Error::Internal(format!("signalling {pid:?}: {e}"))),
+        Err(e) => Err(Error::Internal(format!("signalling a child: {e}"))),
     }
 }
 
@@ -128,6 +137,7 @@ fn output(path: &str) -> Result<Stdio> {
 /// The pod sandbox's process.
 struct Pause {
     pid: u32,
+    pidfd: OwnedFd,
     child: Mutex<Child>,
 }
 
@@ -139,7 +149,7 @@ impl Process for Pause {
         Ok(())
     }
     fn signal(&self, sig: i32) -> Result<()> {
-        signal_pid(self.pid, sig)
+        signal_pidfd(&self.pidfd, sig)
     }
     fn resize(&self, _rows: u16, _cols: u16) -> Result<()> {
         Ok(())
@@ -164,10 +174,13 @@ struct Heard {
 /// A container's VM worker.
 struct Worker {
     pid: u32,
+    pidfd: OwnedFd,
     child: Mutex<Child>,
     tx: Mutex<UnixStream>,
     heard: Arc<(Mutex<Heard>, Condvar)>,
     vm_dir: PathBuf,
+    /// The container's cgroup leaf the worker made, removed once it is empty.
+    cgroup: Option<PathBuf>,
 }
 
 impl Worker {
@@ -204,7 +217,7 @@ impl Process for Worker {
         };
         if self.tell(&m).is_err() {
             // The channel is gone: end the worker itself (the VMM dies with it).
-            return signal_pid(self.pid, SIGKILL);
+            return signal_pidfd(&self.pidfd, SIGKILL);
         }
         Ok(())
     }
@@ -228,6 +241,10 @@ impl Process for Worker {
         // itself (as the kiln user: root deletes nothing in that user's store). Its directory
         // here is under root's own.
         let _ = fs::remove_dir_all(&self.vm_dir);
+        if let Some(cg) = &self.cgroup {
+            // Empty now that the worker and the VMM are gone; kubelet removes the pod's.
+            let _ = fs::remove_dir(cg);
+        }
         // Only the worker's own report is the guest's exit: a worker that crashed (or
         // was killed) without it says nothing about the guest.
         let _ = status;
@@ -248,6 +265,7 @@ impl LinuxBackend {
         let child = self.spawn(cmd, None)?;
         Ok(Arc::new(Pause {
             pid: child.id(),
+            pidfd: pidfd(child.id())?,
             child: Mutex::new(child),
         }))
     }
@@ -316,6 +334,7 @@ impl LinuxBackend {
         drop(theirs);
         let child = spawned?;
         let pid = child.id();
+        let worker_pidfd = pidfd(pid)?;
         let mut child = child;
         let failed = |child: &mut Child, msg: String| {
             let _ = child.kill();
@@ -366,10 +385,12 @@ impl LinuxBackend {
         });
         Ok(Arc::new(Worker {
             pid,
+            pidfd: worker_pidfd,
             child: Mutex::new(child),
             tx: Mutex::new(ours),
             heard,
             vm_dir: plan.vm_dir,
+            cgroup: plan.cgroup,
         }))
     }
 }

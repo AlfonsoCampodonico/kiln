@@ -62,11 +62,25 @@ pub fn attach(netns: &Path, account: &Account, allow: &[Cidr], node: &[Ipv4Addr]
             if run("ip", &words(&["link", "show", TAP])).is_ok() {
                 return Ok(Some(pod));
             }
-            for c in netconf::tap_commands(&pod, TAP, account.uid, account.gid) {
-                run("ip", &c)?;
-            }
-            for c in netconf::tc_commands(&pod, TAP, allow, node) {
-                run("tc", &c)?;
+            let setup = || -> Result<()> {
+                for c in netconf::tap_commands(&pod, TAP, account.uid, account.gid) {
+                    run("ip", &c)?;
+                }
+                for c in netconf::tc_commands(&pod, TAP, allow, node) {
+                    run("tc", &c)?;
+                }
+                Ok(())
+            };
+            if let Err(e) = setup() {
+                // Undone, so a later container finds no tap and sets it all up again,
+                // instead of taking a half-made one for done: the tap goes with its filters,
+                // and the redirect on the pod interface is the shim's own (pref 1).
+                let _ = run("ip", &words(&["link", "del", TAP]));
+                let _ = run(
+                    "tc",
+                    &words(&["filter", "del", "dev", &pod.ifname, "ingress", "pref", "1"]),
+                );
+                return Err(e);
             }
             Ok(Some(pod))
         })

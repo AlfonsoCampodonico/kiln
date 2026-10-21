@@ -169,6 +169,8 @@ Before the first container VM of a pod netns starts, the shim runs this from a t
    - **Why stateless:** guest traffic is redirected before the pod netns's IP stack or netfilter sees it, so nftables in the pod netns can't filter it.
    - **Why rules 3 and 4 let only replies through:** the guest must still be able to *answer* kubelet, whose probes come from a node address. Passing only replies (a TCP segment with ACK set, an ICMP answer), and dropping the rest over any protocol, means the guest can open nothing on the node.
    - **What D4 delegates elsewhere:** private and cluster ranges are not denied. Routing policy belongs to the CNI and NetworkPolicy.
+   - **What the filters cannot see:** they match the guest's packets *before* kube-proxy's DNAT. So a Service whose endpoints are node addresses (the API server, a hostNetwork pod) stays reachable through its Service IP, as it is for a runc pod. That is how in-cluster API access works. Enforcing the node deny list after DNAT, with node-side nftables on traffic from pod IPs, is a follow-up. The node's addresses are read when the pod is first attached; addresses added to the node later are not covered for that pod.
+   - **If a step fails:** setup stops, the tap is deleted (with its filters), and the shim's redirect on the CNI interface is removed. A later container then finds no tap and sets everything up again, instead of taking a half-made attachment for a complete one.
 5. **Remembering the result.** The shim keeps the attachment in memory, keyed by the netns's device and inode. One shim serves one pod, so the record lives exactly as long as the pod's shim. A second container in the same netns, such as the app after its init containers, reuses it without touching the netns again. A netns that already has `kiln0` is only read.
 
 When the pod netns is deleted, the tap and the filters go with it. The shim removes nothing itself.
@@ -485,6 +487,7 @@ The vmkit `TapAttach` mode has its own contract test in vmkit. Its guest boots w
 | More than one container VM at once (sidecars) | D2 | Refused when the second container starts |
 | containerd sandbox API | Needs the multi-rootfs guest (D2) | Later |
 | IPv6 inside the guest | kiln-proto `Network` is IPv4. The tap's ingress drops IPv6. | After kiln's IPv6 work lands |
+| Enforcing the node deny list after Service DNAT | tc sees the guest's packets before kube-proxy translates them (§6.1) | Node-side nftables for pod IPs |
 | Squashing over the device budget | Not needed for typical images on Cloud Hypervisor or Firecracker aarch64 | Spec §3.1 |
 | dm-verity | S4 | Spec §3.1 |
 | containerd 2.3+ stdin bootstrap and 2.4 `MountCapabilities` | The Rust crate lacks bootstrap support. The legacy protocol and the RuntimeInfo annotation still work. | When the crate supports it |

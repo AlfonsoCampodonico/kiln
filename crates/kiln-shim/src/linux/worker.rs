@@ -78,8 +78,8 @@ pub fn main() -> ! {
     loop {
         match lines.read::<ToWorker>() {
             Ok(Some(ToWorker::Start {})) => break,
-            Ok(Some(ToWorker::Kill {})) | Ok(None) | Err(_) => end(&plan, 128 + 9),
-            Ok(Some(ToWorker::Signal(sig))) => end(&plan, 128 + sig),
+            Ok(Some(ToWorker::Kill {})) | Ok(None) | Err(_) => exited(&plan, &mut tx, 128 + 9),
+            Ok(Some(ToWorker::Signal(sig))) => exited(&plan, &mut tx, 128 + sig),
             Ok(Some(_)) => {}
         }
     }
@@ -87,10 +87,17 @@ pub fn main() -> ! {
         Ok(code) => code,
         Err(message) => {
             let _ = send(&mut tx, &FromWorker::Failed { message });
-            EXIT_INFRA
+            exited(&plan, &mut tx, EXIT_INFRA)
         }
     };
     end(&plan, code)
+}
+
+/// Ends a container that did not run to the guest's own exit, telling the shim the code
+/// (it reports only what the worker says: a worker that just vanished is 255).
+fn exited(plan: &WorkerPlan, tx: &mut UnixStream, code: i32) -> ! {
+    let _ = send(tx, &FromWorker::Exited { code });
+    end(plan, code)
 }
 
 /// Removes the scratch disk and exits. Only as the kiln user, whose store it is in: root
@@ -187,6 +194,8 @@ fn prepare(plan: &WorkerPlan) -> Result<Prepared, Fail> {
     let init_bytes = ctx(kiln_image::init_layer(&init, &plan.vm_dir), "building the init layer")?;
     let init_layer = plan.vm_dir.join("init.erofs");
     ctx(fs::write(&init_layer, init_bytes), "writing the init layer")?;
+    // A leftover (a worker killed with its shim) would make the disk's exclusive create fail.
+    let _ = fs::remove_dir_all(&plan.scratch_dir);
     ctx(fs::create_dir_all(&plan.scratch_dir), "creating the scratch directory")?;
     let scratch = plan.scratch_dir.join("scratch.img");
     ctx(
