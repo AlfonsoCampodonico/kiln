@@ -4,8 +4,8 @@
 use std::net::Ipv4Addr;
 
 use kiln_proto::{
-    Config, ExitMethod, Exited, GuestMessage, Hello, HostMessage, InitFailed, MAX_FRAME, Message, Network, Process,
-    Scratch, Shutdown, Signal, Stage, WindowSize, read_message, write_message,
+    Config, ExitMethod, Exited, GuestMessage, Hello, HostMessage, InitFailed, Ipv6Network, MAX_FRAME, Message, Network,
+    Process, Scratch, Shutdown, Signal, Stage, WindowSize, read_message, write_message,
 };
 use proptest::prelude::*;
 
@@ -61,6 +61,11 @@ fn config() -> impl Strategy<Value = Config> {
                     prefix_len: 30,
                     gateway: Ipv4Addr::new(172, 30, 0, 1),
                     dns: vec![Ipv4Addr::new(172, 30, 0, 1)],
+                    ipv6: (blocks % 2 == 0).then(|| Ipv6Network {
+                        address: "fd76:6d6b:6974::2".parse().unwrap(),
+                        prefix_len: 64,
+                        gateway: "fd76:6d6b:6974::1".parse().unwrap(),
+                    }),
                 }),
                 layers,
                 scratch: Scratch {

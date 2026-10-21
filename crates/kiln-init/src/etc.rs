@@ -39,6 +39,7 @@ mod tests {
             prefix_len: 30,
             gateway: Ipv4Addr::new(172, 30, 0, 1),
             dns: vec![Ipv4Addr::new(172, 30, 0, 1)],
+            ipv6: None,
         };
         assert!(hosts("box", Some(&net)).ends_with("\n172.30.0.2\tbox\n"));
         assert!(hosts("box", None).ends_with("\n127.0.1.1\tbox\n"));

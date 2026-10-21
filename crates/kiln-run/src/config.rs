@@ -77,6 +77,7 @@ pub fn build(image: &ImageProcess, opts: &RunOptions, rt: &Runtime) -> Result<Co
             prefix_len: PREFIX,
             gateway: GATEWAY,
             dns: vec![GATEWAY],
+            ipv6: None,
         }),
         layers: rt.layers,
         scratch: Scratch {
@@ -196,7 +197,8 @@ mod tests {
                 address: GUEST,
                 prefix_len: 30,
                 gateway: GATEWAY,
-                dns: vec![GATEWAY]
+                dns: vec![GATEWAY],
+                ipv6: None,
             })
         );
         assert_eq!(c.shutdown_grace_secs, 3);

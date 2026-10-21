@@ -394,6 +394,7 @@ fn networking_from_config(backend: Backend) {
         prefix_len: PREFIX,
         gateway: GATEWAY,
         dns: vec![GATEWAY],
+        ipv6: None,
     });
     let net = NetSpec {
         forwards: vec![PortForward {
