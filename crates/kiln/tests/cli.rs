@@ -821,7 +821,7 @@ fn pinned_boot_layers_are_fetched_from_the_registry() {
     assert!(blob.exists(), "gc removed the pinned kernel");
 }
 
-const FPM: &str = "usr/local/etc/php-fpm.d/laravel-cloud-fpm.conf";
+const FPM: &str = "usr/local/etc/php-fpm.d/www.conf";
 
 /// A two-layer base: `var/` with `var_mode`, nginx, and the php-fpm config.
 fn rebase_base(nginx: &[u8], var_mode: u32, fpm: &[u8]) -> Vec<Vec<u8>> {
@@ -840,10 +840,7 @@ fn rebase_base(nginx: &[u8], var_mode: u32, fpm: &[u8]) -> Vec<Vec<u8>> {
 fn rebase_cfg(php: &str) -> ContainerConfig {
     ContainerConfig {
         cmd: Some(vec!["php-fpm".into()]),
-        env: Some(vec![
-            format!("PHP_VERSION={php}"),
-            "PHP_FPM_REQUEST_TERMINATE_TIMEOUT=60".into(),
-        ]),
+        env: Some(vec![format!("PHP_VERSION={php}"), "FPM_REQUEST_TIMEOUT=60".into()]),
         labels: Some([("php.version".to_string(), php.to_string())].into()),
         ..Default::default()
     }
@@ -855,7 +852,7 @@ fn rebase_cfg(php: &str) -> ContainerConfig {
 fn rebase_onto_a_patched_base_and_refuse_a_stale_copy() {
     let src = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let fpm = b"request_terminate_timeout = ${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}\n";
+    let fpm = b"request_terminate_timeout = ${FPM_REQUEST_TIMEOUT}\n";
     let old = rebase_base(b"nginx 1.30.4", 0o755, fpm);
     let patched = rebase_base(b"nginx 1.30.6", 0o750, fpm);
     let fpm_changed = rebase_base(b"nginx 1.30.6", 0o755, b"request_terminate_timeout = 30\n");

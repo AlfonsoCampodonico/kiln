@@ -509,17 +509,11 @@ mod tests {
 
     #[test]
     fn env_refuses_a_dropped_variable() {
-        let old = s(&["PATH=/bin", "PHP_FPM_REQUEST_TERMINATE_TIMEOUT=60", "FLAG"]);
-        assert!(
-            env(
-                &old,
-                &s(&["PATH=/usr/bin", "PHP_FPM_REQUEST_TERMINATE_TIMEOUT=30", "FLAG", "NEW=1"])
-            )
-            .is_ok()
-        );
+        let old = s(&["PATH=/bin", "FPM_REQUEST_TIMEOUT=60", "FLAG"]);
+        assert!(env(&old, &s(&["PATH=/usr/bin", "FPM_REQUEST_TIMEOUT=30", "FLAG", "NEW=1"])).is_ok());
         let r = env(&old, &s(&["PATH=/bin"])).unwrap_err();
         assert_eq!(r.gate, "env");
-        assert!(r.reason.contains("PHP_FPM_REQUEST_TERMINATE_TIMEOUT, FLAG"), "{r}");
+        assert!(r.reason.contains("FPM_REQUEST_TIMEOUT, FLAG"), "{r}");
     }
 
     #[test]
@@ -688,7 +682,7 @@ mod tests {
 
     #[test]
     fn shadow_refuses_a_stale_copied_up_file() {
-        let fpm = "usr/local/etc/php-fpm.d/laravel-cloud-fpm.conf";
+        let fpm = "usr/local/etc/php-fpm.d/www.conf";
         let mut old = view(&[
             ("usr", dir(0o755)),
             (fpm, file(b"timeout=${T}", 0o644)),
@@ -799,8 +793,8 @@ mod tests {
 
     #[test]
     fn label_merge_follows_the_new_base_only_for_inherited_values() {
-        let old = m(&[("php.version", "8.4.12"), ("vendor", "laravel"), ("gone", "x")]);
-        let new = m(&[("php.version", "8.4.14"), ("vendor", "laravel"), ("added", "1")]);
+        let old = m(&[("php.version", "8.4.12"), ("vendor", "acme"), ("gone", "x")]);
+        let new = m(&[("php.version", "8.4.14"), ("vendor", "acme"), ("added", "1")]);
         let image = m(&[
             ("php.version", "8.4.12"),
             ("vendor", "acme"),

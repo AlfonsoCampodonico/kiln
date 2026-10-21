@@ -100,7 +100,7 @@
   - §4.1: `snapshot` and `restore` are implemented, and `Capabilities` gains `lazy_memory`.
   - §4.2: adds `kiln-snapshot`.
   - The overview, the repository table and §12: sherd and raku have a first cut; sagger remains.
-- **rev 2.13 (2026-10-22):** adds `kiln rebase` (§16): swap the base layers under an image for a patched base without rebuilding. It is the primitive `potter rebase` and Laravel Cloud's build operator share.
+- **rev 2.13 (2026-10-22):** adds `kiln rebase` (§16): swap the base layers under an image for a patched base without rebuilding. It is a primitive `potter rebase` and other registry-side rebasers can share.
   - `kiln convert --base NAME` records the base/app boundary in the config (§5.1, §16.2).
   - §6.4 squashes the base and the app separately when a boundary is recorded, so no squashed layer straddles it.
   - Layers that inherited parents are re-finalised against the new base (§16.4).
@@ -944,14 +944,14 @@ Each item has a defined fallback, so none blocks the design.
 
 It is one primitive with two callers:
 - **`potter rebase`** (potter spec §16): the composite of catalog layers is the base, and `runtime_steps` plus the export layer are the app.
-- **Laravel Cloud's build operator:** fleet-wide CVE patching of images built `FROM` a Laravel Cloud base. Here the base is an ordinary OCI image converted by kiln. potter's rule that images on OCI bases are never rebased does not apply to kiln: kiln's gates (§16.3), and above all the shadowed-path gate, catch what made that rule necessary.
+- **Rebasing converted OCI images:** patching a fleet of images built `FROM` a shared base, such as app images on a language base. Here the base is an ordinary OCI image converted by kiln. potter's rule that images on OCI bases are never rebased does not apply to kiln: kiln's gates (§16.3), and above all the shadowed-path gate, catch what made that rule necessary.
 
 ### 16.1 Why the gates exist
 
-A registry-side OCI rebase (restack the app's layer blobs on a patched base) is safe only if the app's layers do not depend on the bytes they cover. The case that motivated this section is a real one:
-- A Laravel Cloud Dockerfile template runs `sed -i` over `/usr/local/etc/php-fpm.d/*.conf`.
-- That copies `laravel-cloud-fpm.conf` up into an app layer. The copy references `${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}`, which an older base did not define.
-- A rebase that passed every label gate produced an image whose php-fpm would not start.
+A registry-side OCI rebase (restack the app's layer blobs on a patched base) is safe only if the app's layers do not depend on the bytes they cover. The case that motivated this section is a common one:
+- A Dockerfile step runs `sed -i` over the base's `/usr/local/etc/php-fpm.d/*.conf`.
+- That copies `www.conf` up into an app layer. The copy references `${FPM_REQUEST_TIMEOUT}`, which an older base did not define.
+- A rebase that passed every label gate would produce an image whose php-fpm does not start.
 
 The env gate catches that instance. The general fix is the shadowed-path gate: a file the app copied up from the old base must be identical in the new base, otherwise the app's copy is stale. kiln can check this cheaply because its readers see each base's merged view directly from its erofs layers.
 
@@ -1006,7 +1006,7 @@ Each gate is a pure function in `kiln-image` with its own unit tests. `rebase` r
 - **Limits:**
   - The refusal lists up to 20 differing paths and the total count.
   - A directory that was implicit and was then described later in the same layer (§6.3 rule 5) is compared by type only, like the implicit ones, so a change to its own header is not caught. This is a documented gap.
-- **Deleted subtrees stay strict (decided 2026-10-21):** a whiteout's whole subtree is compared, so a slimming step such as `RUN rm -rf /usr/share/doc/*` refuses the rebase whenever a patched package's docs change, even though a rebuild would show the same view. The rule is kept on purpose. A deletion can be the trace of a file derived from the base and then removed (a rendered config whose template was deleted), and the gate cannot tell that apart from slimming. Such images need a rebuild. Laravel Cloud's registry rebase (laravel/cloud-build-operator#709) makes the same choice.
+- **Deleted subtrees stay strict (decided 2026-10-21):** a whiteout's whole subtree is compared, so a slimming step such as `RUN rm -rf /usr/share/doc/*` refuses the rebase whenever a patched package's docs change, even though a rebuild would show the same view. The rule is kept on purpose. A deletion can be the trace of a file derived from the base and then removed (a rendered config whose template was deleted), and the gate cannot tell that apart from slimming. Such images need a rebuild.
 
 ### 16.4 Re-finalising app layers
 

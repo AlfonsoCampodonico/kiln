@@ -14,7 +14,7 @@ use kiln_oci::testlayout::{LayoutBuilder, TestLayer};
 use kiln_oci::{ContainerConfig, ImageConfig, ImageManifest, Platform, canonical_json};
 use kiln_store::{Digest, Store};
 
-const FPM: &str = "usr/local/etc/php-fpm.d/laravel-cloud-fpm.conf";
+const FPM: &str = "usr/local/etc/php-fpm.d/www.conf";
 
 /// What a base build varies.
 #[derive(Clone)]
@@ -33,13 +33,10 @@ impl Base {
         Self {
             nginx: b"nginx 1.30.4",
             var_mode: 0o755,
-            fpm_conf: b"request_terminate_timeout = ${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}\n",
+            fpm_conf: b"request_terminate_timeout = ${FPM_REQUEST_TIMEOUT}\n",
             os_release: "ID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n",
             php: "8.4.12",
-            env: vec![
-                "PATH=/usr/local/bin:/usr/bin:/bin",
-                "PHP_FPM_REQUEST_TERMINATE_TIMEOUT=60",
-            ],
+            env: vec!["PATH=/usr/local/bin:/usr/bin:/bin", "FPM_REQUEST_TIMEOUT=60"],
             cmd: "php-fpm",
         }
     }
@@ -82,7 +79,7 @@ impl Base {
             env: Some(self.env()),
             labels: Some(BTreeMap::from([
                 ("php.version".into(), self.php.into()),
-                ("vendor".into(), "laravel".into()),
+                ("vendor".into(), "acme".into()),
             ])),
             ..Default::default()
         }
@@ -451,7 +448,7 @@ fn refuses_a_dropped_env_var() {
     );
     f.app("app:1", "base:1", &Base::old(), &[app_code()]).unwrap();
     let reason = only(&refusals(f.rebase("base:1", "base:2", "app:1", "x")), "env");
-    assert!(reason.contains("PHP_FPM_REQUEST_TERMINATE_TIMEOUT"), "{reason}");
+    assert!(reason.contains("FPM_REQUEST_TIMEOUT"), "{reason}");
 }
 
 #[test]
@@ -479,7 +476,7 @@ fn refuses_when_a_copied_up_file_changed_in_the_new_base() {
     f.base(
         "base:2",
         &Base {
-            fpm_conf: b"request_terminate_timeout = ${PHP_FPM_REQUEST_TERMINATE_TIMEOUT:-60}\n",
+            fpm_conf: b"request_terminate_timeout = ${FPM_REQUEST_TIMEOUT:-60}\n",
             ..Base::patched()
         },
     );
