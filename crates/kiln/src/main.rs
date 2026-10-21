@@ -3,6 +3,7 @@
 
 mod bench;
 mod run_cmd;
+mod snapshot_cmd;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -171,6 +172,11 @@ enum Cmd {
     },
     /// Remove blobs and cache entries no tag reaches.
     Gc,
+    /// Push, pull and inspect VM snapshots (vmkit bundles as chunked OCI artifacts).
+    Snapshot {
+        #[command(subcommand)]
+        cmd: snapshot_cmd::SnapshotCmd,
+    },
     /// Boot an image in a microVM and run its command (Linux with KVM; on macOS,
     /// in a Lima VM).
     Run(Box<run_cmd::RunArgs>),
@@ -298,6 +304,16 @@ fn default_tag(path: &Path) -> Result<String> {
             clean_line(&path.display().to_string())
         ),
     }
+}
+
+/// Refuses a name that is a snapshot where an image is expected, saying what to use.
+fn refuse_snapshot(store: &Store, name: &str, instead: &str) -> Result<()> {
+    if let Ok(d) = resolve_name(store, name)
+        && kiln_snapshot::is_snapshot(store, &d)
+    {
+        bail!("{} is a kiln snapshot, not an image ({instead})", clean_line(name));
+    }
+    Ok(())
 }
 
 /// The plural suffix for a count of `n`.
@@ -521,6 +537,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Push { name, reference, json } => {
             let store = open_store(&cli)?;
+            refuse_snapshot(&store, name, "use `kiln snapshot push`")?;
             let (r, client) = registry(reference)?;
             let rep = push_image(&store, &client, name, &r)?;
             if *json {
@@ -556,6 +573,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Inspect { name, json } => {
             let store = open_store(&cli)?;
+            refuse_snapshot(&store, name, "use `kiln snapshot inspect`")?;
             let loaded = load(&store, &resolve_name(&store, name)?)?;
             if *json {
                 let entries: Vec<_> = loaded
@@ -619,33 +637,43 @@ fn run(cli: Cli) -> Result<()> {
             let store = open_store(&cli)?;
             let mut rows = Vec::new();
             for (name, digest) in store.refs()? {
-                let (platforms, size) = match load(&store, &digest) {
-                    Ok(l) => {
-                        let ps: Vec<String> = l.entries.iter().map(|(p, _)| clean_line(&p.to_string())).collect();
-                        let size: u64 = l
-                            .entries
-                            .iter()
-                            .flat_map(|(_, m)| m.manifest.layers.iter().map(|d| d.size))
-                            .sum();
-                        (ps.join(","), size)
+                let (kind, platforms, size) = if kiln_snapshot::is_snapshot(&store, &digest) {
+                    match kiln_snapshot::load(&store, &digest) {
+                        Ok(l) => {
+                            let arch = l.config.bundle["arch"].as_str().map_or_else(|| "?".into(), clean_line);
+                            ("snapshot", arch, l.stored_size())
+                        }
+                        Err(e) => ("snapshot", format!("<{}>", clean_line(&e.to_string())), 0),
                     }
-                    Err(e) => (format!("<{}>", clean_line(&e.to_string())), 0),
+                } else {
+                    match load(&store, &digest) {
+                        Ok(l) => {
+                            let ps: Vec<String> = l.entries.iter().map(|(p, _)| clean_line(&p.to_string())).collect();
+                            let size: u64 = l
+                                .entries
+                                .iter()
+                                .flat_map(|(_, m)| m.manifest.layers.iter().map(|d| d.size))
+                                .sum();
+                            ("image", ps.join(","), size)
+                        }
+                        Err(e) => ("image", format!("<{}>", clean_line(&e.to_string())), 0),
+                    }
                 };
-                rows.push((name, digest, platforms, size));
+                rows.push((name, digest, kind, platforms, size));
             }
             if *json {
                 let v: Vec<_> = rows
                     .iter()
-                    .map(|(n, d, p, s)| json!({"name": n, "digest": d.to_string(), "platforms": p, "size": s}))
+                    .map(|(n, d, k, p, s)| json!({"name": n, "digest": d.to_string(), "type": k, "platforms": p, "size": s}))
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&v)?);
                 return Ok(());
             }
-            println!("{:<32} {:<19} {:<24} SIZE", "NAME", "DIGEST", "PLATFORMS");
-            for (n, d, p, s) in rows {
+            println!("{:<32} {:<19} {:<8} {:<24} SIZE", "NAME", "DIGEST", "TYPE", "PLATFORMS");
+            for (n, d, k, p, s) in rows {
                 // Names are validated when written, but refs.json may have been edited by hand.
                 let n = clean_line(&n);
-                println!("{n:<32} {:<19} {p:<24} {}", &d.to_string()[..19], human_size(s));
+                println!("{n:<32} {:<19} {k:<8} {p:<24} {}", &d.to_string()[..19], human_size(s));
             }
         }
         Cmd::Rebase {
@@ -729,6 +757,7 @@ fn run(cli: Cli) -> Result<()> {
                 r.cache_entries_removed
             );
         }
+        Cmd::Snapshot { cmd } => snapshot_cmd::run(open_store(&cli)?, cmd)?,
         Cmd::Run(_) => unreachable!("handled in main"),
         Cmd::Bench {
             path,

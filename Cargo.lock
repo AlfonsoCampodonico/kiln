@@ -846,6 +846,7 @@ dependencies = [
  "kiln-proto",
  "kiln-registry",
  "kiln-run",
+ "kiln-snapshot",
  "kiln-store",
  "predicates",
  "rlimit",
@@ -946,6 +947,21 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "tempfile",
+ "thiserror",
+ "vmkit",
+]
+
+[[package]]
+name = "kiln-snapshot"
+version = "0.1.0"
+dependencies = [
+ "kiln-oci",
+ "kiln-registry",
+ "kiln-store",
+ "libc",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "vmkit",
@@ -1963,13 +1979,14 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "vmkit"
 version = "0.1.0"
-source = "git+https://github.com/AlfonsoCampodonico/vmkit?rev=272879ce3c692925838972e35cfdae9615800fa5#272879ce3c692925838972e35cfdae9615800fa5"
+source = "git+https://github.com/AlfonsoCampodonico/vmkit?rev=d2fb6215b15e8611da0eb1af6543d2c892816932#d2fb6215b15e8611da0eb1af6543d2c892816932"
 dependencies = [
  "libc",
  "rustix",
  "seccompiler",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

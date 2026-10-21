@@ -16,12 +16,10 @@ serde_json = "1.0.151"
 thiserror = "2.0.21"
 
 # The VMMs run on Linux only; elsewhere `kiln run` explains how to use a Lima VM.
-# Pinned to the commit where port forwards name their host address and `allow`
-# entries covering the host are refused (vmkit's forward-bind-address).
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.5", features = ["event", "net", "pipe", "stdio", "termios"] }
 signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
-vmkit = { git = "https://github.com/AlfonsoCampodonico/vmkit", rev = "272879ce3c692925838972e35cfdae9615800fa5" }
+vmkit.workspace = true
 
 [dev-dependencies]
 kiln-erofs = { path = "../kiln-erofs" }
