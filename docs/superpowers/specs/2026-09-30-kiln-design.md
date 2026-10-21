@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.11: 2026-10-11)
-**Status:** Draft rev 2.11, awaiting review
+**Date:** 2026-09-30 (rev 2.12: 2026-10-21)
+**Status:** Draft rev 2.12, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:**
 - `../../../../ROADMAP.md`: the three-repo roadmap (`vmkit`, `kiln`, `potter`).
@@ -32,7 +32,6 @@
   - DNS and port forwards are DNAT'd, and pasta handles loopback resolver stubs;
   - `deny-all` honours `allow`;
   - pasta's version floor is documented rather than checked.
-
 - **rev 2.5 (2026-10-03):** §4.2 aligned with the validated M1b-2 plan:
   - T2's exception applies only to registries without a public address, and only to their own address classes;
   - tags are resolved HEAD-first, so a warm convert costs no Docker Hub pull;
@@ -91,6 +90,11 @@
   - **Stopping (ruling 3):** the first process to exit (a service or the main process), or `Shutdown`, ends the run. The others stop in reverse start order, each with its own stop signal; the grace period is split evenly between the processes still to stop, and one that has not exited when its share ends gets SIGKILL before the next gets its stop signal, so a stuck nginx no longer costs php-fpm its SIGQUIT. The sequence stays within the grace period; the host's stop deadline is unchanged (§9.6).
   - **Reporting:** `Exited` carries the status of the process whose exit ended the run, naming it when it was a service, or after `Shutdown` the main process's; `kiln run` exits with it and prints which service ended the run (§9.5, §9.7).
   - **Sharing:** services share the main process's stdout and stderr (with `-t`, the terminal, never as their controlling terminal or input); `kiln run --env` values reach every service as well as the main process; forwarded signals go to the main process only (§9.6, §9.7).
+- **rev 2.12 (2026-10-21):** adds `kiln rebase` (§16): swap the base layers under an image for a patched base without rebuilding. It is a primitive `potter rebase` and other registry-side rebasers can share.
+  - `kiln convert --base NAME` records the base/app boundary in the config (§5.1, §16.2).
+  - §6.4 squashes the base and the app separately when a boundary is recorded, so no squashed layer straddles it.
+  - Layers that inherited parents are re-finalised against the new base (§16.4).
+  - Gates refuse with a reason (§16.3). The shadowed-path gate compares, in both bases' merged views, every path the app layers shadow.
 ---
 
 ## 1. Goals
@@ -250,7 +254,7 @@ VMM-neutral VM lifecycle, sandboxing, networking and kernel profiles.
 | `kiln-init` | Static musl PID 1 for the guest, including the guest side of the control protocol. Gains `services` (M3d), build mode (M3e), and exec, stats, OOM reports and file updates (M4) (§9.8). | — (guest only) |
 | `kiln-proto` | Control-protocol message types and framing, shared by `kiln-init` and every host side: `kiln run`, potter and `kiln-shim` (§9.5, §9.8). | `serde` |
 | `kiln-image` | `kiln` image manifest and config types; assembly; run-time verification of kernel and init (§8.1). | `kiln-oci`, `kiln-erofs`, `kiln-store` |
-| `kiln` (bin) | CLI: `convert`, `build` (backend dispatch, §6), `pull`, `push`, `import`, `run`, `inspect`, `ls`, `gc`, `bench`. | all of the above, `vmkit` |
+| `kiln` (bin) | CLI: `convert`, `build` (backend dispatch, §6), `pull`, `push`, `import`, `rebase`, `run`, `inspect`, `ls`, `gc`, `bench`. | all of the above, `vmkit` |
 | `kiln-shim` (bin, M4) | containerd shim v2 `io.containerd.kiln.v2`, one microVM per pod, behind the RuntimeClass `kiln`. Specified in `2026-10-05-kiln-shim-design.md`. | `kiln-proto`, `kiln-image`, `vmkit` (exact set designed in M4) |
 
 potter depends on `kiln-oci`, `kiln-erofs`, `kiln-image`, `kiln-store`, `kiln-registry` and `kiln-proto` (potter spec §4). kiln never depends on potter's crates: that would be a cycle, so `kiln build` runs the `potter` binary instead (§6).
@@ -280,6 +284,8 @@ A `kiln` image is an OCI 1.1 artifact.
   - `source`: `{ manifestDigest, reference? }`. `reference` is present only for registry inputs, normalised (e.g. `docker.io/library/php:8.4-cli`). Local inputs omit it, keeping manifests deterministic.
   - `erofsFormatVersion`
   - `services` (M3d, omitted when empty): processes `kiln-init` starts before the main process, from the source config's `dev.kiln.services` label (§9.8). A config with services has `schemaVersion` 2, one without keeps 1, so a kiln older than M3d refuses an image with services (rev 2.11).
+  - `labels`: the source config's labels, omitted when empty.
+  - `base` (only for `convert --base`, §16.2): `{ name, manifestDigest, layers, sourceLayers }`. The image's bottom `layers` kiln layers are the base's, and they came from its first `sourceLayers` OCI layers.
   - There is **no** kernel cmdline field (T4). There is **no** `kiln` version field, so patch releases that produce identical output produce identical digests.
 - **Layers, in boot order:**
   1. Kernel: `application/vnd.kiln.kernel.v1`.
@@ -391,6 +397,9 @@ The VM's device budget is `max_virtio_devices` minus the fixed devices: the init
 - **Whiteouts:** the squashed layer is always the bottom of the stack, so all whiteout markers and opaque xattrs are applied and then **removed** from its output.
 - **Data:** data extents orphaned by later replacements are not copied.
 - **Cache key:** SHA-256 of the ordered erofs digests plus `erofsFormatVersion`.
+- **With a recorded base (§16.2):** the base and the app are squashed separately, so no layer mixes base and app content.
+  - The base half is the base image's own layer list, unchanged.
+  - The app half gets `--max-layers` minus the base's layer count (at least 1, else `convert` refuses). When it has more layers than that, its bottom ones are merged as an **upper** squash: whiteouts and opaque markers that may hide base content are kept, and a directory that replaces a lower non-directory becomes opaque.
 - **At run time:** if an image's app layers exceed the device budget for the chosen backend, `kiln run` fails with a message telling the user to re-convert with a lower `--max-layers`. There is no squashing at run time.
 
 ### 6.5 Init, kernel, commit
@@ -906,3 +915,102 @@ Each item has a defined fallback, so none blocks the design.
   - `docs/architecture.md`.
   - `docs/security.md`: the threat model, sandbox and egress defaults.
 - **License:** Apache-2.0.
+
+---
+
+## 16. Rebase
+
+`kiln rebase OLD NEW IMAGE --tag NAME` swaps the base layers under `IMAGE` from `OLD` to `NEW`, usually a patched build of the same base, without rebuilding the app. The app's layers are reused byte for byte, except those whose bytes depend on the base (§16.4). Every gate in §16.3 must pass first, or nothing is tagged.
+
+It is one primitive with two callers:
+- **`potter rebase`** (potter spec §16): the composite of catalog layers is the base, and `runtime_steps` plus the export layer are the app.
+- **Rebasing converted OCI images:** patching a fleet of images built `FROM` a shared base, such as app images on a language base. Here the base is an ordinary OCI image converted by kiln. potter's rule that images on OCI bases are never rebased does not apply to kiln: kiln's gates (§16.3), and above all the shadowed-path gate, catch what made that rule necessary.
+
+### 16.1 Why the gates exist
+
+A registry-side OCI rebase (restack the app's layer blobs on a patched base) is safe only if the app's layers do not depend on the bytes they cover. The case that motivated this section is a common one:
+- A Dockerfile step runs `sed -i` over the base's `/usr/local/etc/php-fpm.d/*.conf`.
+- That copies `www.conf` up into an app layer. The copy references `${FPM_REQUEST_TERMINATE_TIMEOUT_SEC}`, which an older base did not define.
+- A rebase that passed every label gate would produce an image whose php-fpm does not start.
+
+The env gate catches that instance. The general fix is the shadowed-path gate: a file the app copied up from the old base must be identical in the new base, otherwise the app's copy is stale. kiln can check this cheaply because its readers see each base's merged view directly from its erofs layers.
+
+### 16.2 The base/app boundary
+
+`kiln convert SRC --base NAME` names the base, a kiln image already in the store. Typically it is `kiln convert` of the image's `FROM` image.
+- **How the boundary is found.** `convert` converts every layer of `SRC` as usual, then looks for a `k` such that the kiln layers of `SRC`'s first `k` OCI layers, squashed as `NAME` was (§6.4), are exactly `NAME`'s layers.
+  - Only erofs digests are compared, so the match is exact and needs neither `NAME`'s source manifest nor any trust in annotations (T1).
+  - When `NAME`'s bottom layer is a squash, its `dev.kiln.source.digests` annotation is used only as a *hint* for how many layers it merged. The squash digest is then recomputed (normally from `cache/squash`) and compared. Without a usable hint, every candidate is tried, tail first.
+  - If there is no match, `convert` fails: the image is not built on that base. If `k` is all of `SRC`'s layers, it also fails: there is nothing to rebase.
+- **Alternatives rejected:**
+  - A `--base` that takes an OCI reference would resolve and convert a second image on every `convert`. Converting the base once and naming the kiln image is cheaper, and it is what `rebase` needs anyway.
+  - OCI's `org.opencontainers.image.base.{name,digest}` annotations are optional: BuildKit writes them only on request. They name a registry manifest kiln may not have, and annotations never drive behaviour (T1). A later `--base auto` may use them to *find* a candidate in the store, which would then be verified exactly as above.
+- **The record:** `config.base = { name, manifestDigest, layers, sourceLayers }`. It is in the config, so the manifest digest covers it.
+  - `name` is informational.
+  - `manifestDigest` is the base's kiln manifest for this platform.
+  - `layers` is the count of the image's bottom kiln layers that are the base's.
+  - `sourceLayers` is `k`.
+- **Squash** happens on each side of the boundary separately (§6.4).
+- `kiln rebase` refuses images without a record. An image converted without `--base` must be re-converted with it, which is cheap, since every layer is a cache hit.
+
+### 16.3 Gates
+
+Each gate is a pure function in `kiln-image` with its own unit tests. `rebase` evaluates all of them and reports every refusal at once, each with its gate's name and the reason, so an operator sees the whole picture.
+
+| Gate | Refuses when |
+|---|---|
+| `platform` | `OLD`, `NEW` and the `IMAGE` entry differ in os, architecture or variant. A variant is compared only when both sides name one, since single-manifest kiln images do not record it. Every platform of `IMAGE` must exist in `OLD` and `NEW`. |
+| `bottom` | `IMAGE` has no base record; or its bottom `base.layers` layer digests differ from `OLD`'s layers. If the record's `manifestDigest` differs from `OLD`'s but the layers match, the rebase goes ahead: same layers, re-converted config. |
+| `distro` | `/etc/os-release` (or `/usr/lib/os-release`), read from each base's merged view with symlinks followed, shows a different `ID`, or a different release: `VERSION_CODENAME` when both have one, else the first two components of `VERSION_ID`. A file present in only one base also refuses. Neither having one (scratch, distroless) passes. |
+| `runtime` | A label ending in `.version` on `OLD` (`php.version=8.4.12`) is missing on `NEW` or has a different `major.minor`. |
+| `env` | `NEW` drops an environment variable `OLD` defines. |
+| `process` | `OLD` and `NEW` differ in entrypoint, cmd, user, working directory or stop signal. |
+| `shadow` | See below. |
+
+**The shadowed-path gate.**
+- **The shadowed set.** Walk every app layer, after re-finalisation (§16.4), one source layer at a time. Take every path it contains, including whiteouts and opaque directories. Exclude the layer's implicit directories: their attributes are re-derived from the new base, so they follow it by construction.
+- **The check.** For each path `P`, look it up in `OLD`'s and `NEW`'s merged views (`kiln-erofs` `Merged`, with whiteouts and opaque markers applied). If `P` is in neither, it passes. If it is in only one, the gate refuses: the base added or removed a file the app shadows. If it is in both, the two entries must match:
+  - type, permission bits, uid, gid, and xattrs (overlay xattrs excluded);
+  - for regular files, size and content (SHA-256);
+  - symlink target and device numbers.
+- **mtime is not compared.** Package upgrades rewrite mtimes of unchanged files, and the guest sees the app's own copy's mtime anyway. A content or permission difference is what makes the app's copy stale.
+- **Directories:** the app's directory replaces only the base directory's attributes; its children merge. So a non-opaque app directory compares attributes only, and the base's children are checked only when the app touches them.
+- **Whole subtrees:** a whiteout, an opaque directory, or a non-directory hides the base's whole subtree at `P`. The union of both bases' subtrees under `P` is compared path by path, so a base that adds a file under a directory the app made opaque also refuses.
+- **Limits:**
+  - The refusal lists up to 20 differing paths and the total count.
+  - A directory that was implicit and was then described later in the same layer (§6.3 rule 5) is excluded with the implicit ones, so a change to its own header is not caught. This is a documented gap.
+
+### 16.4 Re-finalising app layers
+
+- **Where the app's layers come from.** Rebase re-derives the app half from its source OCI layers, which `config.source.manifestDigest` names. That manifest and its config must still be in the store (§6.1 stores them).
+- **For each app source layer, bottom-up**, with the new base's layers plus the app layers already done as lowers:
+  - **Cache entry `erofs <digest>`.** The layer has no implicit directories and is reused byte for byte.
+  - **Cache entry `parents [paths]`.** Re-resolve the paths in the **new** merged view and compute the new `ctx` (§6.3).
+    - On a `cache/layers-ctx` hit, the layer is reused.
+    - On a miss, re-stream the cached source tar, verify it against its `diff_id` (§6.1) and finalise it with the new attributes.
+  - **No entry** (a cleared cache): the layer is converted from its source tar, as `convert` would.
+- **Missing sources.** If a source tar a layer needs is no longer in the store, rebase fails, names the layer, and says to re-convert. `gc` drops source blobs today, so an inheriting layer's tar survives only until the next `gc`. Making `gc` keep the sources of inheriting layers of images that record a base is a follow-up.
+- **Squash and report.** The app half is squashed again for the new base's layer count (§6.4).
+  - Rebase reports, per app layer, whether it was reused or changed.
+  - It reports how many source layers were re-finalised.
+
+### 16.5 The rebased image
+
+- **Layers:** `NEW`'s layers, then the app half.
+- **Config:** `IMAGE`'s config with these changes.
+  - **`base`:** points at `NEW`.
+  - **`source`:** unchanged. The app's provenance is still the source manifest.
+  - **`env`:** a variable whose value in `IMAGE` equals `OLD`'s value was inherited, so it takes `NEW`'s value. A variable the app set itself, so that its value differs from `OLD`'s, is kept. Variables `NEW` adds are appended in `NEW`'s order.
+  - **`labels`:** the same rule, keyed by name. An inherited label that `NEW` drops is dropped.
+  - Entrypoint, cmd, user, working directory and stop signal are kept from `IMAGE`. The `process` gate guarantees the base did not change them.
+- **Determinism:** rebase is deterministic. Rebasing the same inputs twice gives the same digest, and rebasing back onto `OLD` gives `IMAGE`'s layers again.
+
+### 16.6 CLI
+
+```
+kiln rebase OLD NEW IMAGE --tag NAME [--max-layers N] [--json]
+```
+
+- Exit status: 0 on success, 1 on a refusal or error.
+- The text output lists each app layer as `reused` or `changed`.
+- A refusal prints `rebase refused:`, then one line per failed gate: `- <gate>: <reason>`.
