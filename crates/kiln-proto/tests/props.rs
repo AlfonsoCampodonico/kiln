@@ -61,6 +61,8 @@ fn config() -> impl Strategy<Value = Config> {
                     prefix_len: 30,
                     gateway: Ipv4Addr::new(172, 30, 0, 1),
                     dns: vec![Ipv4Addr::new(172, 30, 0, 1)],
+                    search: Vec::new(),
+                    options: Vec::new(),
                     ipv6: (blocks % 2 == 0).then(|| Ipv6Network {
                         address: "fd76:6d6b:6974::2".parse().unwrap(),
                         prefix_len: 64,

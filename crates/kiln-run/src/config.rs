@@ -88,6 +88,8 @@ pub fn build(image: &ImageProcess, opts: &RunOptions, rt: &Runtime) -> Result<Co
             prefix_len: PREFIX,
             gateway: GATEWAY,
             dns: vec![GATEWAY],
+            search: Vec::new(),
+            options: Vec::new(),
             ipv6: rt.ipv6.then_some(Ipv6Network {
                 address: GUEST6,
                 prefix_len: PREFIX6,
@@ -214,6 +216,8 @@ mod tests {
                 prefix_len: 30,
                 gateway: GATEWAY,
                 dns: vec![GATEWAY],
+                search: Vec::new(),
+                options: Vec::new(),
                 ipv6: Some(Ipv6Network {
                     address: "fd76:6d6b:6974::2".parse().unwrap(),
                     prefix_len: 64,

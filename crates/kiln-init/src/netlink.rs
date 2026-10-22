@@ -28,6 +28,8 @@ const RT_TABLE_MAIN: u8 = 254;
 const RTPROT_BOOT: u8 = 3;
 const RT_SCOPE_UNIVERSE: u8 = 0;
 const RTN_UNICAST: u8 = 1;
+/// The gateway is on the link even though no address's prefix covers it.
+const RTNH_F_ONLINK: u32 = 4;
 
 const HEADER: usize = 16;
 
@@ -88,17 +90,19 @@ pub fn add_address6(seq: u32, index: u32, addr: Ipv6Addr, prefix: u8) -> Vec<u8>
     finish(m)
 }
 
-/// `ip route add default via <gateway> dev <index>`.
-pub fn add_default_route(seq: u32, index: u32, gateway: Ipv4Addr) -> Vec<u8> {
-    default_route(seq, index, AF_INET, &gateway.octets())
+/// `ip route add default via <gateway> dev <index> [onlink]`: on-link when the gateway
+/// is outside the interface's prefix (a CNI's `/32` pod address).
+pub fn add_default_route(seq: u32, index: u32, gateway: Ipv4Addr, onlink: bool) -> Vec<u8> {
+    let flags = if onlink { RTNH_F_ONLINK } else { 0 };
+    default_route(seq, index, AF_INET, &gateway.octets(), flags)
 }
 
 /// `ip -6 route add default via <gateway> dev <index>`.
 pub fn add_default_route6(seq: u32, index: u32, gateway: Ipv6Addr) -> Vec<u8> {
-    default_route(seq, index, AF_INET6, &gateway.octets())
+    default_route(seq, index, AF_INET6, &gateway.octets(), 0)
 }
 
-fn default_route(seq: u32, index: u32, family: u8, gateway: &[u8]) -> Vec<u8> {
+fn default_route(seq: u32, index: u32, family: u8, gateway: &[u8], flags: u32) -> Vec<u8> {
     let mut m = header(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, seq);
     m.extend_from_slice(&[
         family,
@@ -110,7 +114,7 @@ fn default_route(seq: u32, index: u32, family: u8, gateway: &[u8]) -> Vec<u8> {
         RT_SCOPE_UNIVERSE,
         RTN_UNICAST,
     ]);
-    m.extend_from_slice(&0u32.to_ne_bytes()); // rtm_flags
+    m.extend_from_slice(&flags.to_ne_bytes()); // rtm_flags
     attr(&mut m, RTA_GATEWAY, gateway);
     attr(&mut m, RTA_OIF, &index.to_ne_bytes());
     finish(m)
@@ -161,9 +165,17 @@ mod tests {
         assert_eq!(&a[16..20], &[AF_INET, 30, 0, 0]);
         assert_eq!(&a[28..32], &[172, 30, 0, 2]);
 
-        let r = add_default_route(3, 3, Ipv4Addr::new(172, 30, 0, 1));
+        let r = add_default_route(3, 3, Ipv4Addr::new(172, 30, 0, 1), false);
         assert_eq!(r.len(), 16 + 12 + 8 + 8);
         assert_eq!(&r[32..36], &[172, 30, 0, 1]);
+        assert_eq!(u32::from_ne_bytes(r[24..28].try_into().unwrap()), 0, "rtm_flags");
+    }
+
+    /// A gateway outside the address's prefix (a `/32` pod address) is reached on-link.
+    #[test]
+    fn a_default_route_can_be_on_link() {
+        let r = add_default_route(3, 3, Ipv4Addr::new(169, 254, 1, 1), true);
+        assert_eq!(u32::from_ne_bytes(r[24..28].try_into().unwrap()), RTNH_F_ONLINK);
     }
 
     #[test]

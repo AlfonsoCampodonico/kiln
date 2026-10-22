@@ -398,6 +398,8 @@ fn networking_from_config(backend: Backend) {
         prefix_len: PREFIX,
         gateway: GATEWAY,
         dns: vec![GATEWAY],
+        search: Vec::new(),
+        options: Vec::new(),
         ipv6: Some(Ipv6Network {
             address: GUEST6,
             prefix_len: PREFIX6,

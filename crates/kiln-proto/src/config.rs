@@ -13,6 +13,8 @@ pub const MAX_LAYERS: u32 = 128;
 pub const MIN_SCRATCH_BYTES: u64 = 64 << 20;
 /// The most `nameserver` lines resolv.conf honours.
 const MAX_DNS: usize = 3;
+/// The most `search` domains glibc's resolver honours.
+const MAX_SEARCH: usize = 6;
 
 /// One run's configuration, sent once in answer to the guest's `Hello`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,7 +70,9 @@ impl Process {
     }
 }
 
-/// `eth0`'s address, gateway and resolvers (vmkit's tap network, spec §9.3).
+/// `eth0`'s address, gateway and resolvers: vmkit's tap network (spec §9.3), or a pod's
+/// own address under kiln-shim. A gateway outside the prefix is routed to on-link (a
+/// CNI's `/32` pod address with a link-local gateway).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Network {
@@ -76,6 +80,12 @@ pub struct Network {
     pub prefix_len: u8,
     pub gateway: Ipv4Addr,
     pub dns: Vec<Ipv4Addr>,
+    /// `search` domains for resolv.conf (a pod's cluster domains); omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub search: Vec<String>,
+    /// resolv.conf `options` (e.g. `ndots:5`); omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
     /// `eth0`'s IPv6 address and default route, when the VM has IPv6 egress. DNS stays on
     /// the IPv4 resolvers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,14 +192,25 @@ impl Config {
 }
 
 impl Network {
+    fn mask(&self) -> u32 {
+        u32::MAX.checked_shl(32 - u32::from(self.prefix_len)).unwrap_or(0)
+    }
+
+    /// The gateway is inside the address's prefix; otherwise the route to it is on-link.
+    pub fn gateway_in_prefix(&self) -> bool {
+        let mask = self.mask();
+        u32::from(self.address) & mask == u32::from(self.gateway) & mask
+    }
+
     fn validate(&self) -> Result<()> {
-        if !(8..=30).contains(&self.prefix_len) {
+        if !(8..=32).contains(&self.prefix_len) {
             return Err(invalid(format!("network prefix /{}", self.prefix_len)));
         }
-        let mask = u32::MAX << (32 - u32::from(self.prefix_len));
+        let mask = self.mask();
         let (addr, gw) = (u32::from(self.address), u32::from(self.gateway));
-        let host = addr & !mask;
-        if addr & mask != gw & mask || addr == gw || host == 0 || host == !mask {
+        // On prefixes up to /30 the all-zeros and all-ones hosts are the network and broadcast.
+        let reserved = |a: u32| self.prefix_len <= 30 && (a & !mask == 0 || a & !mask == !mask);
+        if addr == gw || reserved(addr) || (self.gateway_in_prefix() && reserved(gw)) {
             return Err(invalid(format!(
                 "address {}/{} with gateway {}",
                 self.address, self.prefix_len, self.gateway
@@ -197,6 +218,19 @@ impl Network {
         }
         if self.dns.len() > MAX_DNS {
             return Err(invalid(format!("{} DNS servers (at most {MAX_DNS})", self.dns.len())));
+        }
+        if self.search.len() > MAX_SEARCH {
+            return Err(invalid(format!(
+                "{} search domains (at most {MAX_SEARCH})",
+                self.search.len()
+            )));
+        }
+        let word = |s: &str, max: usize| (1..=max).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_graphic());
+        if let Some(d) = self.search.iter().find(|d| !word(d, 253)) {
+            return Err(invalid(format!("search domain {d:?}")));
+        }
+        if let Some(o) = self.options.iter().find(|o| !word(o, 64)) {
+            return Err(invalid(format!("resolver option {o:?}")));
         }
         if let Some(n) = &self.ipv6 {
             n.validate()?;
@@ -274,6 +308,8 @@ mod tests {
                 prefix_len: 30,
                 gateway: Ipv4Addr::new(172, 30, 0, 1),
                 dns: vec![Ipv4Addr::new(172, 30, 0, 1)],
+                search: Vec::new(),
+                options: Vec::new(),
                 ipv6: Some(Ipv6Network {
                     address: "fd76:6d6b:6974::2".parse().unwrap(),
                     prefix_len: 64,
@@ -348,10 +384,35 @@ mod tests {
                 Box::new(|c| c.scratch.size_bytes = MIN_SCRATCH_BYTES - 4096),
             ),
             ("scratch unaligned", Box::new(|c| c.scratch.size_bytes = (1 << 30) + 1)),
-            ("prefix", Box::new(|c| c.network.as_mut().unwrap().prefix_len = 31)),
+            ("prefix", Box::new(|c| c.network.as_mut().unwrap().prefix_len = 7)),
+            ("prefix long", Box::new(|c| c.network.as_mut().unwrap().prefix_len = 33)),
             (
-                "gateway",
-                Box::new(|c| c.network.as_mut().unwrap().gateway = Ipv4Addr::new(10, 0, 0, 1)),
+                "gateway is the network",
+                Box::new(|c| c.network.as_mut().unwrap().gateway = Ipv4Addr::new(172, 30, 0, 0)),
+            ),
+            (
+                "search count",
+                Box::new(|c| c.network.as_mut().unwrap().search = vec!["a".into(); 7]),
+            ),
+            (
+                "search long",
+                Box::new(|c| c.network.as_mut().unwrap().search = vec!["a".repeat(254)]),
+            ),
+            (
+                "search space",
+                Box::new(|c| c.network.as_mut().unwrap().search = vec!["a b".into()]),
+            ),
+            (
+                "search empty",
+                Box::new(|c| c.network.as_mut().unwrap().search = vec![String::new()]),
+            ),
+            (
+                "option space",
+                Box::new(|c| c.network.as_mut().unwrap().options = vec!["ndots: 5".into()]),
+            ),
+            (
+                "option NUL",
+                Box::new(|c| c.network.as_mut().unwrap().options = vec!["a\0".into()]),
             ),
             (
                 "address is gateway",
@@ -390,6 +451,46 @@ mod tests {
             mutate(&mut c);
             assert!(c.validate().is_err(), "{name} was accepted");
         }
+    }
+
+    #[test]
+    fn search_domains_and_resolver_options_round_trip_and_are_optional() {
+        let mut c = config();
+        let n = c.network.as_mut().unwrap();
+        n.search = vec!["default.svc.cluster.local".into(), "svc.cluster.local".into()];
+        n.options = vec!["ndots:5".into()];
+        c.validate().unwrap();
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"search\":[\"default.svc.cluster.local\""), "{json}");
+        assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), c);
+        let plain = serde_json::to_string(&config()).unwrap();
+        assert!(!plain.contains("search") && !plain.contains("options"), "{plain}");
+        assert!(
+            serde_json::from_str::<Config>(&plain)
+                .unwrap()
+                .network
+                .unwrap()
+                .search
+                .is_empty()
+        );
+    }
+
+    /// A pod IP can be a /32 with a gateway outside it (Calico's 169.254.1.1): the guest
+    /// routes to it on-link.
+    #[test]
+    fn a_gateway_outside_the_prefix_is_on_link() {
+        let mut c = config();
+        let n = c.network.as_mut().unwrap();
+        n.address = Ipv4Addr::new(10, 244, 1, 5);
+        n.prefix_len = 32;
+        n.gateway = Ipv4Addr::new(169, 254, 1, 1);
+        c.validate().unwrap();
+        assert!(!c.network.as_ref().unwrap().gateway_in_prefix());
+        assert!(config().network.unwrap().gateway_in_prefix());
+        let mut c = config();
+        c.network.as_mut().unwrap().prefix_len = 31;
+        c.network.as_mut().unwrap().gateway = Ipv4Addr::new(172, 30, 0, 3);
+        c.validate().unwrap();
     }
 
     #[test]

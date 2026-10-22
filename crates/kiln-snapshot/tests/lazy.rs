@@ -79,6 +79,7 @@ fn a_snapshot_pulled_lazily_restores_from_the_registry() {
         memory_mib: 256,
         vsock: Some(VsockSpec { guest_cid: 3 }),
         net: None,
+        tap: None,
         console_log: run.path().join("console.log"),
         run_dir: run.path().to_path_buf(),
     };
