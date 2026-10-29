@@ -130,10 +130,20 @@ pub fn check_relative_path(name: &'static str, path: &str) -> Result<()> {
 }
 
 /// An absolute path in the guest: no NUL or control character, no `.` or `..`
-/// component, and not `/` itself.
+/// component, not `/` itself, and not at or under `/proc`, `/sys` or `/dev`, which init
+/// mounts itself (and reaches its own volumes through `/proc`).
 pub fn check_absolute_path(name: &'static str, path: &str) -> Result<()> {
     match path.strip_prefix('/') {
-        Some(rest) if !rest.is_empty() && check_components(rest) => Ok(()),
+        Some(rest) if !rest.is_empty() && check_components(rest) => {
+            let first = rest.split('/').next().unwrap_or(rest);
+            if ["proc", "sys", "dev"].contains(&first) {
+                return Err(invalid(
+                    name,
+                    format!("mount path {path:?} is under /{first}, which init provides"),
+                ));
+            }
+            Ok(())
+        }
         _ => Err(invalid(
             name,
             format!("mount path {path:?} is not an absolute path below /"),
@@ -305,7 +315,9 @@ mod tests {
         for ok in ["/etc/config", "/var/run/secrets/kubernetes.io/serviceaccount", "/data/"] {
             check_absolute_path("t", ok).unwrap();
         }
-        for bad in ["/", "relative", "/a/../b", "/a/./b", "/a//b", "", "/a\nb"] {
+        for bad in [
+            "/", "relative", "/a/../b", "/a/./b", "/a//b", "", "/a\nb", "/proc", "/proc/x", "/sys/fs", "/dev/shm",
+        ] {
             assert!(check_absolute_path("t", bad).is_err(), "{bad:?}");
         }
         let v = |kind| Volume {

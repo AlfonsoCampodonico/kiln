@@ -5,11 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use containerd_shim::protos::events::task::{TaskCreate, TaskDelete, TaskExit, TaskIO, TaskStart};
+use containerd_shim::protos::events::task::{
+    TaskCreate, TaskDelete, TaskExecAdded, TaskExecStarted, TaskExit, TaskIO, TaskStart,
+};
 use containerd_shim::protos::protobuf::well_known_types::timestamp::Timestamp;
 use containerd_shim::protos::protobuf::{MessageDyn, MessageField};
 use containerd_shim::protos::topics::{
-    TASK_CREATE_EVENT_TOPIC, TASK_DELETE_EVENT_TOPIC, TASK_EXIT_EVENT_TOPIC, TASK_START_EVENT_TOPIC,
+    TASK_CREATE_EVENT_TOPIC, TASK_DELETE_EVENT_TOPIC, TASK_EXEC_ADDED_EVENT_TOPIC, TASK_EXEC_STARTED_EVENT_TOPIC,
+    TASK_EXIT_EVENT_TOPIC, TASK_START_EVENT_TOPIC,
 };
 use containerd_shim::protos::ttrpc::{self, Code};
 use containerd_shim::protos::types::introspection::{RuntimeInfo, RuntimeVersion};
@@ -118,12 +121,9 @@ fn timestamp(t: SystemTime) -> Timestamp {
     ts
 }
 
-fn no_exec(exec_id: &str) -> TtrpcResult<()> {
-    if exec_id.is_empty() {
-        Ok(())
-    } else {
-        Err(status(Error::NotFound(format!("exec {exec_id} not found"))))
-    }
+/// A request's exec id: `None` names the task itself.
+fn exec_id(exec_id: &str) -> Option<&str> {
+    (!exec_id.is_empty()).then_some(exec_id)
 }
 
 /// The runtime options CRI sends (`runtimeoptions.v1.Options`), when the request has them.
@@ -293,30 +293,44 @@ impl containerd_shim::Task for Service {
     }
 
     fn start(&self, _ctx: &TtrpcContext, req: api::StartRequest) -> TtrpcResult<api::StartResponse> {
-        no_exec(&req.exec_id)?;
         let mut resp = api::StartResponse::new();
-        resp.pid = self.tasks.start(&req.id).map_err(status)?;
+        resp.pid = match exec_id(&req.exec_id) {
+            None => self.tasks.start(&req.id),
+            Some(x) => self.tasks.start_exec(&req.id, x),
+        }
+        .map_err(status)?;
         Ok(resp)
     }
 
     fn kill(&self, _ctx: &TtrpcContext, req: api::KillRequest) -> TtrpcResult<api::Empty> {
-        no_exec(&req.exec_id)?;
+        let exec = exec_id(&req.exec_id);
         match req.signal {
             // As kill(2): signal 0 only checks that the task is there.
             0 => {
-                self.tasks.state(&req.id).map_err(status)?;
+                match exec {
+                    None => self.tasks.state(&req.id),
+                    Some(x) => self.tasks.exec_state(&req.id, x),
+                }
+                .map_err(status)?;
             }
             // kiln-proto forwards 1-31; anything else would be a protocol violation, which
             // kills the VM.
-            1..=31 => self.tasks.kill(&req.id, req.signal as i32).map_err(status)?,
+            1..=31 => match exec {
+                None => self.tasks.kill(&req.id, req.signal as i32),
+                Some(x) => self.tasks.kill_exec(&req.id, x, req.signal as i32),
+            }
+            .map_err(status)?,
             sig => return Err(status(Error::invalid(format!("signal {sig} (kiln forwards 1-31)")))),
         }
         Ok(api::Empty::new())
     }
 
     fn wait(&self, _ctx: &TtrpcContext, req: api::WaitRequest) -> TtrpcResult<api::WaitResponse> {
-        no_exec(&req.exec_id)?;
-        let exit = self.tasks.wait(&req.id).map_err(status)?;
+        let exit = match exec_id(&req.exec_id) {
+            None => self.tasks.wait(&req.id),
+            Some(x) => self.tasks.wait_exec(&req.id, x),
+        }
+        .map_err(status)?;
         let mut resp = api::WaitResponse::new();
         resp.exit_status = exit.code;
         resp.exited_at = MessageField::some(timestamp(exit.at));
@@ -324,8 +338,11 @@ impl containerd_shim::Task for Service {
     }
 
     fn state(&self, _ctx: &TtrpcContext, req: api::StateRequest) -> TtrpcResult<api::StateResponse> {
-        no_exec(&req.exec_id)?;
-        let s = self.tasks.state(&req.id).map_err(status)?;
+        let s = match exec_id(&req.exec_id) {
+            None => self.tasks.state(&req.id),
+            Some(x) => self.tasks.exec_state(&req.id, x),
+        }
+        .map_err(status)?;
         let mut resp = api::StateResponse::new();
         resp.id = s.id;
         resp.bundle = s.bundle;
@@ -348,8 +365,11 @@ impl containerd_shim::Task for Service {
     }
 
     fn delete(&self, _ctx: &TtrpcContext, req: api::DeleteRequest) -> TtrpcResult<api::DeleteResponse> {
-        no_exec(&req.exec_id)?;
-        let (pid, exit) = self.tasks.delete(&req.id).map_err(status)?;
+        let (pid, exit) = match exec_id(&req.exec_id) {
+            None => self.tasks.delete(&req.id),
+            Some(x) => self.tasks.delete_exec(&req.id, x),
+        }
+        .map_err(status)?;
         let mut resp = api::DeleteResponse::new();
         resp.pid = pid;
         resp.exit_status = exit.code;
@@ -367,25 +387,43 @@ impl containerd_shim::Task for Service {
         Ok(resp)
     }
 
-    fn exec(&self, _ctx: &TtrpcContext, _req: api::ExecProcessRequest) -> TtrpcResult<api::Empty> {
-        Err(status(Error::Unsupported(
-            "kiln: exec needs kiln-init exec support (kiln-shim spec §4.1)".into(),
-        )))
+    fn exec(&self, _ctx: &TtrpcContext, req: api::ExecProcessRequest) -> TtrpcResult<api::Empty> {
+        if req.exec_id.is_empty() {
+            return Err(status(Error::invalid("an exec needs an exec id")));
+        }
+        let spec = req
+            .spec
+            .as_ref()
+            .ok_or_else(|| status(Error::invalid("the exec has no process spec")))?;
+        let (process, terminal) = translate::exec_process(&spec.value).map_err(status)?;
+        let stdio = Stdio {
+            stdin: req.stdin.clone(),
+            stdout: req.stdout.clone(),
+            stderr: req.stderr.clone(),
+            terminal: terminal || req.terminal,
+        };
+        self.tasks.exec(&req.id, &req.exec_id, process, stdio).map_err(status)?;
+        Ok(api::Empty::new())
     }
 
     fn resize_pty(&self, _ctx: &TtrpcContext, req: api::ResizePtyRequest) -> TtrpcResult<api::Empty> {
-        no_exec(&req.exec_id)?;
         let clamp = |n: u32| u16::try_from(n).unwrap_or(u16::MAX);
-        self.tasks
-            .resize(&req.id, clamp(req.height), clamp(req.width))
-            .map_err(status)?;
+        let (rows, cols) = (clamp(req.height), clamp(req.width));
+        match exec_id(&req.exec_id) {
+            None => self.tasks.resize(&req.id, rows, cols),
+            Some(x) => self.tasks.resize_exec(&req.id, x, rows, cols),
+        }
+        .map_err(status)?;
         Ok(api::Empty::new())
     }
 
     fn close_io(&self, _ctx: &TtrpcContext, req: api::CloseIORequest) -> TtrpcResult<api::Empty> {
-        no_exec(&req.exec_id)?;
         if req.stdin {
-            self.tasks.close_stdin(&req.id).map_err(status)?;
+            match exec_id(&req.exec_id) {
+                None => self.tasks.close_stdin(&req.id),
+                Some(x) => self.tasks.close_stdin_exec(&req.id, x),
+            }
+            .map_err(status)?;
         }
         Ok(api::Empty::new())
     }
@@ -445,6 +483,28 @@ fn publish(publisher: &RemotePublisher, namespace: &str, event: Event) {
             e.exit_status = exit.code;
             e.exited_at = MessageField::some(timestamp(exit.at));
             (TASK_DELETE_EVENT_TOPIC, Box::new(e))
+        }
+        Event::ExecAdded { id, exec_id } => {
+            let mut e = TaskExecAdded::new();
+            e.container_id = id;
+            e.exec_id = exec_id;
+            (TASK_EXEC_ADDED_EVENT_TOPIC, Box::new(e))
+        }
+        Event::ExecStarted { id, exec_id, pid } => {
+            let mut e = TaskExecStarted::new();
+            e.container_id = id;
+            e.exec_id = exec_id;
+            e.pid = pid;
+            (TASK_EXEC_STARTED_EVENT_TOPIC, Box::new(e))
+        }
+        Event::ExecExit { id, exec_id, pid, exit } => {
+            let mut e = TaskExit::new();
+            e.container_id = id;
+            e.id = exec_id;
+            e.pid = pid;
+            e.exit_status = exit.code;
+            e.exited_at = MessageField::some(timestamp(exit.at));
+            (TASK_EXIT_EVENT_TOPIC, Box::new(e))
         }
     };
     if let Err(e) = publisher.publish(containerd_shim::Context::default(), topic, namespace, msg) {
@@ -601,7 +661,7 @@ mod tests {
     fn service_maps_errors_and_exec() {
         let (s, backend) = service();
         let err = s.exec(&ctx(), api::ExecProcessRequest::new()).unwrap_err();
-        assert_eq!(code(err), Code::UNIMPLEMENTED);
+        assert_eq!(code(err), Code::INVALID_ARGUMENT, "no exec id");
         let mut st = api::StateRequest::new();
         st.id = "nope".into();
         assert_eq!(code(s.state(&ctx(), st).unwrap_err()), Code::NOT_FOUND);
@@ -631,6 +691,54 @@ mod tests {
         let mut st = api::StateRequest::new();
         st.id = "c1".into();
         assert_eq!(s.state(&ctx(), st).unwrap().status, api::Status::STOPPED.into());
+    }
+
+    #[test]
+    fn exec_through_the_service() {
+        let (s, backend) = service();
+        let dir = bundle(CONTAINER);
+        s.create(&ctx(), create_req("c1", dir.path(), vec![mount("erofs", "/l")]))
+            .unwrap();
+        let mut start = api::StartRequest::new();
+        start.id = "c1".into();
+        let pid = s.start(&ctx(), start).unwrap().pid;
+        let mut req = api::ExecProcessRequest::new();
+        req.id = "c1".into();
+        req.exec_id = "probe".into();
+        let mut any = containerd_shim::protos::protobuf::well_known_types::any::Any::new();
+        any.type_url = "types.containerd.io/opencontainers/runtime-spec/1/Process".into();
+        any.value = br#"{"args":["cat","/ready"],"user":{"uid":0,"gid":0},"cwd":"/"}"#.to_vec();
+        req.spec = MessageField::some(any);
+        s.exec(&ctx(), req.clone()).unwrap();
+        assert_eq!(
+            code(s.exec(&ctx(), req).unwrap_err()),
+            Code::FAILED_PRECONDITION,
+            "twice"
+        );
+        let mut start = api::StartRequest::new();
+        start.id = "c1".into();
+        start.exec_id = "probe".into();
+        assert_eq!(s.start(&ctx(), start).unwrap().pid, pid);
+        let x = backend.get("c1").exec_with(1);
+        assert_eq!(x.launch.process.entrypoint, ["cat", "/ready"]);
+        let mut st = api::StateRequest::new();
+        st.id = "c1".into();
+        st.exec_id = "probe".into();
+        assert_eq!(s.state(&ctx(), st.clone()).unwrap().status, api::Status::RUNNING.into());
+        x.end(1);
+        let mut w = api::WaitRequest::new();
+        w.id = "c1".into();
+        w.exec_id = "probe".into();
+        assert_eq!(s.wait(&ctx(), w).unwrap().exit_status, 1);
+        let mut d = api::DeleteRequest::new();
+        d.id = "c1".into();
+        d.exec_id = "probe".into();
+        assert_eq!(s.delete(&ctx(), d).unwrap().exit_status, 1);
+        assert_eq!(code(s.state(&ctx(), st).unwrap_err()), Code::NOT_FOUND);
+        // The task itself is still there.
+        let mut st = api::StateRequest::new();
+        st.id = "c1".into();
+        assert_eq!(s.state(&ctx(), st).unwrap().status, api::Status::RUNNING.into());
     }
 
     #[test]

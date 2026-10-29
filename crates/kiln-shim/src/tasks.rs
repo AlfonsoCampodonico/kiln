@@ -2,6 +2,8 @@
 //! a [`Backend`] that runs their processes. One shim serves one pod: its sandbox task
 //! (the pause process) and its containers, of which at most one may be created or
 //! running at a time, so init containers run in sequence and each boots its own VM.
+//! A running container also has execs (kiln-shim exec and volumes design §5.5): extra
+//! processes in its VM, each with its own lifecycle and exit.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -65,6 +67,18 @@ impl CreateTask {
     }
 }
 
+/// The most execs a container has at once (created or running).
+pub const MAX_EXECS: usize = kiln_proto::MAX_EXECS;
+
+/// An exec to create in a container's VM.
+#[derive(Debug, Clone)]
+pub struct ExecLaunch {
+    /// The host's id for it inside the VM (S5), chosen by [`Tasks`].
+    pub id: u32,
+    pub process: kiln_proto::Process,
+    pub stdio: Stdio,
+}
+
 /// Runs tasks' processes.
 pub trait Backend: Send + Sync + 'static {
     /// Creates the process (prepared, not started).
@@ -79,6 +93,20 @@ pub trait Process: Send + Sync {
     fn resize(&self, rows: u16, cols: u16) -> Result<()>;
     fn close_stdin(&self) -> Result<()>;
     /// Blocks until the process ends; its exit code, or [`EXIT_LOST`].
+    fn wait(&self) -> u32;
+    /// Creates an exec in the process's VM (prepared, not started).
+    fn exec(&self, _exec: &ExecLaunch) -> Result<Arc<dyn ExecProcess>> {
+        Err(Error::Refused("this task runs no VM to exec in".into()))
+    }
+}
+
+/// One exec's process.
+pub trait ExecProcess: Send + Sync {
+    fn start(&self) -> Result<()>;
+    fn signal(&self, sig: i32) -> Result<()>;
+    fn resize(&self, rows: u16, cols: u16) -> Result<()>;
+    fn close_stdin(&self) -> Result<()>;
+    /// Blocks until it ends (or, never started, is killed or its VM ends): its exit code.
     fn wait(&self) -> u32;
 }
 
@@ -105,6 +133,21 @@ pub enum Event {
         pid: u32,
         exit: Exit,
     },
+    ExecAdded {
+        id: String,
+        exec_id: String,
+    },
+    ExecStarted {
+        id: String,
+        exec_id: String,
+        pid: u32,
+    },
+    ExecExit {
+        id: String,
+        exec_id: String,
+        pid: u32,
+        exit: Exit,
+    },
 }
 
 /// A task as `State` reports it.
@@ -128,6 +171,17 @@ struct Entry {
     /// A `Start` is in progress: the exit waits for it, so `Start` is published first.
     starting: bool,
     exit: Option<Exit>,
+    execs: BTreeMap<String, ExecEntry>,
+    /// The last exec id handed out in this container's VM.
+    last_exec: u32,
+}
+
+struct ExecEntry {
+    stdio: Stdio,
+    process: Arc<dyn ExecProcess>,
+    status: Status,
+    starting: bool,
+    exit: Option<Exit>,
 }
 
 type Publish = Box<dyn Fn(Event) + Send + Sync>;
@@ -146,6 +200,10 @@ pub struct Tasks {
 
 fn not_found(id: &str) -> Error {
     Error::NotFound(format!("task {id} not found"))
+}
+
+fn exec_not_found(exec_id: &str) -> Error {
+    Error::NotFound(format!("exec {exec_id} not found"))
 }
 
 impl Shared {
@@ -204,6 +262,8 @@ impl Tasks {
                 status: Status::Created,
                 starting: false,
                 exit: None,
+                execs: BTreeMap::new(),
+                last_exec: 0,
             },
         );
         (self.shared.publish)(Event::Create {
@@ -342,6 +402,197 @@ impl Tasks {
         self.process(id)?.close_stdin()
     }
 
+    /// Creates exec `exec_id` in running task `id` from `process` and `stdio`.
+    pub fn exec(&self, id: &str, exec_id: &str, process: kiln_proto::Process, stdio: Stdio) -> Result<()> {
+        let (task, launch) = {
+            let mut tasks = self.shared.lock();
+            let e = tasks.get_mut(id).ok_or_else(|| not_found(id))?;
+            if e.status != Status::Running {
+                return Err(Error::Refused(format!("task {id} is not running")));
+            }
+            if e.execs.contains_key(exec_id) {
+                return Err(Error::Refused(format!("exec {exec_id} already exists")));
+            }
+            if e.execs.values().filter(|x| x.status != Status::Stopped).count() >= MAX_EXECS {
+                return Err(Error::Refused(format!(
+                    "kiln runs at most {MAX_EXECS} execs per container at once"
+                )));
+            }
+            e.last_exec += 1;
+            let launch = ExecLaunch {
+                id: e.last_exec,
+                process,
+                stdio: stdio.clone(),
+            };
+            (e.process.clone(), launch)
+        };
+        // Opening its FIFOs may block until containerd's side is there: outside the lock.
+        let process = task.exec(&launch)?;
+        let mut tasks = self.shared.lock();
+        let Some(e) = tasks.get_mut(id) else {
+            let _ = process.signal(SIGKILL);
+            return Err(not_found(id));
+        };
+        if e.execs.contains_key(exec_id) {
+            let _ = process.signal(SIGKILL);
+            return Err(Error::Refused(format!("exec {exec_id} already exists")));
+        }
+        e.execs.insert(
+            exec_id.into(),
+            ExecEntry {
+                stdio,
+                process: process.clone(),
+                status: Status::Created,
+                starting: false,
+                exit: None,
+            },
+        );
+        let pid = e.process.pid();
+        (self.shared.publish)(Event::ExecAdded {
+            id: id.into(),
+            exec_id: exec_id.into(),
+        });
+        drop(tasks);
+        let shared = self.shared.clone();
+        let (id, exec_id) = (id.to_string(), exec_id.to_string());
+        std::thread::Builder::new()
+            .name(format!("exec-{}", &exec_id[..exec_id.len().min(8)]))
+            .spawn(move || {
+                let code = process.wait();
+                let mut tasks = shared.lock();
+                while tasks
+                    .get(&id)
+                    .and_then(|e| e.execs.get(&exec_id))
+                    .is_some_and(|x| x.starting)
+                {
+                    tasks = shared.changed.wait(tasks).unwrap_or_else(|e| e.into_inner());
+                }
+                if let Some(x) = tasks.get_mut(&id).and_then(|e| e.execs.get_mut(&exec_id)) {
+                    let exit = Exit {
+                        code,
+                        at: SystemTime::now(),
+                    };
+                    // One that never ran ends without an exit event, as runc's.
+                    if x.status == Status::Running {
+                        (shared.publish)(Event::ExecExit {
+                            id: id.clone(),
+                            exec_id: exec_id.clone(),
+                            pid,
+                            exit,
+                        });
+                    }
+                    x.status = Status::Stopped;
+                    x.exit = Some(exit);
+                }
+                shared.changed.notify_all();
+            })?;
+        Ok(())
+    }
+
+    fn exec_process(&self, id: &str, exec_id: &str) -> Result<Arc<dyn ExecProcess>> {
+        let tasks = self.shared.lock();
+        let e = tasks.get(id).ok_or_else(|| not_found(id))?;
+        Ok(e.execs
+            .get(exec_id)
+            .ok_or_else(|| exec_not_found(exec_id))?
+            .process
+            .clone())
+    }
+
+    /// Starts a created exec; the pid it reports (its VM's).
+    pub fn start_exec(&self, id: &str, exec_id: &str) -> Result<u32> {
+        let (process, pid) = {
+            let mut tasks = self.shared.lock();
+            let e = tasks.get_mut(id).ok_or_else(|| not_found(id))?;
+            let pid = e.process.pid();
+            let x = e.execs.get_mut(exec_id).ok_or_else(|| exec_not_found(exec_id))?;
+            if x.status != Status::Created || x.starting {
+                return Err(Error::Refused(format!("exec {exec_id} is not in the created state")));
+            }
+            x.starting = true;
+            (x.process.clone(), pid)
+        };
+        let started = process.start();
+        let mut tasks = self.shared.lock();
+        if let Some(x) = tasks.get_mut(id).and_then(|e| e.execs.get_mut(exec_id)) {
+            x.starting = false;
+            if started.is_ok() && x.status == Status::Created {
+                x.status = Status::Running;
+                (self.shared.publish)(Event::ExecStarted {
+                    id: id.into(),
+                    exec_id: exec_id.into(),
+                    pid,
+                });
+            }
+        }
+        self.shared.changed.notify_all();
+        started.map(|()| pid)
+    }
+
+    /// Signals an exec; a stopped one needs nothing.
+    pub fn kill_exec(&self, id: &str, exec_id: &str, sig: i32) -> Result<()> {
+        if self.exec_state(id, exec_id)?.status == Status::Stopped {
+            return Ok(());
+        }
+        self.exec_process(id, exec_id)?.signal(sig)
+    }
+
+    /// Blocks until the exec has stopped.
+    pub fn wait_exec(&self, id: &str, exec_id: &str) -> Result<Exit> {
+        let mut tasks = self.shared.lock();
+        loop {
+            let e = tasks.get(id).ok_or_else(|| not_found(id))?;
+            match e.execs.get(exec_id) {
+                None => return Err(exec_not_found(exec_id)),
+                Some(ExecEntry { exit: Some(exit), .. }) => return Ok(*exit),
+                Some(_) => tasks = self.shared.changed.wait(tasks).unwrap_or_else(|e| e.into_inner()),
+            }
+        }
+    }
+
+    pub fn exec_state(&self, id: &str, exec_id: &str) -> Result<TaskState> {
+        let tasks = self.shared.lock();
+        let e = tasks.get(id).ok_or_else(|| not_found(id))?;
+        let x = e.execs.get(exec_id).ok_or_else(|| exec_not_found(exec_id))?;
+        Ok(TaskState {
+            id: exec_id.into(),
+            bundle: e.bundle.clone(),
+            pid: e.process.pid(),
+            status: x.status,
+            stdio: x.stdio.clone(),
+            exit: x.exit,
+        })
+    }
+
+    /// Forgets a stopped exec (a created one is killed first); its pid and exit. No event,
+    /// as runc's shim publishes none for an exec.
+    pub fn delete_exec(&self, id: &str, exec_id: &str) -> Result<(u32, Exit)> {
+        match self.exec_state(id, exec_id)?.status {
+            Status::Running => {
+                return Err(Error::Refused(format!("exec {exec_id} is running; kill it first")));
+            }
+            Status::Created => {
+                self.kill_exec(id, exec_id, SIGKILL)?;
+                self.wait_exec(id, exec_id)?;
+            }
+            Status::Stopped => {}
+        }
+        let mut tasks = self.shared.lock();
+        let e = tasks.get_mut(id).ok_or_else(|| not_found(id))?;
+        let pid = e.process.pid();
+        let x = e.execs.remove(exec_id).ok_or_else(|| exec_not_found(exec_id))?;
+        self.shared.changed.notify_all();
+        Ok((pid, x.exit.expect("a stopped exec has its exit")))
+    }
+
+    pub fn resize_exec(&self, id: &str, exec_id: &str, rows: u16, cols: u16) -> Result<()> {
+        self.exec_process(id, exec_id)?.resize(rows, cols)
+    }
+
+    pub fn close_stdin_exec(&self, id: &str, exec_id: &str) -> Result<()> {
+        self.exec_process(id, exec_id)?.close_stdin()
+    }
+
     /// No task is left: the shim may exit.
     pub fn is_empty(&self) -> bool {
         self.shared.lock().is_empty()
@@ -362,9 +613,55 @@ pub(crate) mod fake {
         rx: Mutex<Receiver<u32>>,
         pub signals: Mutex<Vec<i32>>,
         pub fail_start: bool,
+        pub execs: Mutex<BTreeMap<u32, Arc<FakeExec>>>,
+    }
+
+    /// An exec that ends when told, or on SIGKILL (137, or 137 unstarted too).
+    pub struct FakeExec {
+        tx: Mutex<Sender<u32>>,
+        rx: Mutex<Receiver<u32>>,
+        pub signals: Mutex<Vec<i32>>,
+        pub fail_start: bool,
+        pub launch: ExecLaunch,
+    }
+
+    impl FakeExec {
+        pub fn end(&self, code: u32) {
+            let _ = self.tx.lock().unwrap().send(code);
+        }
+    }
+
+    impl ExecProcess for FakeExec {
+        fn start(&self) -> Result<()> {
+            if self.fail_start {
+                self.end(EXIT_LOST);
+                return Err(Error::Internal("exec nope: not found".into()));
+            }
+            Ok(())
+        }
+        fn signal(&self, sig: i32) -> Result<()> {
+            self.signals.lock().unwrap().push(sig);
+            if sig == SIGKILL {
+                self.end(137);
+            }
+            Ok(())
+        }
+        fn resize(&self, _rows: u16, _cols: u16) -> Result<()> {
+            Ok(())
+        }
+        fn close_stdin(&self) -> Result<()> {
+            Ok(())
+        }
+        fn wait(&self) -> u32 {
+            self.rx.lock().unwrap().recv().unwrap_or(EXIT_LOST)
+        }
     }
 
     impl FakeProcess {
+        pub fn exec_with(&self, id: u32) -> Arc<FakeExec> {
+            self.execs.lock().unwrap()[&id].clone()
+        }
+
         pub fn end(&self, code: u32) {
             let _ = self.tx.lock().unwrap().send(code);
         }
@@ -402,6 +699,18 @@ pub(crate) mod fake {
         fn wait(&self) -> u32 {
             self.rx.lock().unwrap().recv().unwrap_or(EXIT_LOST)
         }
+        fn exec(&self, exec: &ExecLaunch) -> Result<Arc<dyn ExecProcess>> {
+            let (tx, rx) = channel();
+            let x = Arc::new(FakeExec {
+                tx: Mutex::new(tx),
+                rx: Mutex::new(rx),
+                signals: Mutex::new(Vec::new()),
+                fail_start: exec.process.argv().first() == Some(&"nope"),
+                launch: exec.clone(),
+            });
+            self.execs.lock().unwrap().insert(exec.id, x.clone());
+            Ok(x)
+        }
     }
 
     #[derive(Default)]
@@ -426,6 +735,7 @@ pub(crate) mod fake {
                 rx: Mutex::new(rx),
                 signals: Mutex::new(Vec::new()),
                 fail_start: *self.fail_start.lock().unwrap(),
+                execs: Mutex::new(BTreeMap::new()),
             });
             ps.insert(task.id.clone(), p.clone());
             Ok(p)
@@ -486,8 +796,83 @@ mod tests {
                 Event::Start { .. } => "start",
                 Event::Exit { .. } => "exit",
                 Event::Delete { .. } => "delete",
+                Event::ExecAdded { .. } => "exec-added",
+                Event::ExecStarted { .. } => "exec-started",
+                Event::ExecExit { .. } => "exec-exit",
             })
             .collect()
+    }
+
+    fn argv(a: &[&str]) -> kiln_proto::Process {
+        kiln_proto::Process {
+            entrypoint: a.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exec_lifecycle_and_events() {
+        let (t, backend, events) = tasks();
+        let pid = t.create(container("c", None)).unwrap();
+        assert!(
+            matches!(
+                t.exec("c", "e1", argv(&["sh"]), Stdio::default()),
+                Err(Error::Refused(_))
+            ),
+            "not running yet"
+        );
+        t.start("c").unwrap();
+        t.exec("c", "e1", argv(&["sh"]), Stdio::default()).unwrap();
+        t.exec("c", "e2", argv(&["true"]), Stdio::default()).unwrap();
+        assert!(
+            t.exec("c", "e1", argv(&["sh"]), Stdio::default()).is_err(),
+            "same exec id"
+        );
+        let p = backend.get("c");
+        assert_eq!((p.exec_with(1).launch.id, p.exec_with(2).launch.id), (1, 2), "host ids");
+        assert_eq!(t.exec_state("c", "e1").unwrap().status, Status::Created);
+        assert_eq!(t.start_exec("c", "e1").unwrap(), pid);
+        assert_eq!(t.exec_state("c", "e1").unwrap().status, Status::Running);
+        assert!(t.start_exec("c", "e1").is_err());
+        t.kill_exec("c", "e1", 15).unwrap();
+        assert_eq!(p.exec_with(1).signals.lock().unwrap().as_slice(), [15]);
+        assert!(matches!(t.delete_exec("c", "e1"), Err(Error::Refused(_))), "running");
+        p.exec_with(1).end(7);
+        assert_eq!(t.wait_exec("c", "e1").unwrap().code, 7);
+        let (p_, exit) = t.delete_exec("c", "e1").unwrap();
+        assert_eq!((p_, exit.code), (pid, 7));
+        assert!(matches!(t.exec_state("c", "e1"), Err(Error::NotFound(_))));
+        // A created exec deleted is killed, with no exit event.
+        assert_eq!(t.delete_exec("c", "e2").unwrap().1.code, 137);
+        assert_eq!(
+            kinds(&events),
+            [
+                "create",
+                "start",
+                "exec-added",
+                "exec-added",
+                "exec-started",
+                "exec-exit"
+            ]
+        );
+        assert!(t.state("c").is_ok());
+    }
+
+    #[test]
+    fn a_failed_exec_start_and_the_limit() {
+        let (t, _backend, events) = tasks();
+        t.create(container("c", None)).unwrap();
+        t.start("c").unwrap();
+        t.exec("c", "bad", argv(&["nope"]), Stdio::default()).unwrap();
+        assert!(t.start_exec("c", "bad").is_err());
+        assert_eq!(t.wait_exec("c", "bad").unwrap().code, EXIT_LOST);
+        assert!(!kinds(&events).contains(&"exec-exit"), "it never ran");
+        for n in 0..MAX_EXECS {
+            t.exec("c", &format!("e{n}"), argv(&["sh"]), Stdio::default()).unwrap();
+        }
+        let err = t.exec("c", "over", argv(&["sh"]), Stdio::default()).unwrap_err();
+        assert!(err.to_string().contains("at most"), "{err}");
+        assert!(matches!(t.start_exec("c", "nope"), Err(Error::NotFound(_))));
     }
 
     #[test]
