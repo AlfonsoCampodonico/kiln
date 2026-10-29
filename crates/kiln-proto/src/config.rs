@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ProtoError, Result};
 use crate::message::WindowSize;
+use crate::volume::{MAX_VOLUMES, Volume, VolumeKind};
 
 /// The most app layers a guest mounts (overlayfs allows 500; mount(2) data is one page).
 pub const MAX_LAYERS: u32 = 128;
@@ -41,6 +42,13 @@ pub struct Config {
     pub exit_method: ExitMethod,
     /// The grace period when init gets SIGINT (Ctrl-Alt-Del) instead of `Shutdown`.
     pub shutdown_grace_secs: u32,
+    /// A pod's volumes; omitted when empty. The host follows `Config` with the files
+    /// volumes' first `FileUpdate`s.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<Volume>,
+    /// The pod disk after the layers (`emptyDir` volumes), grown like the scratch disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_disk: Option<Scratch>,
 }
 
 /// The main process (spec §5.1 `process`, minus `stopSignal`).
@@ -64,6 +72,44 @@ pub struct Process {
 }
 
 impl Process {
+    /// Checks the command line, environment, working directory and user; `name` is the
+    /// message's, for errors.
+    pub fn validate(&self, name: &'static str) -> Result<()> {
+        let p = self;
+        let argv = p.argv();
+        if argv.first().is_none_or(|a| a.is_empty()) {
+            return Err(ProtoError::invalid(name, "no command: entrypoint and cmd are empty"));
+        }
+        for a in &argv {
+            no_nul(name, "an argument", a)?;
+        }
+        for e in &p.env {
+            no_nul(name, "an environment entry", e)?;
+            if e.split_once('=')
+                .is_none_or(|(k, _)| k.is_empty() || k.chars().any(char::is_control))
+            {
+                return Err(ProtoError::invalid(
+                    name,
+                    format!("environment entry {e:?} is not KEY=value"),
+                ));
+            }
+        }
+        if let Some(w) = &p.working_dir {
+            no_nul(name, "workingDir", w)?;
+            if !w.starts_with('/') {
+                return Err(ProtoError::invalid(name, format!("workingDir {w:?} is not absolute")));
+            }
+        }
+        if let Some(u) = &p.user {
+            no_nul(name, "user", u)?;
+            let parts: Vec<&str> = u.split(':').collect();
+            if parts.len() > 2 || parts.iter().any(|s| s.is_empty() || s.chars().any(char::is_control)) {
+                return Err(ProtoError::invalid(name, format!("user {u:?} is not user[:group]")));
+            }
+        }
+        Ok(())
+    }
+
     /// The command line: entrypoint followed by cmd.
     pub fn argv(&self) -> Vec<&str> {
         self.entrypoint.iter().chain(&self.cmd).map(String::as_str).collect()
@@ -121,9 +167,9 @@ fn invalid(reason: impl Into<String>) -> ProtoError {
 }
 
 /// Strings become C strings in the guest, so they cannot hold NUL.
-fn no_nul(what: &str, s: &str) -> Result<()> {
+fn no_nul(name: &'static str, what: &str, s: &str) -> Result<()> {
     if s.contains('\0') {
-        return Err(invalid(format!("{what} contains a NUL byte")));
+        return Err(ProtoError::invalid(name, format!("{what} contains a NUL byte")));
     }
     Ok(())
 }
@@ -137,35 +183,7 @@ fn valid_hostname(h: &str) -> bool {
 impl Config {
     /// Checks every field; both sides call it (on encode and on decode).
     pub fn validate(&self) -> Result<()> {
-        let p = &self.process;
-        let argv = p.argv();
-        if argv.first().is_none_or(|a| a.is_empty()) {
-            return Err(invalid("no command: entrypoint and cmd are empty"));
-        }
-        for a in &argv {
-            no_nul("an argument", a)?;
-        }
-        for e in &p.env {
-            no_nul("an environment entry", e)?;
-            if e.split_once('=')
-                .is_none_or(|(k, _)| k.is_empty() || k.chars().any(char::is_control))
-            {
-                return Err(invalid(format!("environment entry {e:?} is not KEY=value")));
-            }
-        }
-        if let Some(w) = &p.working_dir {
-            no_nul("workingDir", w)?;
-            if !w.starts_with('/') {
-                return Err(invalid(format!("workingDir {w:?} is not absolute")));
-            }
-        }
-        if let Some(u) = &p.user {
-            no_nul("user", u)?;
-            let parts: Vec<&str> = u.split(':').collect();
-            if parts.len() > 2 || parts.iter().any(|s| s.is_empty() || s.chars().any(char::is_control)) {
-                return Err(invalid(format!("user {u:?} is not user[:group]")));
-            }
-        }
+        self.process.validate("Config")?;
         if crate::signal::name(self.stop_signal).is_none() {
             return Err(invalid(format!(
                 "stopSignal {} (signals 1-31 only; real-time signals are not supported)",
@@ -186,6 +204,23 @@ impl Config {
         }
         if let Some(n) = &self.network {
             n.validate()?;
+        }
+        if self.volumes.len() > MAX_VOLUMES {
+            return Err(invalid(format!(
+                "{} volumes (at most {MAX_VOLUMES})",
+                self.volumes.len()
+            )));
+        }
+        for v in &self.volumes {
+            v.validate()?;
+            if matches!(v.kind, VolumeKind::EmptyDir { .. }) && self.pod_disk.is_none() {
+                return Err(invalid(format!("emptyDir {} without a pod disk", v.path)));
+            }
+        }
+        if let Some(d) = &self.pod_disk
+            && (d.size_bytes < MIN_SCRATCH_BYTES || !d.size_bytes.is_multiple_of(4096))
+        {
+            return Err(invalid(format!("pod disk size {}", d.size_bytes)));
         }
         Ok(())
     }
@@ -320,7 +355,39 @@ mod tests {
             scratch: Scratch { size_bytes: 4 << 30 },
             exit_method: ExitMethod::Reboot,
             shutdown_grace_secs: 10,
+            volumes: Vec::new(),
+            pod_disk: None,
         }
+    }
+
+    #[test]
+    fn volumes_and_the_pod_disk_are_optional_and_checked() {
+        let plain = serde_json::to_string(&config()).unwrap();
+        assert!(!plain.contains("volumes") && !plain.contains("podDisk"), "{plain}");
+        let mut c = config();
+        c.volumes = vec![
+            Volume {
+                path: "/etc/cfg".into(),
+                kind: VolumeKind::Files { file: false },
+            },
+            Volume {
+                path: "/cache".into(),
+                kind: VolumeKind::EmptyDir { name: "cache".into() },
+            },
+        ];
+        assert!(c.validate().is_err(), "an emptyDir needs the pod disk");
+        c.pod_disk = Some(Scratch { size_bytes: 1 << 30 });
+        c.validate().unwrap();
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains(r#""podDisk":{"sizeBytes":1073741824}"#), "{json}");
+        assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), c);
+        c.pod_disk = Some(Scratch { size_bytes: 4096 });
+        assert!(c.validate().is_err());
+        c.pod_disk = Some(Scratch { size_bytes: 1 << 30 });
+        c.volumes[0].path = "/".into();
+        assert!(c.validate().is_err());
+        c.volumes = vec![c.volumes[1].clone(); MAX_VOLUMES + 1];
+        assert!(c.validate().is_err());
     }
 
     #[test]

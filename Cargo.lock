@@ -1502,6 +1502,7 @@ dependencies = [
  "kiln-proto",
  "rustix 1.1.5",
  "signal-hook 0.4.5",
+ "tempfile",
 ]
 
 [[package]]
@@ -1522,6 +1523,7 @@ dependencies = [
 name = "kiln-proto"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "proptest",
  "serde",
  "serde_json",

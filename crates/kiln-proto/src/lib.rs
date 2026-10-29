@@ -12,19 +12,28 @@
 
 mod config;
 mod error;
+mod exec;
 mod exit;
 mod frame;
 mod message;
 pub mod sanitize;
 pub mod signal;
+mod volume;
 
 pub use config::{Config, ExitMethod, Ipv6Network, MAX_LAYERS, MIN_SCRATCH_BYTES, Network, Process, Scratch};
 pub use error::{ProtoError, Result};
+pub use exec::{
+    EXEC_HEADER, ExecExited, ExecFailed, ExecSignal, ExecStart, ExecStarted, ExecStream, ExecWindowSize, MAX_EXECS,
+};
 pub use exit::{EXIT_CANNOT_INVOKE, EXIT_INFRA, EXIT_NOT_FOUND};
 pub use frame::{read_message, write_message};
 pub use message::{
     Exited, GuestMessage, Hello, HostMessage, InitFailed, MAX_MESSAGE_BYTES, Message, STAGES, Shutdown, Signal, Stage,
     WindowSize, stage_name,
+};
+pub use volume::{
+    FileEntry, FileUpdate, MAX_VOLUME_BYTES, MAX_VOLUME_FILES, MAX_VOLUMES, Volume, VolumeFile, VolumeKind,
+    check_generation, check_relative_path, file_updates,
 };
 
 /// The protocol version a guest announces in [`Hello`].
@@ -48,4 +57,6 @@ pub mod port {
     pub const STDERR: u32 = 1027;
     /// The terminal in `tty` mode, both directions; replaces the three stdio ports.
     pub const TTY: u32 = 1028;
+    /// Exec stdio: one connection per stream, each opened by a [`crate::ExecStream`] header.
+    pub const EXEC: u32 = 1029;
 }

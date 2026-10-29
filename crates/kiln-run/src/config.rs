@@ -102,6 +102,8 @@ pub fn build(image: &ImageProcess, opts: &RunOptions, rt: &Runtime) -> Result<Co
         },
         exit_method: rt.exit_method,
         shutdown_grace_secs: opts.stop_timeout,
+        volumes: Vec::new(),
+        pod_disk: None,
     };
     check_size(&config)?;
     Ok(config)
@@ -130,14 +132,20 @@ pub fn check_size(config: &Config) -> Result<()> {
 /// The virtio devices a run needs: init and scratch disks, the app layers, vsock
 /// and the NIC (spec §9.1). Checked against the VMM's budget before boot.
 pub fn check_devices(layers: usize, net: bool, available: u32, vmm: &str) -> Result<()> {
-    let fixed = 3 + u32::from(net);
+    check_devices_with(layers, false, net, available, vmm)
+}
+
+/// [`check_devices`], with `pod_disk` counting kiln-shim's pod disk (its `emptyDir`s).
+pub fn check_devices_with(layers: usize, pod_disk: bool, net: bool, available: u32, vmm: &str) -> Result<()> {
+    let fixed = 3 + u32::from(net) + u32::from(pod_disk);
     let needed = u32::try_from(layers).ok().and_then(|n| n.checked_add(fixed));
     if needed.is_none_or(|n| n > available) {
         let needed = needed.map_or_else(|| format!("more than {}", u32::MAX), |n| n.to_string());
         return Err(Error::refused(format!(
-            "the image has {layers} layers, which with the init and scratch disks, vsock{} need \
+            "the image has {layers} layers, which with the init and scratch disks{}, vsock{} need \
              {needed} virtio devices; {vmm} has room for {available}. Convert the image again with \
              --max-layers {} or fewer",
+            if pod_disk { ", the pod disk" } else { "" },
             if net { " and the network" } else { "" },
             available.saturating_sub(fixed)
         )));
@@ -279,6 +287,10 @@ mod tests {
             "{err}"
         );
         check_devices(27, false, 30, "cloud-hypervisor").unwrap();
+        let err = check_devices_with(26, true, true, 30, "cloud-hypervisor")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the pod disk") && err.contains("--max-layers 25"), "{err}");
         assert!(check_devices(129, false, 300, "x").is_err());
         // Counts that do not fit a u32 are refused, never wrapped into the budget.
         if let Ok(huge) = usize::try_from(u64::from(u32::MAX) - 1) {

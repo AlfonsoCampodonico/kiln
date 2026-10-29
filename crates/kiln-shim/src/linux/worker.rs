@@ -228,6 +228,8 @@ fn prepare(plan: &WorkerPlan) -> Result<Prepared, Fail> {
         },
         exit_method: kiln_run::exit_method(vmm.as_ref()),
         shutdown_grace_secs: SHUTDOWN_GRACE,
+        volumes: Vec::new(),
+        pod_disk: None,
     };
     ctx(config.validate(), "the guest's configuration")?;
     ctx(kiln_run::config::check_size(&config), "the guest's configuration")?;

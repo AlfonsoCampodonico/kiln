@@ -111,19 +111,15 @@ pub fn signal(pid: Pid, sig: i32) {
     }
 }
 
-/// Reaps every child without blocking. Returns the wait status of `main` if it was among them.
-/// (`wait`, i.e. `waitpid(-1)`: rustix's `waitpid(None, ..)` is `waitpid(0)`, which only
-/// sees children in init's process group, and the main process has its own session.)
-pub fn reap(main: Pid) -> Option<rustix::process::WaitStatus> {
-    let mut found = None;
+/// Reaps every child without blocking, and returns them. (`wait`, i.e. `waitpid(-1)`:
+/// rustix's `waitpid(None, ..)` is `waitpid(0)`, which only sees children in init's
+/// process group, and the main process and execs have sessions of their own.)
+pub fn reap() -> Vec<(Pid, rustix::process::WaitStatus)> {
+    let mut reaped = Vec::new();
     loop {
         match rustix::process::wait(rustix::process::WaitOptions::NOHANG) {
-            Ok(Some((pid, status))) => {
-                if pid == main {
-                    found = Some(status);
-                }
-            }
-            Ok(None) | Err(_) => return found,
+            Ok(Some(child)) => reaped.push(child),
+            Ok(None) | Err(_) => return reaped,
         }
     }
 }
