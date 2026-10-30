@@ -1,6 +1,7 @@
 //! `containerd-shim-kiln-v1`. containerd runs it as a shim (`start`, `delete`, and the
 //! server), and with `-info` and `-v`; the shim re-runs itself as `pause` (a pod's
-//! sandbox) and `vm` (a container's VM worker) on Linux.
+//! sandbox), `vm` (a container's VM worker) and `cleanup` (a pod disk's removal, as its
+//! owner) on Linux.
 
 use std::io::Write;
 
@@ -14,6 +15,7 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("vm") => kiln_shim::linux::worker::main(),
         Some("pause") => kiln_shim::linux::pause::main(args.get(2).map(std::path::Path::new)),
+        Some("cleanup") => kiln_shim::linux::cleanup(args.get(2).map(std::path::Path::new)),
         _ => {}
     }
     // containerd's flags are Go-style: one dash or two.

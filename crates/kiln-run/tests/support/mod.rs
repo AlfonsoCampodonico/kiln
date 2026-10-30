@@ -298,6 +298,8 @@ impl Case {
             scratch: Scratch { size_bytes: SCRATCH },
             exit_method: self.exit_method(),
             shutdown_grace_secs: 10,
+            volumes: Vec::new(),
+            pod_disk: None,
         }
     }
 

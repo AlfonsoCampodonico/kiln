@@ -25,18 +25,32 @@ pub fn guest_process(spec: &Spec) -> Result<Process> {
         .process
         .as_ref()
         .ok_or_else(|| Error::invalid("the spec has no process"))?;
+    process(p, "the spec's process")
+}
+
+/// An exec's process (`ExecProcessRequest.spec`, an OCI `Process` as JSON), and whether
+/// it has a terminal: translated as the main process is.
+pub fn exec_process(json: &[u8]) -> Result<(Process, bool)> {
+    let p: crate::oci::Process =
+        serde_json::from_slice(json).map_err(|e| Error::invalid(format!("the exec's process: {e}")))?;
+    Ok((process(&p, "the exec's process")?, p.terminal))
+}
+
+fn process(p: &crate::oci::Process, what: &str) -> Result<Process> {
     if p.args.first().is_none_or(|a| a.is_empty()) {
-        return Err(Error::invalid(
-            "the spec's process has no command (process.args is empty)",
-        ));
+        return Err(Error::invalid(format!("{what} has no command (process.args is empty)")));
     }
-    Ok(Process {
+    let process = Process {
         entrypoint: p.args.clone(),
         cmd: Vec::new(),
         env: p.env.clone(),
         working_dir: (!p.cwd.is_empty()).then(|| p.cwd.clone()),
         user: Some(format!("{}:{}", p.user.uid, p.user.gid)),
-    })
+    };
+    process
+        .validate("the process")
+        .map_err(|e| Error::invalid(e.to_string()))?;
+    Ok(process)
 }
 
 /// kiln-proto's hostname rule: 1-64 of letters, digits, `-` and `.`, starting with a
@@ -97,6 +111,22 @@ mod tests {
 
     fn settings() -> Settings {
         Settings::parse("user = \"kiln\"\nstore = \"/s\"\nkernel = \"/k\"\ninit = \"/i\"\n").unwrap()
+    }
+
+    #[test]
+    fn exec_processes_translate_like_the_main_one() {
+        let json = br#"{"terminal":true,"user":{"uid":1000,"gid":1000},"args":["sh","-c","id"],
+            "env":["PATH=/bin"],"cwd":"/srv"}"#;
+        let (p, tty) = exec_process(json).unwrap();
+        assert!(tty);
+        assert_eq!(p.entrypoint, ["sh", "-c", "id"]);
+        assert_eq!(
+            (p.user.as_deref(), p.working_dir.as_deref()),
+            (Some("1000:1000"), Some("/srv"))
+        );
+        assert!(exec_process(br#"{"args":[]}"#).is_err());
+        assert!(exec_process(br#"{"args":["a\u0000b"]}"#).is_err());
+        assert!(exec_process(b"nope").is_err());
     }
 
     #[test]

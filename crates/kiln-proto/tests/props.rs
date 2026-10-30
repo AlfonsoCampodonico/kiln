@@ -79,6 +79,8 @@ fn config() -> impl Strategy<Value = Config> {
                     ExitMethod::Reboot
                 },
                 shutdown_grace_secs: grace,
+                volumes: Vec::new(),
+                pod_disk: None,
             }
         })
 }

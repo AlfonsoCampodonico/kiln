@@ -41,27 +41,32 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use kiln_proto::{
-    Config, EXIT_INFRA, Exited, GuestMessage, HostMessage, InitFailed, Shutdown, Signal, WindowSize, port,
-    read_message, write_message,
+    Config, EXEC_HEADER, EXIT_INFRA, ExecSignal, ExecStart, ExecStream, ExecWindowSize, Exited, FileUpdate,
+    GuestMessage, HostMessage, InitFailed, Shutdown, Signal, WindowSize, port, read_message, write_message,
 };
 use rustix::event::{PollFd, PollFlags, poll};
 use vmkit::{EndReason, Vm, VmEnd};
 
 use crate::error::{Error, Result};
 use crate::escape::{Escape, Key};
+use crate::exec::{ExecReport, ExecStreams, Execs, Relay};
 use crate::protocol::{Accepted, Protocol};
 
 /// How many host messages may wait for the guest to read them.
 const QUEUE: usize = 64;
 /// How long one control write may block before the guest counts as not reading.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an exec stream has to send its header.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `update_files` waits for room in the queue before it gives up.
+const FILES_WAIT: Duration = Duration::from_secs(60);
 /// How often the main loop looks for the VMM's end (vmkit has no pollable handle).
 const VM_POLL: Duration = Duration::from_millis(20);
 /// The exit code of a VM the user killed (second SIGINT, `Ctrl-]` `k`), as `docker kill`.
@@ -102,6 +107,11 @@ pub struct SessionOptions {
     /// Raw bytes to answer `Hello` with instead of `Config` (tests of the guest's T9).
     #[doc(hidden)]
     pub reply: Option<Vec<u8>>,
+    /// Listen for exec stdio on port 1029 ([`Handle::exec`]).
+    pub exec: bool,
+    /// Sent right after `Config`, before any other message: the first generation of
+    /// each files volume.
+    pub after_config: Vec<HostMessage>,
 }
 
 impl Default for SessionOptions {
@@ -114,6 +124,8 @@ impl Default for SessionOptions {
             kill_wait: Duration::from_secs(5),
             escape_keys: false,
             reply: None,
+            exec: false,
+            after_config: Vec::new(),
         }
     }
 }
@@ -121,6 +133,8 @@ impl Default for SessionOptions {
 /// What the writer sends.
 enum Out {
     Msg(HostMessage),
+    /// A `FileUpdate`, counted against [`FileBudget`].
+    File(HostMessage),
     Raw(Vec<u8>),
     Stop,
 }
@@ -144,6 +158,48 @@ pub struct Handle {
     out: SyncSender<Out>,
     /// A full queue was reported: one violation, however many sends find it full.
     full: Arc<AtomicBool>,
+    execs: Arc<Execs>,
+    files: Arc<FileBudget>,
+}
+
+/// File frames in the writer's queue: at most half of it, so a large update can never
+/// fill the queue under a `Signal` (a full queue is a violation).
+#[derive(Default)]
+struct FileBudget {
+    /// Queued, and whether the writer has stopped.
+    state: Mutex<(usize, bool)>,
+    changed: std::sync::Condvar,
+}
+
+impl FileBudget {
+    /// Waits for room; false when the writer has stopped or there was none in time.
+    fn reserve(&self) -> bool {
+        let deadline = Instant::now() + FILES_WAIT;
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while s.0 >= QUEUE / 2 && !s.1 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            s = self.changed.wait_timeout(s, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        if s.1 {
+            return false;
+        }
+        s.0 += 1;
+        true
+    }
+
+    fn done(&self) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.0 = s.0.saturating_sub(1);
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+        self.changed.notify_all();
+    }
 }
 
 impl Handle {
@@ -175,6 +231,53 @@ impl Handle {
     /// The terminal was resized. Dropped when the queue is full: a later resize follows.
     pub fn window_size(&self, size: WindowSize) {
         self.queue(Out::Msg(HostMessage::WindowSize(size)), false);
+    }
+
+    /// Starts an exec (the session must have been started with `exec`). Its events go
+    /// to `report`; `start.stdin` follows `streams.stdin`. Refused for an id in use, over
+    /// [`kiln_proto::MAX_EXECS`], and after the VM's end.
+    pub fn exec(
+        &self,
+        mut start: ExecStart,
+        streams: ExecStreams,
+        report: ExecReport,
+    ) -> std::result::Result<(), String> {
+        start.stdin = streams.stdin.is_some();
+        self.execs.add(start.id, start.tty.is_some(), streams, report)?;
+        self.queue(Out::Msg(HostMessage::ExecStart(start)), true);
+        Ok(())
+    }
+
+    /// Forwards a signal (1–31) to exec `id`.
+    pub fn exec_signal(&self, id: u32, sig: i32) {
+        self.queue(Out::Msg(HostMessage::ExecSignal(ExecSignal { id, sig })), true);
+    }
+
+    /// Exec `id`'s terminal was resized; dropped when the queue is full.
+    pub fn exec_window_size(&self, id: u32, size: WindowSize) {
+        self.queue(
+            Out::Msg(HostMessage::ExecWindowSize(ExecWindowSize {
+                id,
+                rows: size.rows,
+                cols: size.cols,
+            })),
+            false,
+        );
+    }
+
+    /// Queues a files volume's new generation, waiting for room as the guest reads.
+    /// False if the session's writer has stopped (or stalled for a minute).
+    pub fn update_files(&self, frames: Vec<FileUpdate>) -> bool {
+        for f in frames {
+            if !self.files.reserve() {
+                return false;
+            }
+            if self.out.send(Out::File(HostMessage::FileUpdate(f))).is_err() {
+                self.files.done();
+                return false;
+            }
+        }
+        true
     }
 
     /// Any host message (tests).
@@ -359,6 +462,9 @@ impl Session {
             }
             ports.extend([port::STDOUT, port::STDERR]);
         }
+        if opts.exec {
+            ports.push(port::EXEC);
+        }
         let listeners = ports
             .iter()
             .map(|&p| Ok((p, bind(&base, p)?)))
@@ -368,9 +474,11 @@ impl Session {
         let (stream_tx, stream_rx) = channel();
         let (wake_r, wake) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(std::io::Error::from)?;
         let drain = Arc::new(Drain::default());
+        let execs = Arc::new(Execs::default());
+        let files = Arc::new(FileBudget::default());
         spawn("control-writer", {
-            let tx = tx.clone();
-            move || writer(&stream_rx, &out_rx, &tx)
+            let (tx, files) = (tx.clone(), files.clone());
+            move || writer(&stream_rx, &out_rx, &tx, &files)
         })?;
         let serve = Serve {
             config,
@@ -382,12 +490,17 @@ impl Session {
             stderr: Some(streams.stderr),
             escape_keys: opts.escape_keys,
             drain: drain.clone(),
+            execs: execs.clone(),
+            after_config: opts.after_config.clone(),
+            headers: Arc::default(),
         };
         let listener = spawn("vsock-listener", move || listen(listeners, &wake_r, serve))?;
         let handle = Handle {
             events: tx,
             out: out_tx,
             full: Arc::new(AtomicBool::new(false)),
+            execs,
+            files,
         };
         let now = Instant::now();
         let mut s = Session {
@@ -488,6 +601,8 @@ impl Session {
         while let Ok(e) = self.events.try_recv() {
             self.handle_event(e);
         }
+        // Nothing the guest says now reaches an exec.
+        self.handle.execs.end();
         for p in self.drain.pending() {
             self.warnings.push(format!(
                 "the guest's {} was cut off: {}",
@@ -643,7 +758,8 @@ impl Session {
             Event::Guest(msg) => {
                 match self.proto.accept(&msg) {
                     Ok(Accepted::Hello | Accepted::Recorded) => {}
-                    Ok(Accepted::Ignored) => return,
+                    // The reader handles exec messages; they never reach the loop.
+                    Ok(Accepted::Ignored | Accepted::Exec) => return,
                     Err(v) => {
                         // The reader checked it already; this cannot differ.
                         self.violate(v.0);
@@ -663,6 +779,7 @@ impl Session {
                         self.stop_deadline = None;
                         self.expect_end(now, FINAL_MESSAGE);
                     }
+                    GuestMessage::ExecStarted(_) | GuestMessage::ExecExited(_) | GuestMessage::ExecFailed(_) => {}
                 }
             }
             Event::Violation(why) => self.violate(why),
@@ -780,6 +897,7 @@ impl Drop for Session {
             let _ = self.vm.kill();
             let _ = self.vm.wait_timeout(self.opts.kill_wait);
         }
+        self.handle.execs.end();
         let _ = rustix::io::write(&self.wake, &[STOP]);
         let _ = self.handle.out.try_send(Out::Stop);
         if let Some(l) = self.listener.take() {
@@ -829,6 +947,10 @@ struct Serve {
     stderr: Option<Box<dyn Write + Send>>,
     escape_keys: bool,
     drain: Arc<Drain>,
+    execs: Arc<Execs>,
+    after_config: Vec<HostMessage>,
+    /// Connections on port 1029 that have not sent their header yet.
+    headers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Accepts on every port until told to stop; a second connection on a port is a
@@ -906,7 +1028,7 @@ fn accept(p: u32, l: &UnixListener, seen: &mut BTreeSet<u32>, serve: &mut Serve)
             return Accept::Failed;
         }
     };
-    if !seen.insert(p) {
+    if p != port::EXEC && !seen.insert(p) {
         let _ = serve
             .events
             .send(Event::Violation(format!("a second connection on vsock port {p}")));
@@ -936,9 +1058,21 @@ impl Serve {
         match p {
             port::CONTROL => {
                 let (config, reply, writer) = (self.config.clone(), self.reply.take(), self.writer.clone());
+                let (execs, after) = (self.execs.clone(), std::mem::take(&mut self.after_config));
                 spawn("control-reader", move || {
-                    control(stream, &config, reply, &events, &writer, &drain)
+                    control(stream, &config, reply, after, &events, &writer, &drain, &execs)
                 })?;
+            }
+            port::EXEC => {
+                // A guest may have no more connections waiting to name their stream than
+                // the host's execs have streams to connect (each holds a thread).
+                let headers = self.headers.clone();
+                if headers.fetch_add(1, Ordering::SeqCst) >= self.execs.unconnected() {
+                    headers.fetch_sub(1, Ordering::SeqCst);
+                    return Err(Error::refused("a stream on port 1029 that no exec expects"));
+                }
+                let execs = self.execs.clone();
+                spawn("exec-stream", move || exec_stream(stream, &execs, &events, &headers))?;
             }
             port::STDIN => {
                 if let Some(input) = self.stdin.take() {
@@ -977,15 +1111,18 @@ impl Serve {
 
 /// Reads guest messages through the state machine; answers the first `Hello`.
 /// Reports the end of the control connection as `Eof`, however it ended.
+#[allow(clippy::too_many_arguments)]
 fn control(
     stream: UnixStream,
     config: &Config,
     reply: Option<Vec<u8>>,
+    after: Vec<HostMessage>,
     events: &Sender<Event>,
     writer: &Sender<UnixStream>,
     drain: &Drain,
+    execs: &Execs,
 ) {
-    read_control(stream, config, reply, events, writer);
+    read_control(stream, config, reply, after, events, writer, execs);
     drain.ports().remove(&port::CONTROL);
     let _ = events.send(Event::Eof);
 }
@@ -994,8 +1131,10 @@ fn read_control(
     stream: UnixStream,
     config: &Config,
     reply: Option<Vec<u8>>,
+    mut after: Vec<HostMessage>,
     events: &Sender<Event>,
     writer: &Sender<UnixStream>,
+    execs: &Execs,
 ) {
     let violation = |why: String| {
         let _ = events.send(Event::Violation(why));
@@ -1039,6 +1178,12 @@ fn read_control(
                 if let Err(e) = sent {
                     return violation(format!("sending Config: {e}"));
                 }
+                // The volumes' first files, before anything the writer sends.
+                for m in std::mem::take(&mut after) {
+                    if let Err(e) = write_message(&mut w, &m) {
+                        return violation(format!("sending the volumes' files: {e}"));
+                    }
+                }
                 match w.try_clone() {
                     Ok(c) => {
                         let _ = writer.send(c);
@@ -1051,22 +1196,45 @@ fn read_control(
                     return;
                 }
             }
+            Ok(Accepted::Exec) => {
+                if let Err(why) = execs.guest(&msg) {
+                    return violation(why);
+                }
+            }
             Err(v) => return violation(v.0),
         }
     }
 }
 
 /// Writes queued host messages once `Config` has gone out.
-fn writer(stream: &Receiver<UnixStream>, out: &Receiver<Out>, events: &Sender<Event>) {
+fn writer(stream: &Receiver<UnixStream>, out: &Receiver<Out>, events: &Sender<Event>, files: &FileBudget) {
+    struct Closed<'a>(&'a FileBudget);
+    impl Drop for Closed<'_> {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _closed = Closed(files);
     let Ok(mut s) = stream.recv() else { return };
     for item in out {
-        let r = match item {
+        let msg = match &item {
             Out::Stop => return,
-            Out::Msg(m) => write_message(&mut s, &m).map_err(|e| match e {
-                kiln_proto::ProtoError::Io(io) => io,
-                other => std::io::Error::other(other.to_string()),
-            }),
-            Out::Raw(b) => s.write_all(&b),
+            Out::Msg(m) | Out::File(m) => Some(m),
+            Out::Raw(_) => None,
+        };
+        let r = match (msg, &item) {
+            (Some(m), _) => {
+                let r = write_message(&mut s, m).map_err(|e| match e {
+                    kiln_proto::ProtoError::Io(io) => io,
+                    other => std::io::Error::other(other.to_string()),
+                });
+                if matches!(item, Out::File(_)) {
+                    files.done();
+                }
+                r
+            }
+            (None, Out::Raw(b)) => s.write_all(b),
+            (None, _) => Ok(()),
         };
         match r {
             Ok(()) => {}
@@ -1122,6 +1290,87 @@ fn write_moving(sink: &mut dyn Write, mut bytes: &[u8], drain: &Drain) -> bool {
         }
     }
     sink.flush().is_ok()
+}
+
+/// Serves one connection on port 1029: its header names an exec the host started and
+/// one of its streams (anything else is a violation, S5); then it relays that stream.
+fn exec_stream(mut stream: UnixStream, execs: &Execs, events: &Sender<Event>, headers: &AtomicUsize) {
+    let violation = |why: String| {
+        let _ = events.send(Event::Violation(why));
+    };
+    let read = read_header(&mut stream);
+    headers.fetch_sub(1, Ordering::SeqCst);
+    let header = match read {
+        Ok(h) => h,
+        Err(e) => return violation(format!("an exec stream's header: {e}")),
+    };
+    if let Err(e) = stream.set_read_timeout(None) {
+        return violation(format!("an exec stream's header: {e}"));
+    }
+    let (id, kind) = match ExecStream::parse(header) {
+        Ok(h) => h,
+        Err(e) => return violation(e.to_string()),
+    };
+    match execs.connect(id, kind) {
+        Err(why) => violation(why),
+        Ok(Relay::In(input)) => copy_in(input, stream),
+        Ok(Relay::Out(sink)) => {
+            copy_plain(stream, sink);
+            execs.output_closed(id);
+        }
+        Ok(Relay::Tty { input, output }) => {
+            if let Some(input) = input {
+                match stream.try_clone() {
+                    Ok(to) => {
+                        let _ = spawn("exec-tty-in", move || copy_in(input, to));
+                    }
+                    Err(e) => return violation(format!("exec {id}'s terminal: {e}")),
+                }
+            }
+            copy_plain(stream, output);
+            execs.output_closed(id);
+        }
+    }
+}
+
+/// An exec stream's header, within [`HEADER_TIMEOUT`] in all.
+fn read_header(stream: &mut UnixStream) -> std::io::Result<[u8; EXEC_HEADER]> {
+    let deadline = Instant::now() + HEADER_TIMEOUT;
+    let mut header = [0u8; EXEC_HEADER];
+    let mut got = 0;
+    while got < EXEC_HEADER {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::from(ErrorKind::TimedOut));
+        }
+        stream.set_read_timeout(Some(left))?;
+        match stream.read(&mut header[got..]) {
+            Ok(0) => return Err(std::io::Error::from(ErrorKind::UnexpectedEof)),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(header)
+}
+
+/// Copies an exec's output to its sink until EOF; a sink that fails is dropped, and the
+/// rest is read and discarded, so the guest never blocks on it.
+fn copy_plain(mut from: UnixStream, mut sink: Box<dyn Write + Send>) {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut ok = true;
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if ok {
+                    ok = sink.write_all(buf.get(..n).unwrap_or_default()).is_ok() && sink.flush().is_ok();
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
 }
 
 /// Copies stdin to the guest; EOF is a half-close.

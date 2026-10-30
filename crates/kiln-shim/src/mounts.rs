@@ -1,12 +1,16 @@
-//! The spec's `mounts` under kiln (design §7.2). A VM shares no filesystem with the
-//! host, so a mount is something kiln-init already provides, something the shim
-//! translates (the pod's resolv.conf), a kubelet volume kiln does not deliver yet
-//! (ignored with a warning the pod's log shows), or a host path, which is refused.
+//! The spec's `mounts` under kiln (design §7.2, and the exec and volumes design §5.1). A
+//! VM shares no filesystem with the host, so a mount is something kiln-init already
+//! provides, something the shim translates (the pod's resolv.conf), a kubelet volume
+//! the shim delivers into the guest (files, an `emptyDir`, a tmpfs), or a host path,
+//! which is refused.
 
 use std::path::PathBuf;
 
 use crate::error::{Error, Result};
 use crate::oci::{Mount, Spec};
+
+/// Where kubelet keeps its pods' volumes.
+pub const KUBELET_PODS: &str = "/var/lib/kubelet/pods";
 
 /// What kiln does with one mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,18 +21,37 @@ pub enum MountClass {
     ResolvConf(PathBuf),
     /// kiln-init writes its own (`/etc/hosts`, `/etc/hostname`).
     Kiln,
-    /// A kubelet volume or file kiln does not deliver yet (kiln-shim spec §4.5).
-    NotDelivered,
+    /// Not delivered, and not worth a warning (the termination log).
+    Ignored,
+    /// A kubelet volume or a tmpfs, delivered into the guest.
+    Volume(Source),
     /// A host path the guest cannot see: hostPath, CSI and the like.
     Refused,
+}
+
+/// Where a delivered volume comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A Secret, ConfigMap, projected or downward-API volume's directory.
+    Files(PathBuf),
+    /// An `emptyDir`'s directory: on disk, or (kubelet's `medium: Memory`) a tmpfs.
+    EmptyDir { name: String, dir: PathBuf },
+    /// A `subPath` inside volume `volume` of the pod whose directory is `pod`.
+    SubPath {
+        pod: PathBuf,
+        volume: String,
+        source: PathBuf,
+    },
+    /// A tmpfs of the OCI spec, with its `size=` when it has one.
+    Tmpfs { size: Option<u64> },
 }
 
 /// What `check` found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Checked {
     pub resolv_conf: Option<PathBuf>,
-    /// The destinations of the volumes the guest does not get, for the warning.
-    pub not_delivered: Vec<String>,
+    /// The volumes to deliver, with their destinations.
+    pub volumes: Vec<(String, Source)>,
 }
 
 const PROVIDED: [&str; 7] = [
@@ -44,27 +67,61 @@ const PROVIDED: [&str; 7] = [
 const KERNEL_FS: [&str; 8] = [
     "proc", "sysfs", "tmpfs", "devpts", "mqueue", "cgroup", "cgroup2", "devtmpfs",
 ];
-/// kubelet's volume plugins whose files are small and are delivered later (spec §4.5).
-const KUBELET_VOLUMES: [&str; 5] = ["projected", "secret", "configmap", "downward-api", "empty-dir"];
+/// kubelet's volume plugins whose content is files in its atomic-writer layout.
+pub const FILES_PLUGINS: [&str; 4] = ["projected", "secret", "configmap", "downward-api"];
 
-fn kubelet_volume(source: &str) -> bool {
-    let Some(rest) = source.strip_prefix("/var/lib/kubelet/pods/") else {
-        return false;
-    };
-    // <uid>/volumes/kubernetes.io~<plugin>/<name>, or a file kubelet writes for the
-    // container (<uid>/containers/<name>/<id>: the termination log).
+/// `/var/lib/kubelet/pods/<uid>/<rest>` of the container's own pod: the pod's directory
+/// and `<rest>`'s parts. Another pod's directory (a hostPath naming it) is not kubelet's
+/// volume for this container, and is refused like any host path.
+fn kubelet_path<'a>(source: &'a str, pod_uid: Option<&str>) -> Option<(PathBuf, Vec<&'a str>)> {
+    let rest = source.strip_prefix(KUBELET_PODS)?.strip_prefix('/')?;
     let mut parts = rest.split('/');
-    let _uid = parts.next();
-    match (parts.next(), parts.next()) {
-        (Some("volumes"), Some(plugin)) => plugin
-            .strip_prefix("kubernetes.io~")
-            .is_some_and(|p| KUBELET_VOLUMES.contains(&p)),
-        (Some("containers"), Some(_)) => true,
-        _ => false,
+    let uid = parts
+        .next()
+        .filter(|u| !u.is_empty() && *u != "." && *u != ".." && Some(*u) == pod_uid)?;
+    let parts: Vec<&str> = parts.collect();
+    if parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+        return None;
+    }
+    Some((PathBuf::from(KUBELET_PODS).join(uid), parts))
+}
+
+fn kubelet_volume(source: &str, pod_uid: Option<&str>) -> Option<MountClass> {
+    let (pod, parts) = kubelet_path(source, pod_uid)?;
+    match parts.as_slice() {
+        ["volumes", plugin, name] => match plugin.strip_prefix("kubernetes.io~")? {
+            p if FILES_PLUGINS.contains(&p) => Some(MountClass::Volume(Source::Files(source.into()))),
+            "empty-dir" => Some(MountClass::Volume(Source::EmptyDir {
+                name: name.to_string(),
+                dir: source.into(),
+            })),
+            _ => None,
+        },
+        ["volume-subpaths", volume, _container, _n] => Some(MountClass::Volume(Source::SubPath {
+            pod,
+            volume: volume.to_string(),
+            source: source.into(),
+        })),
+        // A file kubelet writes for the container: the termination log.
+        ["containers", ..] => Some(MountClass::Ignored),
+        _ => None,
     }
 }
 
-pub fn classify(m: &Mount) -> MountClass {
+/// A tmpfs mount's `size=` option, in bytes (`k`, `m` and `g` suffixes, as mount(8)).
+fn tmpfs_size(options: &[String]) -> Option<u64> {
+    let v = options.iter().find_map(|o| o.strip_prefix("size="))?;
+    let (num, mul) = match v.as_bytes().last()? {
+        b'k' | b'K' => (&v[..v.len() - 1], 1 << 10),
+        b'm' | b'M' => (&v[..v.len() - 1], 1 << 20),
+        b'g' | b'G' => (&v[..v.len() - 1], 1 << 30),
+        _ => (v, 1),
+    };
+    num.parse::<u64>().ok()?.checked_mul(mul).filter(|n| *n > 0)
+}
+
+/// One mount of a container of the pod whose uid is `pod_uid`.
+pub fn classify(m: &Mount, pod_uid: Option<&str>) -> MountClass {
     let dest = m.destination.trim_end_matches('/');
     let source = m.source.as_deref().unwrap_or("");
     let bind = m.kind.as_deref().is_none_or(|k| k == "bind" || k == "rbind")
@@ -73,10 +130,14 @@ pub fn classify(m: &Mount) -> MountClass {
         "/etc/resolv.conf" if bind && !source.is_empty() => MountClass::ResolvConf(source.into()),
         "/etc/hosts" | "/etc/hostname" => MountClass::Kiln,
         d if PROVIDED.contains(&d) => MountClass::Provided,
-        "/dev/termination-log" => MountClass::NotDelivered,
-        _ if !bind && m.kind.as_deref().is_some_and(|k| KERNEL_FS.contains(&k)) => MountClass::NotDelivered,
-        _ if kubelet_volume(source) => MountClass::NotDelivered,
-        _ => MountClass::Refused,
+        "/dev/termination-log" => MountClass::Ignored,
+        // kiln-init provides /proc, /sys and /dev; nothing more is mounted there.
+        d if ["/proc/", "/sys/", "/dev/"].iter().any(|p| d.starts_with(p)) => MountClass::Refused,
+        _ if !bind && m.kind.as_deref() == Some("tmpfs") => MountClass::Volume(Source::Tmpfs {
+            size: tmpfs_size(&m.options),
+        }),
+        _ if !bind && m.kind.as_deref().is_some_and(|k| KERNEL_FS.contains(&k)) => MountClass::Refused,
+        _ => kubelet_volume(source, pod_uid).unwrap_or(MountClass::Refused),
     }
 }
 
@@ -84,10 +145,10 @@ pub fn classify(m: &Mount) -> MountClass {
 pub fn check(spec: &Spec) -> Result<Checked> {
     let mut out = Checked::default();
     for m in &spec.mounts {
-        match classify(m) {
-            MountClass::Provided | MountClass::Kiln => {}
+        match classify(m, spec.pod_uid()) {
+            MountClass::Provided | MountClass::Kiln | MountClass::Ignored => {}
             MountClass::ResolvConf(p) => out.resolv_conf = Some(p),
-            MountClass::NotDelivered => out.not_delivered.push(m.destination.clone()),
+            MountClass::Volume(source) => out.volumes.push((m.destination.clone(), source)),
             MountClass::Refused => {
                 return Err(Error::invalid(format!(
                     "kiln cannot mount {} into a VM (from {}): host paths, hostPath and CSI volumes are \
@@ -99,16 +160,6 @@ pub fn check(spec: &Spec) -> Result<Checked> {
         }
     }
     Ok(out)
-}
-
-/// The line the pod's log gets about volumes the guest does not have.
-pub fn warning(not_delivered: &[String]) -> Option<String> {
-    (!not_delivered.is_empty()).then(|| {
-        format!(
-            "kiln: warning: these volumes are not inside the VM yet (kiln-shim spec §4.5): {}",
-            not_delivered.join(", ")
-        )
-    })
 }
 
 #[cfg(test)]
@@ -144,7 +195,8 @@ mod tests {
                 bind("/dev/shm", "/run/containerd/io.containerd.grpc.v1.cri/sandboxes/s/shm"),
                 MountClass::Provided,
             ),
-            (fs("/run", "tmpfs"), MountClass::NotDelivered),
+            (fs("/run", "tmpfs"), MountClass::Volume(Source::Tmpfs { size: None })),
+            (fs("/run/x", "proc"), MountClass::Refused),
             (bind("/etc/hosts", &format!("{pod}/etc-hosts")), MountClass::Kiln),
             (
                 bind("/etc/hostname", "/var/lib/containerd/x/hostname"),
@@ -159,19 +211,44 @@ mod tests {
                     "/var/run/secrets/kubernetes.io/serviceaccount",
                     &format!("{pod}/volumes/kubernetes.io~projected/kube-api-access-x"),
                 ),
-                MountClass::NotDelivered,
+                MountClass::Volume(Source::Files(
+                    format!("{pod}/volumes/kubernetes.io~projected/kube-api-access-x").into(),
+                )),
             ),
             (
                 bind("/cfg", &format!("{pod}/volumes/kubernetes.io~configmap/c")),
-                MountClass::NotDelivered,
+                MountClass::Volume(Source::Files(format!("{pod}/volumes/kubernetes.io~configmap/c").into())),
             ),
             (
                 bind("/cache", &format!("{pod}/volumes/kubernetes.io~empty-dir/e")),
-                MountClass::NotDelivered,
+                MountClass::Volume(Source::EmptyDir {
+                    name: "e".into(),
+                    dir: format!("{pod}/volumes/kubernetes.io~empty-dir/e").into(),
+                }),
+            ),
+            (
+                bind("/etc/nginx/nginx.conf", &format!("{pod}/volume-subpaths/cfg/web/0")),
+                MountClass::Volume(Source::SubPath {
+                    pod: pod.into(),
+                    volume: "cfg".into(),
+                    source: format!("{pod}/volume-subpaths/cfg/web/0").into(),
+                }),
             ),
             (
                 bind("/dev/termination-log", &format!("{pod}/containers/app/5d1c")),
-                MountClass::NotDelivered,
+                MountClass::Ignored,
+            ),
+            (
+                bind("/x", &format!("{pod}/volumes/kubernetes.io~configmap/../../etc")),
+                MountClass::Refused,
+            ),
+            (
+                bind("/x", "/var/lib/kubelet/pods/../../etc/volumes/kubernetes.io~secret/s"),
+                MountClass::Refused,
+            ),
+            (
+                bind("/dev/x", &format!("{pod}/volumes/kubernetes.io~configmap/c")),
+                MountClass::Refused,
             ),
             (
                 bind("/data", &format!("{pod}/volumes/kubernetes.io~csi/pvc-1/mount")),
@@ -180,7 +257,7 @@ mod tests {
             (bind("/data", "/srv/data"), MountClass::Refused),
         ];
         for (m, want) in cases {
-            assert_eq!(classify(&m), want, "{m:?}");
+            assert_eq!(classify(&m, Some("0e1f")), want, "{m:?}");
         }
     }
 
@@ -200,12 +277,31 @@ mod tests {
                     "/var/lib/kubelet/pods/u/volumes/kubernetes.io~projected/t",
                 ),
             ],
+            annotations: [(crate::oci::SANDBOX_UID.to_string(), "u".to_string())].into(),
             ..Spec::default()
         };
         let c = check(&spec).unwrap();
         assert_eq!(c.resolv_conf.as_deref(), Some(std::path::Path::new("/r")));
-        assert_eq!(c.not_delivered, ["/var/run/secrets/kubernetes.io/serviceaccount"]);
-        assert!(warning(&c.not_delivered).unwrap().contains("serviceaccount"));
-        assert_eq!(warning(&[]), None);
+        assert_eq!(c.volumes.len(), 1);
+        assert_eq!(c.volumes[0].0, "/var/run/secrets/kubernetes.io/serviceaccount");
+    }
+
+    #[test]
+    fn only_the_containers_own_pods_volumes() {
+        let m = bind("/x", "/var/lib/kubelet/pods/other/volumes/kubernetes.io~secret/s");
+        assert_eq!(classify(&m, Some("mine")), MountClass::Refused);
+        assert_eq!(classify(&m, None), MountClass::Refused);
+        assert!(matches!(classify(&m, Some("other")), MountClass::Volume(_)));
+    }
+
+    #[test]
+    fn tmpfs_sizes() {
+        let o = |s: &str| vec!["nosuid".to_string(), s.to_string()];
+        assert_eq!(tmpfs_size(&o("size=64m")), Some(64 << 20));
+        assert_eq!(tmpfs_size(&o("size=1G")), Some(1 << 30));
+        assert_eq!(tmpfs_size(&o("size=4096")), Some(4096));
+        assert_eq!(tmpfs_size(&o("size=0")), None);
+        assert_eq!(tmpfs_size(&o("size=x")), None);
+        assert_eq!(tmpfs_size(&o("mode=1777")), None);
     }
 }

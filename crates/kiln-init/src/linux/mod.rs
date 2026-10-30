@@ -11,10 +11,11 @@ mod root;
 mod storage;
 mod supervise;
 pub mod sys;
+mod volumes;
 
 use std::io::Write;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Mutex, OnceLock};
 
@@ -37,6 +38,9 @@ static CONTROL: OnceLock<Mutex<Vsock>> = OnceLock::new();
 /// later stage, and stage 6 before `Running`, checks it, so a broken host stops the
 /// boot at the next stage rather than at stage 7.
 static HOST_FAILED: OnceLock<String> = OnceLock::new();
+/// The final message (`Exited` or `InitFailed`) has gone out: no exec message may follow
+/// it. Set and checked under the `CONTROL` lock.
+static FINISHED: AtomicBool = AtomicBool::new(false);
 
 /// What the supervisor waits for (spec §9.6 stage 7).
 #[derive(Debug)]
@@ -62,11 +66,14 @@ fn boot() -> Result<()> {
     early()?;
     let (events, rx) = channel();
     enter(2)?;
-    let config = control::connect(events.clone())?;
+    let (config, files) = control::connect(events.clone())?;
     enter(3)?;
     let scratch = storage::mount_all(&config)?;
+    let mut volumes = volumes::Volumes::prepare(&config, &files)?;
+    drop(files);
     enter(4)?;
     root::pivot()?;
+    volumes.attach(&config)?;
     enter(5)?;
     identity::configure(&config)?;
     enter(6)?;
@@ -75,11 +82,12 @@ fn boot() -> Result<()> {
     host_ok()?;
     send(&GuestMessage::Running)?;
     enter(7)?;
-    let exited = supervise::run(&config, started, &rx)?;
+    let exited = supervise::run(&config, started, &rx, &mut volumes)?;
     // The scratch disk is synced and read-only before `Exited`: the host may end
     // the VM as soon as it has the message, and `Exited` means the disk is safe.
     storage::finish(&scratch);
-    send(&GuestMessage::Exited(exited))?;
+    volumes.finish();
+    send_final(&GuestMessage::Exited(exited))?;
     Ok(())
 }
 
@@ -115,6 +123,28 @@ fn host_ok() -> Result<()> {
     }
 }
 
+/// Sends an exec message, unless the final message has gone out (the host reports the
+/// execs it has not heard of as killed). A failed send is the host's end: ignored here,
+/// the supervisor learns of it from the control reader.
+fn send_exec(msg: &GuestMessage) {
+    let control = CONTROL.get().expect("the control channel is up");
+    let mut stream = control.lock().unwrap_or_else(|e| e.into_inner());
+    if !FINISHED.load(Ordering::SeqCst) {
+        let _ = write_message(&mut *stream, msg);
+    }
+}
+
+/// Sends the final message: nothing from an exec follows it.
+fn send_final(msg: &GuestMessage) -> Result<()> {
+    let control = CONTROL.get().expect("the control channel is up");
+    let mut stream = control.lock().unwrap_or_else(|e| e.into_inner());
+    FINISHED.store(true, Ordering::SeqCst);
+    write_message(&mut *stream, msg).map_err(|e| match HOST_FAILED.get() {
+        Some(why) => Failure::msg(why.clone()),
+        None => Failure::msg(format!("send to the host: {e}")),
+    })
+}
+
 fn send(msg: &GuestMessage) -> Result<()> {
     let control = CONTROL.get().expect("the control channel is up");
     let mut stream = control.lock().unwrap_or_else(|e| e.into_inner());
@@ -132,6 +162,7 @@ fn fail(f: Failure) -> ! {
     if let Some(control) = CONTROL.get()
         && let Ok(mut stream) = control.try_lock()
     {
+        FINISHED.store(true, Ordering::SeqCst);
         let msg = InitFailed::new(stage, f.reported_errno(stage), &f.message);
         let _ = write_message(&mut *stream, &GuestMessage::InitFailed(msg));
     }

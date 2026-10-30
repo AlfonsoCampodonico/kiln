@@ -64,6 +64,13 @@ impl Vsock {
     pub fn shutdown_write(&self) {
         let _ = rustix::net::shutdown(&self.0, Shutdown::Write);
     }
+
+    /// Closes both directions, for every descriptor of the connection: a terminal's,
+    /// whose input relay holds a clone. The VMMs pass a guest's half-close on only once
+    /// the connection is closed.
+    pub fn shutdown(&self) {
+        let _ = rustix::net::shutdown(&self.0, Shutdown::Both);
+    }
 }
 
 impl AsFd for Vsock {
@@ -111,19 +118,15 @@ pub fn signal(pid: Pid, sig: i32) {
     }
 }
 
-/// Reaps every child without blocking. Returns the wait status of `main` if it was among them.
-/// (`wait`, i.e. `waitpid(-1)`: rustix's `waitpid(None, ..)` is `waitpid(0)`, which only
-/// sees children in init's process group, and the main process has its own session.)
-pub fn reap(main: Pid) -> Option<rustix::process::WaitStatus> {
-    let mut found = None;
+/// Reaps every child without blocking, and returns them. (`wait`, i.e. `waitpid(-1)`:
+/// rustix's `waitpid(None, ..)` is `waitpid(0)`, which only sees children in init's
+/// process group, and the main process and execs have sessions of their own.)
+pub fn reap() -> Vec<(Pid, rustix::process::WaitStatus)> {
+    let mut reaped = Vec::new();
     loop {
         match rustix::process::wait(rustix::process::WaitOptions::NOHANG) {
-            Ok(Some((pid, status))) => {
-                if pid == main {
-                    found = Some(status);
-                }
-            }
-            Ok(None) | Err(_) => return found,
+            Ok(Some(child)) => reaped.push(child),
+            Ok(None) | Err(_) => return reaped,
         }
     }
 }

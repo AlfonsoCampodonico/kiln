@@ -479,8 +479,8 @@ The vmkit `TapAttach` mode has its own contract test in vmkit. Its guest boots w
 
 | Item | Why | Where it goes |
 |---|---|---|
-| `Exec` (`kubectl exec`, exec probes) | kiln-init runs one process and has no exec messages | Spec §4.1 (S1): kiln-proto `ExecStart` / `ExecExited` |
-| Projected volumes, Secrets, ConfigMaps, service-account tokens, `emptyDir` | No file delivery into the guest yet | Spec §4.5: files in `Config`, plus `FileUpdate` |
+| `Exec` (`kubectl exec`, exec probes) | kiln-init runs one process and has no exec messages | Done: [exec and volumes design](2026-10-30-kiln-shim-exec-volumes-design.md) |
+| Projected volumes, Secrets, ConfigMaps, service-account tokens, `emptyDir` | No file delivery into the guest yet | Done: [exec and volumes design](2026-10-30-kiln-shim-exec-volumes-design.md) |
 | hostPath, CSI, NFS | No shared filesystems in kiln | Refused (spec §4.5) |
 | `Stats`, OOM → `OOMKilled` | Needs guest resource signals | Spec §4.2 |
 | In-place resize (`Update`) | Needs hotplug and balloon | Spec §4.3 |
@@ -506,5 +506,5 @@ The vmkit `TapAttach` mode has its own contract test in vmkit. Its guest boots w
 | V4 | The fixed deny list is enforced with tc filters on the tap, not nftables: guest traffic bypasses netfilter. Node addresses block only new connections, so replies to kubelet probes pass. | My call (§6.1) |
 | V5 | A root `vm` worker per container drops to a configured kiln user after the netns, cgroup and bind mounts. The shim itself never runs vmkit. | My call (§8) |
 | V6 | The kernel and kiln-init are node paths in the shim's config until kiln-init is released and pinned | My call (§5.4) |
-| V7 | Unknown mounts (hostPath, CSI) are refused. Projected, Secret, ConfigMap, downward-API and emptyDir volumes are ignored with a visible warning, so ordinary pods run before §4.5 lands. | My call (§7.2) |
+| V7 | Unknown mounts (hostPath, CSI) are refused. Projected, Secret, ConfigMap, downward-API and emptyDir volumes are ignored with a visible warning, so ordinary pods run before §4.5 lands. Superseded by the [exec and volumes design](2026-10-30-kiln-shim-exec-volumes-design.md), which delivers them. | My call (§7.2) |
 | V8 | kiln-proto `Network` gains optional `search` and `options`, and kiln-init routes via an on-link gateway, so cluster DNS and `/32` pod IPs work | My call (§6.5) |

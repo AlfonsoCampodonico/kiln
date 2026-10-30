@@ -13,6 +13,8 @@ use crate::error::{Error, Result};
 pub const CONTAINER_TYPE: &str = "io.kubernetes.cri.container-type";
 /// The pod: every task of one pod carries its sandbox's id.
 pub const SANDBOX_ID: &str = "io.kubernetes.cri.sandbox-id";
+/// The pod's uid, which names its directory under kubelet's pods.
+pub const SANDBOX_UID: &str = "io.kubernetes.cri.sandbox-uid";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +132,11 @@ impl Spec {
     }
 
     /// The pod's id: what one shim process serves.
+    /// The pod's uid (CRI's annotation).
+    pub fn pod_uid(&self) -> Option<&str> {
+        self.annotations.get(SANDBOX_UID).map(String::as_str)
+    }
+
     pub fn group(&self) -> Option<&str> {
         self.annotations.get(SANDBOX_ID).map(String::as_str)
     }

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::error::{ProtoError, Result};
+use crate::exec::{ExecExited, ExecFailed, ExecSignal, ExecStart, ExecStarted, ExecWindowSize, check_code, check_id};
+use crate::volume::FileUpdate;
 
 /// The number of `kiln-init` stages (spec §9.6).
 pub const STAGES: u8 = 7;
@@ -115,6 +117,9 @@ pub enum GuestMessage {
     Running,
     Exited(Exited),
     InitFailed(InitFailed),
+    ExecStarted(ExecStarted),
+    ExecExited(ExecExited),
+    ExecFailed(ExecFailed),
 }
 
 /// Messages from the host.
@@ -124,6 +129,10 @@ pub enum HostMessage {
     Shutdown(Shutdown),
     Signal(Signal),
     WindowSize(WindowSize),
+    ExecStart(ExecStart),
+    ExecSignal(ExecSignal),
+    ExecWindowSize(ExecWindowSize),
+    FileUpdate(FileUpdate),
 }
 
 const HELLO: u8 = 1;
@@ -135,6 +144,13 @@ const INIT_FAILED: u8 = 6;
 const SHUTDOWN: u8 = 7;
 const SIGNAL: u8 = 8;
 const WINDOW_SIZE: u8 = 9;
+const EXEC_START: u8 = 10;
+const EXEC_SIGNAL: u8 = 11;
+const EXEC_WINDOW_SIZE: u8 = 12;
+const FILE_UPDATE: u8 = 13;
+const EXEC_STARTED: u8 = 14;
+const EXEC_EXITED: u8 = 15;
+const EXEC_FAILED: u8 = 16;
 
 fn type_name(ty: u8) -> Option<&'static str> {
     Some(match ty {
@@ -147,6 +163,13 @@ fn type_name(ty: u8) -> Option<&'static str> {
         SHUTDOWN => "Shutdown",
         SIGNAL => "Signal",
         WINDOW_SIZE => "WindowSize",
+        EXEC_START => "ExecStart",
+        EXEC_SIGNAL => "ExecSignal",
+        EXEC_WINDOW_SIZE => "ExecWindowSize",
+        FILE_UPDATE => "FileUpdate",
+        EXEC_STARTED => "ExecStarted",
+        EXEC_EXITED => "ExecExited",
+        EXEC_FAILED => "ExecFailed",
         _ => return None,
     })
 }
@@ -209,6 +232,20 @@ fn check_stage(name: &'static str, n: u8) -> Result<()> {
     }
 }
 
+fn check_errno(name: &'static str, errno: Option<i32>) -> Result<()> {
+    match errno {
+        Some(e) if !(1..=4095).contains(&e) => Err(ProtoError::invalid(name, format!("errno {e}"))),
+        _ => Ok(()),
+    }
+}
+
+fn check_text(name: &'static str, message: &str) -> Result<()> {
+    if message.len() > MAX_MESSAGE_BYTES {
+        return Err(ProtoError::invalid(name, format!("message of {} bytes", message.len())));
+    }
+    Ok(())
+}
+
 impl Message for GuestMessage {
     fn message_type(&self) -> u8 {
         match self {
@@ -217,6 +254,9 @@ impl Message for GuestMessage {
             GuestMessage::Running => RUNNING,
             GuestMessage::Exited(_) => EXITED,
             GuestMessage::InitFailed(_) => INIT_FAILED,
+            GuestMessage::ExecStarted(_) => EXEC_STARTED,
+            GuestMessage::ExecExited(_) => EXEC_EXITED,
+            GuestMessage::ExecFailed(_) => EXEC_FAILED,
         }
     }
 
@@ -225,35 +265,21 @@ impl Message for GuestMessage {
             GuestMessage::Hello(h) if h.protocol == 0 => Err(ProtoError::invalid("Hello", "protocol 0")),
             GuestMessage::Hello(_) | GuestMessage::Running => Ok(()),
             GuestMessage::Stage(s) => check_stage("Stage", s.n),
-            GuestMessage::Exited(e) => {
-                let ok = if e.signaled {
-                    (1..=64).contains(&e.code)
-                } else {
-                    (0..=255).contains(&e.code)
-                };
-                if ok {
-                    Ok(())
-                } else {
-                    Err(ProtoError::invalid(
-                        "Exited",
-                        format!("code {} (signaled: {})", e.code, e.signaled),
-                    ))
-                }
+            GuestMessage::Exited(e) => check_code("Exited", e.signaled, e.code),
+            GuestMessage::ExecStarted(e) => check_id("ExecStarted", e.id),
+            GuestMessage::ExecExited(e) => {
+                check_id("ExecExited", e.id)?;
+                check_code("ExecExited", e.signaled, e.code)
+            }
+            GuestMessage::ExecFailed(f) => {
+                check_id("ExecFailed", f.id)?;
+                check_errno("ExecFailed", f.errno)?;
+                check_text("ExecFailed", &f.message)
             }
             GuestMessage::InitFailed(f) => {
                 check_stage("InitFailed", f.stage)?;
-                if let Some(errno) = f.errno
-                    && !(1..=4095).contains(&errno)
-                {
-                    return Err(ProtoError::invalid("InitFailed", format!("errno {errno}")));
-                }
-                if f.message.len() > MAX_MESSAGE_BYTES {
-                    return Err(ProtoError::invalid(
-                        "InitFailed",
-                        format!("message of {} bytes", f.message.len()),
-                    ));
-                }
-                Ok(())
+                check_errno("InitFailed", f.errno)?;
+                check_text("InitFailed", &f.message)
             }
         }
     }
@@ -265,6 +291,9 @@ impl Message for GuestMessage {
             GuestMessage::Running => json(&Empty {}),
             GuestMessage::Exited(e) => json(e),
             GuestMessage::InitFailed(f) => json(f),
+            GuestMessage::ExecStarted(e) => json(e),
+            GuestMessage::ExecExited(e) => json(e),
+            GuestMessage::ExecFailed(f) => json(f),
         }
     }
 
@@ -278,6 +307,9 @@ impl Message for GuestMessage {
             }
             EXITED => GuestMessage::Exited(parse(ty, payload)?),
             INIT_FAILED => GuestMessage::InitFailed(parse(ty, payload)?),
+            EXEC_STARTED => GuestMessage::ExecStarted(parse(ty, payload)?),
+            EXEC_EXITED => GuestMessage::ExecExited(parse(ty, payload)?),
+            EXEC_FAILED => GuestMessage::ExecFailed(parse(ty, payload)?),
             _ => return Err(wrong_direction(ty)),
         };
         msg.validate()?;
@@ -292,6 +324,10 @@ impl Message for HostMessage {
             HostMessage::Shutdown(_) => SHUTDOWN,
             HostMessage::Signal(_) => SIGNAL,
             HostMessage::WindowSize(_) => WINDOW_SIZE,
+            HostMessage::ExecStart(_) => EXEC_START,
+            HostMessage::ExecSignal(_) => EXEC_SIGNAL,
+            HostMessage::ExecWindowSize(_) => EXEC_WINDOW_SIZE,
+            HostMessage::FileUpdate(_) => FILE_UPDATE,
         }
     }
 
@@ -302,6 +338,16 @@ impl Message for HostMessage {
                 Err(ProtoError::invalid("Signal", format!("signal {}", s.sig)))
             }
             HostMessage::Signal(_) | HostMessage::Shutdown(_) | HostMessage::WindowSize(_) => Ok(()),
+            HostMessage::ExecStart(e) => e.validate(),
+            HostMessage::ExecSignal(s) => {
+                check_id("ExecSignal", s.id)?;
+                if crate::signal::name(s.sig).is_none() {
+                    return Err(ProtoError::invalid("ExecSignal", format!("signal {}", s.sig)));
+                }
+                Ok(())
+            }
+            HostMessage::ExecWindowSize(w) => check_id("ExecWindowSize", w.id),
+            HostMessage::FileUpdate(u) => u.validate(),
         }
     }
 
@@ -311,6 +357,10 @@ impl Message for HostMessage {
             HostMessage::Shutdown(s) => json(s),
             HostMessage::Signal(s) => json(s),
             HostMessage::WindowSize(w) => json(w),
+            HostMessage::ExecStart(e) => json(e),
+            HostMessage::ExecSignal(s) => json(s),
+            HostMessage::ExecWindowSize(w) => json(w),
+            HostMessage::FileUpdate(u) => json(u),
         }
     }
 
@@ -320,6 +370,10 @@ impl Message for HostMessage {
             SHUTDOWN => HostMessage::Shutdown(parse(ty, payload)?),
             SIGNAL => HostMessage::Signal(parse(ty, payload)?),
             WINDOW_SIZE => HostMessage::WindowSize(parse(ty, payload)?),
+            EXEC_START => HostMessage::ExecStart(parse(ty, payload)?),
+            EXEC_SIGNAL => HostMessage::ExecSignal(parse(ty, payload)?),
+            EXEC_WINDOW_SIZE => HostMessage::ExecWindowSize(parse(ty, payload)?),
+            FILE_UPDATE => HostMessage::FileUpdate(parse(ty, payload)?),
             _ => return Err(wrong_direction(ty)),
         };
         msg.validate()?;

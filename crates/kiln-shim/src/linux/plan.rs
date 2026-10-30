@@ -39,6 +39,16 @@ pub struct WorkerPlan {
     pub scratch_bytes: u64,
     /// Lines for the container's log before the VM starts.
     pub warnings: Vec<String>,
+    /// The guest's volumes, and the files volumes' first generation by volume index.
+    #[serde(default)]
+    pub volumes: Vec<kiln_proto::Volume>,
+    #[serde(default)]
+    pub files: Vec<(u32, Vec<kiln_proto::VolumeFile>)>,
+    /// The pod disk's image (the kiln user's, created on first use) and its size.
+    #[serde(default)]
+    pub pod_disk: Option<PathBuf>,
+    #[serde(default)]
+    pub pod_disk_bytes: u64,
 }
 
 #[cfg(test)]
@@ -78,6 +88,13 @@ mod tests {
             scratch_dir: "/var/lib/kiln/shim-scratch/k8s.io-c1".into(),
             scratch_bytes: 4 << 30,
             warnings: vec!["kiln: warning: x".into()],
+            volumes: vec![kiln_proto::Volume {
+                path: "/cache".into(),
+                kind: kiln_proto::VolumeKind::EmptyDir { name: "cache".into() },
+            }],
+            files: Vec::new(),
+            pod_disk: Some("/var/lib/kiln/shim-scratch/k8s.io-pod-s1/pod.img".into()),
+            pod_disk_bytes: 1 << 30,
         };
         let json = serde_json::to_string(&plan).unwrap();
         assert_eq!(serde_json::from_str::<WorkerPlan>(&json).unwrap(), plan);

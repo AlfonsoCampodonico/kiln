@@ -33,6 +33,8 @@ fn config() -> Config {
         scratch: Scratch { size_bytes: 1 << 30 },
         exit_method: ExitMethod::Reboot,
         shutdown_grace_secs: 10,
+        volumes: Vec::new(),
+        pod_disk: None,
     }
 }
 

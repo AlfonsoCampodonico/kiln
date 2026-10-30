@@ -1,7 +1,8 @@
 //! Stage 6: start the main process (spec §9.6): user and groups from the image,
 //! environment, stdio on pipes relayed to vsock or on a pty, working directory,
 //! exec. Init keeps no copy of the child's ends of its stdio, so the relays see
-//! EOF once every process holding them has exited.
+//! EOF once every process holding them has exited. Execs start the same way, with
+//! their stdio on port 1029 (kiln-shim exec and volumes design §3.2).
 
 use std::fs::File;
 use std::os::fd::{AsFd, OwnedFd};
@@ -10,7 +11,9 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 
-use kiln_proto::{Config, HOST_CID, WindowSize, port};
+use std::io::Write;
+
+use kiln_proto::{Config, ExecStart, ExecStream, HOST_CID, Process, WindowSize, port};
 use rustix::pipe::PipeFlags;
 use rustix::process::{Gid, Pid, Uid};
 use rustix::pty::OpenptFlags;
@@ -33,37 +36,62 @@ pub struct Started {
 }
 
 pub fn start(config: &Config, events: Sender<Event>) -> Result<Started> {
+    watch_signals(events)?;
+    let main = |s: ExecStream| {
+        connect(match s {
+            ExecStream::Stdin => port::STDIN,
+            ExecStream::Stdout => port::STDOUT,
+            ExecStream::Stderr => port::STDERR,
+            ExecStream::Tty => port::TTY,
+        })
+    };
+    spawn(&config.process, &config.hostname, config.tty, config.interactive, &main)
+}
+
+/// Starts exec `e`: each stream is a connection to port 1029 opened by its header.
+pub fn exec(config: &Config, e: &ExecStart) -> Result<Started> {
+    let id = e.id;
+    let open = |s: ExecStream| {
+        let mut v = connect(port::EXEC)?;
+        v.write_all(&s.header(id)).context("send an exec stream's header")?;
+        Ok(v)
+    };
+    spawn(&e.process, &config.hostname, e.tty, e.stdin, &open)
+}
+
+/// Starts `process` with its stdio on the connections `connect` opens.
+fn spawn(
+    process: &Process,
+    hostname: &str,
+    tty: Option<WindowSize>,
+    interactive: bool,
+    connect: &dyn Fn(ExecStream) -> Result<Vsock>,
+) -> Result<Started> {
     let identity = resolve(
-        config.process.user.as_deref(),
+        process.user.as_deref(),
         &read_optional("/etc/passwd")?,
         &read_optional("/etc/group")?,
     )?;
-    let env = crate::env::build(
-        &config.process.env,
-        &identity.home,
-        &config.hostname,
-        config.tty.is_some(),
-    );
-    let workdir = config.process.working_dir.as_deref().unwrap_or("/");
+    let env = crate::env::build(&process.env, &identity.home, hostname, tty.is_some());
+    let workdir = process.working_dir.as_deref().unwrap_or("/");
     std::fs::create_dir_all(workdir).context(format!("create the working directory {workdir}"))?;
-    watch_signals(events)?;
 
-    let argv = config.process.argv();
+    let argv = process.argv();
     let mut cmd = Command::new(argv[0]);
     cmd.args(&argv[1..])
         .env_clear()
         .envs(env.iter().filter_map(|e| e.split_once('=')))
         .current_dir(workdir);
-    let (outputs, tty) = match config.tty {
+    let (outputs, master) = match tty {
         Some(size) => {
-            let (master, outputs) = pty_stdio(&mut cmd, size, &identity)?;
+            let (master, outputs) = pty_stdio(&mut cmd, size, &identity, connect)?;
             (outputs, Some(master))
         }
-        None => (pipe_stdio(&mut cmd, config.interactive, &identity)?, None),
+        None => (pipe_stdio(&mut cmd, interactive, &identity, connect)?, None),
     };
     let (hook_failed, hook_report) =
         rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).context("pipe")?;
-    drop_privileges(&mut cmd, &identity, config.tty.is_some(), hook_report);
+    drop_privileges(&mut cmd, &identity, tty.is_some(), hook_report);
     let child = cmd.spawn().map_err(|e| match hook_step(&hook_failed) {
         // The error came from the setup before exec, not from exec itself.
         Some(step) => Failure::os(format!("start {}: {step}", argv[0]), &e),
@@ -78,7 +106,7 @@ pub fn start(config: &Config, events: Sender<Event>) -> Result<Started> {
     Ok(Started {
         pid: Pid::from_raw(child.id() as i32).expect("a child's pid is positive"),
         outputs,
-        tty,
+        tty: master,
     })
 }
 
@@ -123,21 +151,26 @@ fn give(fd: impl AsFd, id: &Identity) -> Result<()> {
 }
 
 /// Pipes relayed to ports 1025–1027. Without `interactive`, stdin is `/dev/null`.
-fn pipe_stdio(cmd: &mut Command, interactive: bool, id: &Identity) -> Result<Vec<JoinHandle<()>>> {
+fn pipe_stdio(
+    cmd: &mut Command,
+    interactive: bool,
+    id: &Identity,
+    connect: &dyn Fn(ExecStream) -> Result<Vsock>,
+) -> Result<Vec<JoinHandle<()>>> {
     if interactive {
         let (r, w) = pipe()?;
         give(&r, id)?;
-        relay::spawn("stdin", connect(port::STDIN)?, w, drop)?;
+        relay::spawn("stdin", connect(ExecStream::Stdin)?, w, drop)?;
         cmd.stdin(r);
     } else {
         cmd.stdin(Stdio::null());
     }
     let mut outputs = Vec::new();
-    for (name, port) in [("stdout", port::STDOUT), ("stderr", port::STDERR)] {
+    for (name, stream) in [("stdout", ExecStream::Stdout), ("stderr", ExecStream::Stderr)] {
         let (r, w) = pipe()?;
         give(&w, id)?;
-        outputs.push(relay::spawn(name, r, connect(port)?, |v: Vsock| v.shutdown_write())?);
-        if port == port::STDOUT {
+        outputs.push(relay::spawn(name, r, connect(stream)?, |v: Vsock| v.shutdown_write())?);
+        if stream == ExecStream::Stdout {
             cmd.stdout(w);
         } else {
             cmd.stderr(w);
@@ -147,7 +180,12 @@ fn pipe_stdio(cmd: &mut Command, interactive: bool, id: &Identity) -> Result<Vec
 }
 
 /// A pty from the guest's devpts, relayed to port 1028; its slave is the child's stdio.
-fn pty_stdio(cmd: &mut Command, size: WindowSize, id: &Identity) -> Result<(OwnedFd, Vec<JoinHandle<()>>)> {
+fn pty_stdio(
+    cmd: &mut Command,
+    size: WindowSize,
+    id: &Identity,
+    connect: &dyn Fn(ExecStream) -> Result<Vsock>,
+) -> Result<(OwnedFd, Vec<JoinHandle<()>>)> {
     let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
     let master = rustix::pty::openpt(flags).context("open /dev/ptmx")?;
     rustix::pty::grantpt(&master).context("grantpt")?;
@@ -155,7 +193,7 @@ fn pty_stdio(cmd: &mut Command, size: WindowSize, id: &Identity) -> Result<(Owne
     set_window_size(&master, size)?;
     let slave = rustix::pty::ioctl_tiocgptpeer(&master, flags).context("open the pty slave")?;
     give(&slave, id)?;
-    let vsock = connect(port::TTY)?;
+    let vsock = connect(ExecStream::Tty)?;
     let dup = |fd: &OwnedFd| rustix::io::fcntl_dupfd_cloexec(fd, 0).context("dup the pty");
     relay::spawn(
         "tty-in",
@@ -163,9 +201,8 @@ fn pty_stdio(cmd: &mut Command, size: WindowSize, id: &Identity) -> Result<(Owne
         File::from(dup(&master)?),
         drop,
     )?;
-    let output = relay::spawn("tty-out", File::from(dup(&master)?), vsock, |v: Vsock| {
-        v.shutdown_write()
-    })?;
+    // The terminal's end is the end of its output: its input relay stops too.
+    let output = relay::spawn("tty-out", File::from(dup(&master)?), vsock, |v: Vsock| v.shutdown())?;
     cmd.stdin(File::from(dup(&slave)?))
         .stdout(File::from(dup(&slave)?))
         .stderr(File::from(slave));

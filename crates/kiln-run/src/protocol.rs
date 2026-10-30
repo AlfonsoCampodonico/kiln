@@ -34,6 +34,8 @@ pub enum Accepted {
     Recorded,
     /// Arrived after `InitFailed`, and dropped.
     Ignored,
+    /// An exec message, in sequence: the exec registry checks its id and state.
+    Exec,
 }
 
 /// What the guest has reported so far.
@@ -96,6 +98,12 @@ impl Protocol {
                 }
                 self.exited = Some(*e);
             }
+            GuestMessage::ExecStarted(_) | GuestMessage::ExecExited(_) | GuestMessage::ExecFailed(_) => {
+                if !self.running {
+                    return v(format!("{} before Running", name(msg)));
+                }
+                return Ok(Accepted::Exec);
+            }
             GuestMessage::InitFailed(f) => {
                 let seen = if self.running { 7 } else { self.stage };
                 if f.stage < seen {
@@ -150,6 +158,9 @@ fn name(msg: &GuestMessage) -> &'static str {
         GuestMessage::Running => "Running",
         GuestMessage::Exited(_) => "Exited",
         GuestMessage::InitFailed(_) => "InitFailed",
+        GuestMessage::ExecStarted(_) => "ExecStarted",
+        GuestMessage::ExecExited(_) => "ExecExited",
+        GuestMessage::ExecFailed(_) => "ExecFailed",
     }
 }
 
@@ -180,6 +191,19 @@ mod tests {
             p.accept(m).map_err(|v| (i, v))?;
         }
         Ok(p)
+    }
+
+    #[test]
+    fn exec_messages_only_while_running() {
+        let started = GuestMessage::ExecStarted(kiln_proto::ExecStarted { id: 1 });
+        let mut p = run(&[hello(), stage(6)]).unwrap();
+        assert!(p.accept(&started).is_err(), "before Running");
+        let mut p = run(&[hello(), stage(6), GuestMessage::Running]).unwrap();
+        assert_eq!(p.accept(&started), Ok(Accepted::Exec));
+        p.accept(&stage(7)).unwrap();
+        assert_eq!(p.accept(&started), Ok(Accepted::Exec));
+        p.accept(&exited(0)).unwrap();
+        assert!(p.accept(&started).is_err(), "after Exited");
     }
 
     #[test]

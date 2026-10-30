@@ -20,6 +20,7 @@ pub mod service;
 pub mod settings;
 pub mod tasks;
 pub mod translate;
+pub mod volumes;
 pub mod wire;
 
 #[cfg(target_os = "linux")]

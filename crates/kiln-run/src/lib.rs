@@ -10,6 +10,7 @@ pub mod config;
 pub mod console;
 mod error;
 pub mod escape;
+pub mod exec;
 pub mod options;
 pub mod persist;
 pub mod prepare;
