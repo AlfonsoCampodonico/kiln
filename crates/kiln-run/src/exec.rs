@@ -171,7 +171,8 @@ impl Execs {
         Ok(match stream {
             ExecStream::Stdin => Relay::In(s.stdin.take().ok_or_else(gone)?),
             ExecStream::Stdout => Relay::Out(std::mem::replace(&mut s.stdout, Box::new(std::io::sink()))),
-            ExecStream::Stderr => Relay::Out(s.stderr.take().ok_or_else(gone)?),
+            // An exec without a stderr sink (containerd gave none): its stderr is discarded.
+            ExecStream::Stderr => Relay::Out(s.stderr.take().unwrap_or_else(|| Box::new(std::io::sink()))),
             ExecStream::Tty => Relay::Tty {
                 input: s.stdin.take(),
                 output: std::mem::replace(&mut s.stdout, Box::new(std::io::sink())),
@@ -212,6 +213,25 @@ impl Execs {
                 State::Exited(code) => e.send(id, ExecEvent::Exited(code)),
             }
         }
+    }
+
+    /// The streams the host's execs may still connect: what a guest may have open on
+    /// port 1029 before it has said which stream each is.
+    pub fn unconnected(&self) -> usize {
+        self.lock()
+            .values()
+            .map(|e| {
+                [
+                    ExecStream::Stdin,
+                    ExecStream::Stdout,
+                    ExecStream::Stderr,
+                    ExecStream::Tty,
+                ]
+                .into_iter()
+                .filter(|s| e.expects(*s) && !e.connected.contains(s))
+                .count()
+            })
+            .sum()
     }
 
     /// Execs not yet reported.
@@ -282,6 +302,7 @@ mod tests {
         x.add(2, true, streams(true), tx.clone()).unwrap();
         assert!(x.add(2, false, streams(false), tx.clone()).is_err(), "a reused id");
         assert!(x.add(0, false, streams(false), tx).is_err());
+        assert_eq!(x.unconnected(), 2 + 1, "stdout and stderr, and a terminal");
         assert!(x.connect(9, ExecStream::Stdout).is_err(), "not started by the host");
         assert!(x.connect(1, ExecStream::Stdin).is_err(), "no stdin requested");
         assert!(x.connect(1, ExecStream::Tty).is_err(), "not a terminal");

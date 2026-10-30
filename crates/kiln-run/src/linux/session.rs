@@ -41,7 +41,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -492,6 +492,7 @@ impl Session {
             drain: drain.clone(),
             execs: execs.clone(),
             after_config: opts.after_config.clone(),
+            headers: Arc::default(),
         };
         let listener = spawn("vsock-listener", move || listen(listeners, &wake_r, serve))?;
         let handle = Handle {
@@ -948,6 +949,8 @@ struct Serve {
     drain: Arc<Drain>,
     execs: Arc<Execs>,
     after_config: Vec<HostMessage>,
+    /// Connections on port 1029 that have not sent their header yet.
+    headers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Accepts on every port until told to stop; a second connection on a port is a
@@ -1061,8 +1064,15 @@ impl Serve {
                 })?;
             }
             port::EXEC => {
+                // A guest may have no more connections waiting to name their stream than
+                // the host's execs have streams to connect (each holds a thread).
+                let headers = self.headers.clone();
+                if headers.fetch_add(1, Ordering::SeqCst) >= self.execs.unconnected() {
+                    headers.fetch_sub(1, Ordering::SeqCst);
+                    return Err(Error::refused("a stream on port 1029 that no exec expects"));
+                }
                 let execs = self.execs.clone();
-                spawn("exec-stream", move || exec_stream(stream, &execs, &events))?;
+                spawn("exec-stream", move || exec_stream(stream, &execs, &events, &headers))?;
             }
             port::STDIN => {
                 if let Some(input) = self.stdin.take() {
@@ -1284,16 +1294,17 @@ fn write_moving(sink: &mut dyn Write, mut bytes: &[u8], drain: &Drain) -> bool {
 
 /// Serves one connection on port 1029: its header names an exec the host started and
 /// one of its streams (anything else is a violation, S5); then it relays that stream.
-fn exec_stream(mut stream: UnixStream, execs: &Execs, events: &Sender<Event>) {
+fn exec_stream(mut stream: UnixStream, execs: &Execs, events: &Sender<Event>, headers: &AtomicUsize) {
     let violation = |why: String| {
         let _ = events.send(Event::Violation(why));
     };
-    let mut header = [0u8; EXEC_HEADER];
-    let read = stream
-        .set_read_timeout(Some(HEADER_TIMEOUT))
-        .and_then(|()| stream.read_exact(&mut header))
-        .and_then(|()| stream.set_read_timeout(None));
-    if let Err(e) = read {
+    let read = read_header(&mut stream);
+    headers.fetch_sub(1, Ordering::SeqCst);
+    let header = match read {
+        Ok(h) => h,
+        Err(e) => return violation(format!("an exec stream's header: {e}")),
+    };
+    if let Err(e) = stream.set_read_timeout(None) {
         return violation(format!("an exec stream's header: {e}"));
     }
     let (id, kind) = match ExecStream::parse(header) {
@@ -1320,6 +1331,27 @@ fn exec_stream(mut stream: UnixStream, execs: &Execs, events: &Sender<Event>) {
             execs.output_closed(id);
         }
     }
+}
+
+/// An exec stream's header, within [`HEADER_TIMEOUT`] in all.
+fn read_header(stream: &mut UnixStream) -> std::io::Result<[u8; EXEC_HEADER]> {
+    let deadline = Instant::now() + HEADER_TIMEOUT;
+    let mut header = [0u8; EXEC_HEADER];
+    let mut got = 0;
+    while got < EXEC_HEADER {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::from(ErrorKind::TimedOut));
+        }
+        stream.set_read_timeout(Some(left))?;
+        match stream.read(&mut header[got..]) {
+            Ok(0) => return Err(std::io::Error::from(ErrorKind::UnexpectedEof)),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(header)
 }
 
 /// Copies an exec's output to its sink until EOF; a sink that fails is dropped, and the

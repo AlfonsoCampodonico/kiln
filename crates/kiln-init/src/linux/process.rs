@@ -201,9 +201,8 @@ fn pty_stdio(
         File::from(dup(&master)?),
         drop,
     )?;
-    let output = relay::spawn("tty-out", File::from(dup(&master)?), vsock, |v: Vsock| {
-        v.shutdown_write()
-    })?;
+    // The terminal's end is the end of its output: its input relay stops too.
+    let output = relay::spawn("tty-out", File::from(dup(&master)?), vsock, |v: Vsock| v.shutdown())?;
     cmd.stdin(File::from(dup(&slave)?))
         .stdout(File::from(dup(&slave)?))
         .stderr(File::from(slave));

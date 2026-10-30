@@ -119,10 +119,12 @@ for _ in $(seq 50); do [ -S "$SOCK" ] && cri version >/dev/null 2>&1 && break; s
 cri pull "$IMAGE" >/dev/null
 
 FAILED=0
-pass() { echo "PASS $1"; }
-fail() { echo "FAIL $1: $2"; FAILED=1; }
+pass() { echo "PASS $1 ($(date +%T))"; }
+fail() { echo "FAIL $1 ($(date +%T)): $2"; FAILED=1; }
 
 pod() { # pod <name>: runs a pod sandbox, prints its id
+  # A previous run's log would show its output before this run's guest has printed any.
+  rm -rf "$E2E/pods/$1-logs"
   cat > "$E2E/pods/$1.json" <<JSON
 { "metadata": { "name": "$1", "namespace": "kiln-e2e", "uid": "kiln-e2e-$1", "attempt": 1 },
   "hostname": "$1", "log_directory": "$E2E/pods/$1-logs", "linux": {} }
@@ -207,9 +209,10 @@ for _ in $(seq 100); do
   [ "$(cri inspect -o go-template --template '{{.status.state}}' "$C")" = CONTAINER_RUNNING ] && break; sleep 0.2
 done
 if cri exec -s --timeout 10 "$C" cat /tmp/ready >/dev/null 2>&1; then probe_before=ready; else probe_before=unready; fi
-out=$(cri exec "$C" sh -c 'echo exec says hi; touch /tmp/ready; exit 4' 2>&1) && rc=0 || rc=$?
+# crictl reports a non-zero exit as "command terminated with exit code N".
+out=$(cri exec "$C" sh -c 'echo exec says hi; touch /tmp/ready; exit 4' 2>&1) || true
 if cri exec -s --timeout 10 "$C" cat /tmp/ready >/dev/null 2>&1; then probe_after=ready; else probe_after=unready; fi
-if [ "$rc" = 4 ] && echo "$out" | grep -q "exec says hi"; then pass exec; else fail exec "exit $rc: $out"; fi
+if echo "$out" | grep -q "exit code 4" && echo "$out" | grep -q "exec says hi"; then pass exec; else fail exec "$out"; fi
 if [ "$probe_before/$probe_after" = unready/ready ]; then pass exec-probe; else fail exec-probe "$probe_before/$probe_after"; fi
 tty_out=$(script -qec "crictl --config $E2E/crictl.yaml exec -it $C tty" /dev/null </dev/null 2>&1 || true)
 if echo "$tty_out" | grep -q "/dev/pts/"; then pass exec-tty; else fail exec-tty "$(echo "$tty_out" | tr -d '\r' | tail -3)"; fi

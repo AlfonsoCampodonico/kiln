@@ -62,6 +62,9 @@ pub fn recv(sock: impl AsFd) -> std::io::Result<(u32, ExecFds)> {
     if r.bytes != header.len() {
         return Err(std::io::Error::other("a short fd datagram"));
     }
+    if r.flags.contains(rustix::net::ReturnFlags::CTRUNC) {
+        return Err(std::io::Error::other("the exec's fds did not fit (MSG_CTRUNC)"));
+    }
     let mut received: Vec<OwnedFd> = Vec::new();
     for m in cmsg.drain() {
         if let RecvAncillaryMessage::ScmRights(fds) = m {
@@ -70,12 +73,23 @@ pub fn recv(sock: impl AsFd) -> std::io::Result<(u32, ExecFds)> {
     }
     let id = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     let mut it = received.into_iter();
-    let mut take = |bit: u8| if header[4] & (1 << bit) != 0 { it.next() } else { None };
+    let mut missing = false;
+    let mut take = |bit: u8| {
+        if header[4] & (1 << bit) == 0 {
+            return None;
+        }
+        let fd = it.next();
+        missing |= fd.is_none();
+        fd
+    };
     let fds = ExecFds {
         stdin: take(0),
         stdout: take(1),
         stderr: take(2),
     };
+    if missing {
+        return Err(std::io::Error::other("an fd datagram without the fds it names"));
+    }
     if it.next().is_some() {
         return Err(std::io::Error::other("an fd datagram with extra fds"));
     }

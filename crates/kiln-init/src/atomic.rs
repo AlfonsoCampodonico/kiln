@@ -23,6 +23,8 @@ pub struct Writer {
     generation: u64,
     current: Option<String>,
     pending: Option<Pending>,
+    /// A generation failed: its remaining frames are skipped, up to its commit.
+    skipping: bool,
 }
 
 #[derive(Debug)]
@@ -39,6 +41,7 @@ impl Writer {
             generation: 0,
             current: None,
             pending: None,
+            skipping: false,
         }
     }
 
@@ -48,7 +51,23 @@ impl Writer {
 
     /// Writes `u`'s files into the generation being built (starting one if none is);
     /// with `commit`, swaps it in. True when a generation was committed.
+    ///
+    /// A failure drops the generation being built, and the rest of its frames are then
+    /// skipped: the current generation stays, as when kubelet cannot write an update.
     pub fn apply(&mut self, u: &FileUpdate) -> Result<bool> {
+        if self.skipping {
+            self.skipping = !u.commit;
+            return Ok(false);
+        }
+        self.write(u).inspect_err(|_| {
+            if let Some(p) = self.pending.take() {
+                let _ = fs::remove_dir_all(self.base.join(p.dir));
+            }
+            self.skipping = !u.commit;
+        })
+    }
+
+    fn write(&mut self, u: &FileUpdate) -> Result<bool> {
         if self.pending.is_none() {
             self.generation += 1;
             let dir = format!("..kiln.{}", self.generation);
@@ -284,5 +303,26 @@ mod tests {
         let mut u = file_updates(0, &files(base, &[("a", "1", 0o644)])).remove(0);
         u.files.push(u.files[0].clone());
         assert!(w.apply(&u).is_err(), "the same file twice");
+    }
+
+    #[test]
+    fn a_failed_generation_is_skipped_and_the_current_one_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let mut w = Writer::new(base);
+        write(&mut w, &files(base, &[("a", "v1", 0o644)]));
+        let big = "x".repeat(100 << 10);
+        let mut frames = file_updates(0, &files(base, &[("a", &big, 0o644)]));
+        assert!(frames.len() > 1);
+        frames[1].files[0].path = "b".into();
+        assert!(w.apply(&frames[0]).is_ok());
+        assert!(w.apply(&frames[1]).is_err(), "an append to another file");
+        for f in &frames[2..] {
+            assert!(!w.apply(f).unwrap(), "skipped");
+        }
+        assert_eq!(fs::read_to_string(base.join("a")).unwrap(), "v1");
+        assert_eq!(names(base), ["..data", "..kiln.1", "a"]);
+        write(&mut w, &files(base, &[("a", "v3", 0o644)]));
+        assert_eq!(fs::read_to_string(base.join("a")).unwrap(), "v3");
     }
 }

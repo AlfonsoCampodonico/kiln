@@ -70,11 +70,15 @@ const KERNEL_FS: [&str; 8] = [
 /// kubelet's volume plugins whose content is files in its atomic-writer layout.
 pub const FILES_PLUGINS: [&str; 4] = ["projected", "secret", "configmap", "downward-api"];
 
-/// `/var/lib/kubelet/pods/<uid>/<rest>`: the pod's directory and `<rest>`'s parts.
-fn kubelet_path(source: &str) -> Option<(PathBuf, Vec<&str>)> {
+/// `/var/lib/kubelet/pods/<uid>/<rest>` of the container's own pod: the pod's directory
+/// and `<rest>`'s parts. Another pod's directory (a hostPath naming it) is not kubelet's
+/// volume for this container, and is refused like any host path.
+fn kubelet_path<'a>(source: &'a str, pod_uid: Option<&str>) -> Option<(PathBuf, Vec<&'a str>)> {
     let rest = source.strip_prefix(KUBELET_PODS)?.strip_prefix('/')?;
     let mut parts = rest.split('/');
-    let uid = parts.next().filter(|u| !u.is_empty() && *u != "." && *u != "..")?;
+    let uid = parts
+        .next()
+        .filter(|u| !u.is_empty() && *u != "." && *u != ".." && Some(*u) == pod_uid)?;
     let parts: Vec<&str> = parts.collect();
     if parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
         return None;
@@ -82,8 +86,8 @@ fn kubelet_path(source: &str) -> Option<(PathBuf, Vec<&str>)> {
     Some((PathBuf::from(KUBELET_PODS).join(uid), parts))
 }
 
-fn kubelet_volume(source: &str) -> Option<MountClass> {
-    let (pod, parts) = kubelet_path(source)?;
+fn kubelet_volume(source: &str, pod_uid: Option<&str>) -> Option<MountClass> {
+    let (pod, parts) = kubelet_path(source, pod_uid)?;
     match parts.as_slice() {
         ["volumes", plugin, name] => match plugin.strip_prefix("kubernetes.io~")? {
             p if FILES_PLUGINS.contains(&p) => Some(MountClass::Volume(Source::Files(source.into()))),
@@ -116,7 +120,8 @@ fn tmpfs_size(options: &[String]) -> Option<u64> {
     num.parse::<u64>().ok()?.checked_mul(mul).filter(|n| *n > 0)
 }
 
-pub fn classify(m: &Mount) -> MountClass {
+/// One mount of a container of the pod whose uid is `pod_uid`.
+pub fn classify(m: &Mount, pod_uid: Option<&str>) -> MountClass {
     let dest = m.destination.trim_end_matches('/');
     let source = m.source.as_deref().unwrap_or("");
     let bind = m.kind.as_deref().is_none_or(|k| k == "bind" || k == "rbind")
@@ -132,7 +137,7 @@ pub fn classify(m: &Mount) -> MountClass {
             size: tmpfs_size(&m.options),
         }),
         _ if !bind && m.kind.as_deref().is_some_and(|k| KERNEL_FS.contains(&k)) => MountClass::Refused,
-        _ => kubelet_volume(source).unwrap_or(MountClass::Refused),
+        _ => kubelet_volume(source, pod_uid).unwrap_or(MountClass::Refused),
     }
 }
 
@@ -140,7 +145,7 @@ pub fn classify(m: &Mount) -> MountClass {
 pub fn check(spec: &Spec) -> Result<Checked> {
     let mut out = Checked::default();
     for m in &spec.mounts {
-        match classify(m) {
+        match classify(m, spec.pod_uid()) {
             MountClass::Provided | MountClass::Kiln | MountClass::Ignored => {}
             MountClass::ResolvConf(p) => out.resolv_conf = Some(p),
             MountClass::Volume(source) => out.volumes.push((m.destination.clone(), source)),
@@ -252,7 +257,7 @@ mod tests {
             (bind("/data", "/srv/data"), MountClass::Refused),
         ];
         for (m, want) in cases {
-            assert_eq!(classify(&m), want, "{m:?}");
+            assert_eq!(classify(&m, Some("0e1f")), want, "{m:?}");
         }
     }
 
@@ -272,12 +277,21 @@ mod tests {
                     "/var/lib/kubelet/pods/u/volumes/kubernetes.io~projected/t",
                 ),
             ],
+            annotations: [(crate::oci::SANDBOX_UID.to_string(), "u".to_string())].into(),
             ..Spec::default()
         };
         let c = check(&spec).unwrap();
         assert_eq!(c.resolv_conf.as_deref(), Some(std::path::Path::new("/r")));
         assert_eq!(c.volumes.len(), 1);
         assert_eq!(c.volumes[0].0, "/var/run/secrets/kubernetes.io/serviceaccount");
+    }
+
+    #[test]
+    fn only_the_containers_own_pods_volumes() {
+        let m = bind("/x", "/var/lib/kubelet/pods/other/volumes/kubernetes.io~secret/s");
+        assert_eq!(classify(&m, Some("mine")), MountClass::Refused);
+        assert_eq!(classify(&m, None), MountClass::Refused);
+        assert!(matches!(classify(&m, Some("other")), MountClass::Volume(_)));
     }
 
     #[test]

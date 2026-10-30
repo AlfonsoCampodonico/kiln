@@ -46,8 +46,24 @@ pub struct LinuxBackend {
     /// that forked it ends, and ttrpc's handler threads come and go, so every child is
     /// forked by one thread that lives as long as the shim. It also spawns one child at a
     /// time, so a worker's channel fd, which must be inheritable, reaches no other child.
-    spawner: Mutex<std::sync::mpsc::Sender<Spawn>>,
+    spawner: Spawner,
     pod_disks: PodDisks,
+}
+
+type Spawner = Arc<Mutex<std::sync::mpsc::Sender<Spawn>>>;
+
+/// `cmd`, spawned by the spawner thread. `inherit` is made inheritable for this child
+/// only: no other spawn runs until it has been forked.
+fn spawn_with(spawner: &Spawner, cmd: Command, inherit: &[BorrowedFd<'_>]) -> Result<Child> {
+    let gone = || Error::Internal("the spawner thread is gone".into());
+    let spawner = spawner.lock().unwrap_or_else(|e| e.into_inner());
+    for fd in inherit {
+        rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty())
+            .map_err(|e| Error::Internal(format!("the worker's channel: {e}")))?;
+    }
+    let (reply, child) = std::sync::mpsc::channel();
+    spawner.send((cmd, reply)).map_err(|_| gone())?;
+    child.recv().map_err(|_| gone())?.map_err(Error::from)
 }
 
 impl LinuxBackend {
@@ -63,23 +79,13 @@ impl LinuxBackend {
             .expect("the spawner thread");
         Self {
             attached: Mutex::new(HashMap::new()),
-            spawner: Mutex::new(tx),
+            spawner: Arc::new(Mutex::new(tx)),
             pod_disks: PodDisks::default(),
         }
     }
 
-    /// `cmd`, spawned by the spawner thread. `inherit` is made inheritable for this
-    /// child only: no other spawn runs until it has been forked.
     fn spawn(&self, cmd: Command, inherit: &[BorrowedFd<'_>]) -> Result<Child> {
-        let gone = || Error::Internal("the spawner thread is gone".into());
-        let spawner = self.spawner.lock().unwrap_or_else(|e| e.into_inner());
-        for fd in inherit {
-            rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty())
-                .map_err(|e| Error::Internal(format!("the worker's channel: {e}")))?;
-        }
-        let (reply, child) = std::sync::mpsc::channel();
-        spawner.send((cmd, reply)).map_err(|_| gone())?;
-        child.recv().map_err(|_| gone())?.map_err(Error::from)
+        spawn_with(&self.spawner, cmd, inherit)
     }
 
     fn attach(&self, netns: &Path, v: &VmLaunch, account: &Account) -> Result<Option<PodNet>> {
@@ -154,21 +160,23 @@ struct Pause {
     /// Its pod, whose disk goes with it.
     group: Option<String>,
     pod_disks: PodDisks,
+    spawner: Spawner,
 }
 
 /// Removes a pod disk's directory as its owner (root deletes nothing in the kiln user's
 /// store, design §8): `containerd-shim-kiln-v1 cleanup <dir>` run as that user.
-fn remove_pod_disk(dir: &Path, owner: &Account) {
+fn remove_pod_disk(spawner: &Spawner, dir: &Path, owner: &Account) {
     use std::os::unix::process::CommandExt;
     let Ok(exe) = exe() else { return };
-    let status = Command::new(exe)
-        .arg("cleanup")
+    let mut cmd = Command::new(exe);
+    cmd.arg("cleanup")
         .arg(dir)
         .uid(owner.uid)
         .gid(owner.gid)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .status();
+        .stdout(Stdio::null());
+    // Through the spawner, as every child: no other child's inheritable fd reaches it.
+    let status = spawn_with(spawner, cmd, &[]).and_then(|mut c| c.wait().map_err(Error::from));
     if !status.as_ref().is_ok_and(|s| s.success()) {
         log::warn!("removing the pod disk {}: {status:?}", dir.display());
     }
@@ -199,7 +207,7 @@ impl Process for Pause {
             .as_ref()
             .and_then(|g| self.pod_disks.lock().unwrap_or_else(|e| e.into_inner()).remove(g));
         if let Some((dir, owner)) = disk {
-            remove_pod_disk(&dir, &owner);
+            remove_pod_disk(&self.spawner, &dir, &owner);
         }
         code
     }
@@ -265,14 +273,16 @@ struct WorkerExec {
 
 impl ExecProcess for WorkerExec {
     fn start(&self) -> Result<()> {
-        let fifos = self
-            .fifos
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .ok_or_else(|| Error::Refused("the exec was started already".into()))?;
         {
+            // The channel first: a signal that finds the FIFOs gone then waits for the
+            // exec's line to go out, and reaches the exec after it.
             let mut c = self.chan.lock().unwrap_or_else(|e| e.into_inner());
+            let fifos = self
+                .fifos
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .ok_or_else(|| Error::Refused("the exec was started already, or killed".into()))?;
             let fds = [0, 1, 2].map(|i| fifos[i].as_ref().map(|f| f.as_fd()));
             fdpass::send(&c.fds, self.id, fds)
                 .map_err(|e| Error::Internal(format!("passing the exec's stdio: {e}")))?;
@@ -286,7 +296,6 @@ impl ExecProcess for WorkerExec {
             )
             .map_err(|e| Error::Internal(format!("the VM worker: {e}")))?;
         }
-        drop(fifos);
         let (lock, cv) = &*self.heard;
         let mut h = lock.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -400,11 +409,12 @@ impl Process for Worker {
     }
 
     fn exec(&self, e: &ExecLaunch) -> Result<Arc<dyn ExecProcess>> {
+        // Read and write, so the open never waits for containerd's writer (which an exec's
+        // may not have opened yet); EOF comes from `CloseIO`, which the worker relays.
         let stdin = if e.stdio.stdin.is_empty() {
             None
         } else {
-            // containerd opened the writer side already; this returns once it is there.
-            Some(File::open(&e.stdio.stdin)?)
+            Some(OpenOptions::new().read(true).write(true).open(&e.stdio.stdin)?)
         };
         let out = |p: &str| -> Result<Option<File>> {
             if p.is_empty() {
@@ -462,6 +472,7 @@ impl LinuxBackend {
             child: Mutex::new(child),
             group,
             pod_disks: self.pod_disks.clone(),
+            spawner: self.spawner.clone(),
         }))
     }
 
@@ -656,6 +667,11 @@ fn poll_volumes(mut watched: Vec<(u32, PathBuf, String)>, chan: &Mutex<Channel>,
             let (h, _) = cv.wait_timeout(h, POLL).unwrap_or_else(|e| e.into_inner());
             if h.closed || h.exited.is_some() {
                 return;
+            }
+            // Before `Start` the worker has no session to hand an update to; the first
+            // poll after it compares with what `Create` read.
+            if !matches!(h.started, Some(Ok(_))) {
+                continue;
             }
         }
         for (volume, dir, seen) in &mut watched {

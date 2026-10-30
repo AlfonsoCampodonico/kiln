@@ -8,11 +8,11 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use kiln_proto::{Config, FileUpdate, MAX_VOLUME_BYTES, VolumeKind};
+use kiln_proto::{Config, FileUpdate, MAX_VOLUME_BYTES, MAX_VOLUME_FILES, VolumeKind};
 use rustix::fs::{CWD, Mode, OFlags, SeekFrom};
 use rustix::mount::{
     FsMountFlags, FsOpenFlags, MountAttrFlags, MountFlags, MoveMountFlags, OpenTreeFlags, fsconfig_create,
-    fsconfig_set_string, fsmount, fsopen, mount, mount_remount, move_mount, open_tree,
+    fsconfig_set_string, fsmount, fsopen, mount, mount_bind, mount_remount, move_mount, open_tree,
 };
 
 use super::sys;
@@ -23,7 +23,9 @@ use crate::error::{Context, Failure, Result};
 /// The volumes' detached mounts, by index in `Config.volumes`.
 pub struct Volumes {
     files: Vec<Option<(OwnedFd, Writer)>>,
-    pod: Option<OwnedFd>,
+    /// The pod disk's mount (to clone) and its root opened as a directory (for ioctls
+    /// and syncfs, which a mount's path descriptor does not take).
+    pod: Option<(OwnedFd, OwnedFd)>,
 }
 
 /// The path through which init reaches a detached mount.
@@ -54,8 +56,10 @@ impl Volumes {
         for v in &config.volumes {
             files.push(match v.kind {
                 VolumeKind::Files { .. } => {
-                    // Room for two generations: the old one stays until the new one is in.
-                    let size = format!("{}", 2 * MAX_VOLUME_BYTES + (1 << 20));
+                    // Room for two generations (the old one stays until the new one is in),
+                    // each of its most bytes and files, every file rounded up to whole pages.
+                    let one = MAX_VOLUME_BYTES + MAX_VOLUME_FILES as u64 * 4096;
+                    let size = format!("{}", 2 * one + (1 << 20));
                     let fd = detached("tmpfs", &[("size", &size), ("mode", "0755")])?;
                     let writer = Writer::new(fd_path(&fd));
                     Some((fd, writer))
@@ -79,8 +83,17 @@ impl Volumes {
                     disk.size_bytes
                 )));
             }
-            sys::ext4_resize(&fd, disk.size_bytes / 4096).context("grow the pod disk")?;
-            vols.pod = Some(fd);
+            // The mount's descriptor is a path one (fsmount): ioctls and syncfs need its
+            // root opened as a directory, which also keeps the detached mount alive.
+            let root = rustix::fs::openat(
+                &fd,
+                ".",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .context("open the pod disk")?;
+            sys::ext4_resize(&root, disk.size_bytes / 4096).context("grow the pod disk")?;
+            vols.pod = Some((fd, root));
         }
         Ok(vols)
     }
@@ -96,23 +109,36 @@ impl Volumes {
         w.apply(u).map(drop)
     }
 
-    /// Stage 4, after the pivot: attaches every volume at its path.
+    /// Stage 4, after the pivot: attaches every volume at its path. A whole detached
+    /// mount is cloned straight onto its path; a part of one (an `emptyDir` on the pod
+    /// disk, a single file) is bound from the mount attached at a staging directory,
+    /// since the kernel clones only a detached mount's root. The staging mounts are
+    /// detached again, and their directory removed, before anything else runs.
     pub fn attach(&self, config: &Config) -> Result<()> {
+        let mut staging = Staging::default();
+        let attached = self.attach_all(config, &mut staging);
+        staging.remove();
+        attached
+    }
+
+    fn attach_all(&self, config: &Config, staging: &mut Staging) -> Result<()> {
         for (n, v) in config.volumes.iter().enumerate() {
             let dest = Path::new(&v.path);
             match &v.kind {
                 VolumeKind::Files { file } => {
                     let (fd, w) = self.files[n].as_ref().expect("a files volume has its mount");
-                    let clone = if *file {
+                    if *file {
                         touch(dest)?;
+                        let root = staging.attach(fd, &format!("files-{n}"))?;
                         let source = w.single_file()?;
-                        open_tree(CWD, &source, clone_flags()).context(format!("clone {}", source.display()))?
+                        let rel = source.strip_prefix(w.base()).unwrap_or(&source);
+                        mount_bind(root.join(rel), dest).context(format!("mount {}", v.path))?;
                     } else {
                         mkdir_all(dest)?;
-                        open_tree(fd, "", clone_flags() | OpenTreeFlags::AT_EMPTY_PATH)
-                            .context(format!("clone the volume for {}", v.path))?
-                    };
-                    place(&clone, dest)?;
+                        let clone = open_tree(fd, "", clone_flags() | OpenTreeFlags::AT_EMPTY_PATH)
+                            .context(format!("clone the volume for {}", v.path))?;
+                        place(&clone, dest)?;
+                    }
                     mount_remount(
                         dest,
                         MountFlags::BIND | MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV,
@@ -125,7 +151,8 @@ impl Volumes {
                         .pod
                         .as_ref()
                         .ok_or_else(|| Failure::msg("an emptyDir without the pod disk"))?;
-                    let dir = fd_path(pod).join(name);
+                    let (mount, root) = pod;
+                    let dir = fd_path(root).join(name);
                     match std::fs::create_dir(&dir) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -136,9 +163,8 @@ impl Volumes {
                     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
                         .context(format!("chmod the emptyDir {name}"))?;
                     mkdir_all(dest)?;
-                    let clone =
-                        open_tree(pod, name.as_str(), clone_flags()).context(format!("clone the emptyDir {name}"))?;
-                    place(&clone, dest)?;
+                    let root = staging.attach(mount, "pod")?;
+                    mount_bind(root.join(name), dest).context(format!("mount the emptyDir {name}"))?;
                 }
                 VolumeKind::Tmpfs { size_bytes } => {
                     mkdir_all(dest)?;
@@ -164,8 +190,46 @@ impl Volumes {
     /// Before `Exited`: the pod disk synced and made read-only, like the scratch disk,
     /// so the next container's VM finds it clean.
     pub fn finish(&self) {
-        if let Some(pod) = &self.pod {
-            super::storage::finish(pod);
+        if let Some((_, root)) = &self.pod {
+            super::storage::finish(root);
+        }
+    }
+}
+
+/// Where detached mounts are attached while parts of them are bound onto volume paths.
+const STAGING: &str = "/.kiln-volumes";
+
+/// The detached mounts attached at [`STAGING`], by name.
+#[derive(Default)]
+struct Staging {
+    attached: Vec<PathBuf>,
+}
+
+impl Staging {
+    /// `fd`'s mount attached at `STAGING/<name>` (once): its path.
+    fn attach(&mut self, fd: &OwnedFd, name: &str) -> Result<PathBuf> {
+        let at = Path::new(STAGING).join(name);
+        if self.attached.contains(&at) {
+            return Ok(at);
+        }
+        if self.attached.is_empty() {
+            std::fs::create_dir_all(STAGING).context(format!("create {STAGING}"))?;
+        }
+        std::fs::create_dir_all(&at).context(format!("create {}", at.display()))?;
+        let clone = open_tree(fd, "", clone_flags() | OpenTreeFlags::AT_EMPTY_PATH).context("clone a volume")?;
+        place(&clone, &at)?;
+        self.attached.push(at.clone());
+        Ok(at)
+    }
+
+    /// Detaches the staging mounts (the binds made from them stay) and removes their
+    /// directory, so the container's root keeps no trace of them.
+    fn remove(self) {
+        for at in &self.attached {
+            let _ = rustix::mount::unmount(at.as_path(), rustix::mount::UnmountFlags::DETACH);
+        }
+        if !self.attached.is_empty() {
+            let _ = std::fs::remove_dir_all(STAGING);
         }
     }
 }

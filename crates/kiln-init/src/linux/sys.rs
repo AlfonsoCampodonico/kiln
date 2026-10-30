@@ -64,6 +64,13 @@ impl Vsock {
     pub fn shutdown_write(&self) {
         let _ = rustix::net::shutdown(&self.0, Shutdown::Write);
     }
+
+    /// Closes both directions, for every descriptor of the connection: a terminal's,
+    /// whose input relay holds a clone. The VMMs pass a guest's half-close on only once
+    /// the connection is closed.
+    pub fn shutdown(&self) {
+        let _ = rustix::net::shutdown(&self.0, Shutdown::Both);
+    }
 }
 
 impl AsFd for Vsock {

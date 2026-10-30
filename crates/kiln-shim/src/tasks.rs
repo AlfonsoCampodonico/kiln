@@ -280,7 +280,11 @@ impl Tasks {
             .spawn(move || {
                 let code = process.wait();
                 let mut tasks = shared.lock();
-                while tasks.get(&id).is_some_and(|e| e.starting) {
+                // As runc's shim: the container's exit follows its execs' (they end with it).
+                while tasks
+                    .get(&id)
+                    .is_some_and(|e| e.starting || e.execs.values().any(|x| x.starting || x.status == Status::Running))
+                {
                     tasks = shared.changed.wait(tasks).unwrap_or_else(|e| e.into_inner());
                 }
                 if let Some(e) = tasks.get_mut(&id) {

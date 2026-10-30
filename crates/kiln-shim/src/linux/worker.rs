@@ -90,7 +90,7 @@ pub fn main() -> ! {
     }
     // Until Start, a signal ends the container as it would a runc container's init.
     loop {
-        match lines.read::<ToWorker>() {
+        match lines.read_within::<ToWorker>(MAX_PLAN) {
             Ok(Some(ToWorker::Start {})) => break,
             Ok(Some(ToWorker::Kill {})) | Ok(None) | Err(_) => exited(&plan, &mut tx, 128 + 9),
             Ok(Some(ToWorker::Signal(sig))) => exited(&plan, &mut tx, 128 + sig),
@@ -222,10 +222,15 @@ fn prepare(plan: &WorkerPlan) -> Result<Prepared, Fail> {
             ctx(fs::create_dir_all(dir), "creating the pod disk's directory")?;
         }
         if !disk.exists() {
+            // Made beside it and renamed: a worker killed half-way leaves no partial disk
+            // for the next container to attach.
+            let partial = disk.with_extension("partial");
+            let _ = fs::remove_file(&partial);
             ctx(
-                kiln_image::scratch::create_scratch(disk, plan.pod_disk_bytes),
+                kiln_image::scratch::create_scratch(&partial, plan.pod_disk_bytes),
                 "creating the pod disk",
             )?;
+            ctx(fs::rename(&partial, disk), "creating the pod disk")?;
         }
     }
     let run_dir = plan.vm_dir.join("run");
@@ -411,10 +416,16 @@ fn boot(
     };
     say(&FromWorker::Started { vmm_pid });
     let (report, reports) = std::sync::mpsc::channel::<(u32, ExecEvent)>();
+    // Id 0 is no exec's: it marks a flush, answered on `flushed`.
+    let (flush, flushed) = std::sync::mpsc::channel::<()>();
     std::thread::spawn({
         let say = say.clone();
         move || {
             for (id, e) in reports {
+                if id == 0 {
+                    let _ = flush.send(());
+                    continue;
+                }
                 say(&match e {
                     ExecEvent::Started => FromWorker::ExecStarted { id },
                     ExecEvent::Failed(m) => FromWorker::ExecFailed {
@@ -431,14 +442,25 @@ fn boot(
     std::thread::spawn({
         let handle = session.handle();
         move || {
-            for (volume, files) in pending {
-                if !handle.update_files(file_updates(volume, &files)) {
-                    return;
+            while let Ok(first) = pending.recv() {
+                // Only the newest generation of each volume matters.
+                let mut batch = vec![first];
+                batch.extend(pending.try_iter());
+                let mut newest: Vec<(u32, Vec<kiln_proto::VolumeFile>)> = Vec::new();
+                for (volume, files) in batch {
+                    newest.retain(|(v, _)| *v != volume);
+                    newest.push((volume, files));
+                }
+                for (volume, files) in newest {
+                    if !handle.update_files(file_updates(volume, &files)) {
+                        eprintln!("kiln: warning: a volume update could not reach the guest");
+                    }
                 }
             }
         }
     });
     let handle = session.handle();
+    let flusher = report.clone();
     std::thread::spawn(move || {
         let mut closers: HashMap<u32, Arc<AtomicBool>> = HashMap::new();
         loop {
@@ -494,6 +516,10 @@ fn boot(
         }
     });
     let outcome = session.finish();
+    // The execs' last reports (the session ended them) reach the shim before `Exited`.
+    if flusher.send((0, ExecEvent::Started)).is_ok() {
+        let _ = flushed.recv_timeout(Duration::from_secs(2));
+    }
     let log = console.log.clone();
     console.finish(Duration::from_secs(2));
     if let Some(v) = &outcome.violation {

@@ -135,7 +135,10 @@ pub fn run(config: &Config, started: Started, events: &Receiver<Event>, volumes:
                 continue;
             }
             Some(Event::Host(HostMessage::FileUpdate(u))) => {
-                volumes.update(&u)?;
+                // The app keeps the files it has, as when kubelet cannot write an update.
+                if let Err(f) = volumes.update(&u) {
+                    eprintln!("kiln-init: a volume update failed: {f}");
+                }
                 continue;
             }
             Some(Event::Host(HostMessage::Config(_))) => {
