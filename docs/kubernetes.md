@@ -2,7 +2,7 @@
 
 `containerd-shim-kiln-v1` is a containerd shim v2 (runtime type `io.containerd.kiln.v1`). Behind a Kubernetes RuntimeClass `kiln`, it runs a pod's container as a kiln microVM that owns the pod IP. kubelet, the CRI log files, Services, NetworkPolicy and HTTP/TCP probes keep working.
 
-The design is [specs/2026-10-21-kiln-shim-v1-design.md](superpowers/specs/2026-10-21-kiln-shim-v1-design.md). This page is how to run it.
+The design is [specs/2026-10-21-kiln-shim-v1-design.md](superpowers/specs/2026-10-21-kiln-shim-v1-design.md), with exec and volumes in [specs/2026-10-30-kiln-shim-exec-volumes-design.md](superpowers/specs/2026-10-30-kiln-shim-exec-volumes-design.md). This page is how to run it.
 
 ## What works, and what does not yet
 
@@ -14,10 +14,16 @@ The design is [specs/2026-10-21-kiln-shim-v1-design.md](superpowers/specs/2026-1
 - `crictl stop`, `rm` and `rmp`.
 - The pod IP, inbound and outbound, under the CNI and NetworkPolicy. Cloud metadata (`169.254.0.0/16`) and new connections to the node's own addresses are blocked for the guest.
 - Cluster DNS, including search domains.
+- `kubectl exec`, with and without a terminal, and exec probes.
+- Volumes:
+  - Secrets, ConfigMaps, projected volumes (the service-account token too) and the downward API, as read-only files in kubelet's `..data` layout. kubelet's updates reach the running guest within seconds.
+  - A `subPath` that names one file of those volumes.
+  - `emptyDir`. On disk, it lives on one disk per pod, so what an init container writes reaches the app. With `medium: Memory` it is a tmpfs in each VM, not shared between the pod's containers.
 
 **Not yet:**
-- `kubectl exec` and exec probes (refused with `Unimplemented`).
-- Volumes. Projected volumes, Secrets, ConfigMaps, service-account tokens and `emptyDir` are not inside the VM: the pod runs, with a warning in its log. hostPath and CSI are refused.
+- hostPath, CSI and NFS volumes, and `subPath` directories (refused).
+- `emptyDir` `sizeLimit` (not enforced inside the VM).
+- The termination message (`/dev/termination-log` is not copied back).
 - `Stats` and `OOMKilled`.
 - In-place resize.
 - Sidecars and multi-container pods: a second container fails to start while another runs.
@@ -45,6 +51,7 @@ The design is [specs/2026-10-21-kiln-shim-v1-design.md](superpowers/specs/2026-1
    vmm = "firecracker"                          # or "cloud-hypervisor"
    default_memory_mib = 1024                    # guest memory without a memory limit
    scratch_disk = "4G"                          # each VM's writable layer
+   pod_disk = "1G"                              # each pod's disk for its emptyDir volumes
    egress_allow = ["169.254.20.10/32"]          # e.g. NodeLocal DNSCache, despite the link-local deny
    ```
 
@@ -114,7 +121,9 @@ crictl rm "$CTR"; crictl stopp "$POD"; crictl rmp "$POD"
 - HTTP to the pod IP from the node;
 - the metadata and node deny list, with another pod reachable;
 - stop with an ignored SIGTERM;
-- a concurrent second container refused.
+- a concurrent second container refused;
+- exec, an exec readiness probe, a tty exec and a missing command;
+- a Secret, a ConfigMap and an `emptyDir` handed from an init container to the app, then a ConfigMap update seen live, and the pod disk removed with the pod.
 
 On this repository's Lima VM:
 
@@ -125,7 +134,7 @@ sudo env KILN_SHIM=$T/debug/containerd-shim-kiln-v1 KILN_KERNEL=... KILN_INIT=..
 
 ## When a pod fails
 
-- **The pod's log.** It holds the shim's `kiln:` lines: an init failure, the VM ending without the command's exit, the end of the guest console, and volumes not delivered.
+- **The pod's log.** It holds the shim's `kiln:` lines: an init failure, the VM ending without the command's exit, and the end of the guest console.
 - **containerd's log.** It holds the shim's own errors:
   - a rootfs from another snapshotter (`kiln needs containerd's erofs snapshotter`);
   - a refused mount;

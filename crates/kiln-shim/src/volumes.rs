@@ -289,6 +289,11 @@ mod tests {
             std::fs::Permissions::from_mode(0o400),
         )
         .unwrap();
+        std::fs::set_permissions(
+            d.path().join("..2026_10_30_10_00_00.1/app.conf"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
         let (g, files) = read_files(d.path()).unwrap();
         assert_eq!(g, "..2026_10_30_10_00_00.1");
         let names: Vec<_> = files
