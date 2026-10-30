@@ -35,6 +35,8 @@ pub struct Settings {
     pub default_memory_mib: u32,
     /// Each container VM's scratch disk, its writable layer.
     pub scratch_disk: u64,
+    /// Each pod's disk for its `emptyDir` volumes, shared by its containers in turn.
+    pub pod_disk: u64,
     pub boot_timeout: Duration,
     /// Link-local or node addresses the guest may reach anyway (design §6.1).
     pub egress_allow: Vec<Cidr>,
@@ -57,6 +59,8 @@ struct Raw {
     default_memory_mib: Option<u32>,
     #[serde(default)]
     scratch_disk: Option<String>,
+    #[serde(default)]
+    pod_disk: Option<String>,
     #[serde(default)]
     boot_timeout_secs: Option<u64>,
     #[serde(default)]
@@ -100,6 +104,11 @@ impl Settings {
             Some(s) => parse_size(s).map_err(|e| invalid("scratch_disk", e))?,
         };
         kiln_run::options::check_disk(scratch_disk).map_err(|e| invalid("scratch_disk", e))?;
+        let pod_disk = match &raw.pod_disk {
+            None => 1 << 30,
+            Some(s) => parse_size(s).map_err(|e| invalid("pod_disk", e))?,
+        };
+        kiln_run::options::check_disk(pod_disk).map_err(|e| invalid("pod_disk", e))?;
         let egress_allow = raw
             .egress_allow
             .iter()
@@ -122,6 +131,7 @@ impl Settings {
             max_cpus,
             default_memory_mib,
             scratch_disk,
+            pod_disk,
             boot_timeout: Duration::from_secs(raw.boot_timeout_secs.unwrap_or(30)),
             egress_allow,
         })

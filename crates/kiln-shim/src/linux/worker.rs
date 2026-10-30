@@ -3,18 +3,24 @@
 //! fd [`FD_ENV`] names. As root it joins the container's cgroup and the pod netns and
 //! bind-mounts the layers into a private mount namespace; then it drops to the kiln
 //! user for good, and only then touches kiln-run and vmkit (kiln T6).
+//!
+//! Once the VM runs it also starts execs (their FIFOs arrive on the fd channel named
+//! by [`FDS_ENV`]) and hands kubelet's volume updates to the guest (kiln-shim exec and
+//! volumes design §5.3, §5.5).
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, FromRawFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kiln_proto::sanitize::clean_line;
-use kiln_proto::{Config, Scratch, WindowSize};
+use kiln_proto::{Config, ExecStart, HostMessage, Scratch, WindowSize, file_updates};
+use kiln_run::exec::{ExecEvent, ExecStreams};
 use kiln_run::{ConsoleRelay, Session, SessionOptions, Streams, VmmKind};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::mount::{MountFlags, MountPropagationFlags, mount_bind, mount_change, mount_remount};
@@ -22,8 +28,8 @@ use rustix::process::{Gid, Signal, Uid, set_parent_process_death_signal};
 use rustix::thread::{LinkNameSpaceType, UnshareFlags, move_into_link_name_space};
 use vmkit::{TapAttach, Vmm};
 
-use super::FD_ENV;
 use super::plan::WorkerPlan;
+use super::{FD_ENV, FDS_ENV, fdpass};
 use crate::TAP;
 use crate::wire::{FromWorker, Lines, MAX_PLAN, ToWorker, send};
 
@@ -60,6 +66,14 @@ pub fn main() -> ! {
     let Ok(mut tx) = chan.try_clone() else {
         std::process::exit(EXIT_INFRA);
     };
+    // SAFETY: as for the channel: the shim's socketpair end, owned by nothing else here.
+    let fds = std::env::var(FDS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+    if let Some(f) = &fds {
+        let _ = rustix::io::fcntl_setfd(f, rustix::io::FdFlags::CLOEXEC);
+    }
     let mut lines = Lines::new(chan);
     let Ok(Some(plan)) = lines.read_within::<WorkerPlan>(MAX_PLAN) else {
         std::process::exit(EXIT_INFRA);
@@ -83,7 +97,7 @@ pub fn main() -> ! {
             Ok(Some(_)) => {}
         }
     }
-    let code = match boot(&plan, prepared, lines, &mut tx) {
+    let code = match boot(&plan, prepared, lines, &mut tx, fds) {
         Ok(code) => code,
         Err(message) => {
             let _ = send(&mut tx, &FromWorker::Failed { message });
@@ -202,13 +216,26 @@ fn prepare(plan: &WorkerPlan) -> Result<Prepared, Fail> {
         kiln_image::scratch::create_scratch(&scratch, plan.scratch_bytes),
         "creating the scratch disk",
     )?;
+    if let Some(disk) = &plan.pod_disk {
+        // The pod's earlier containers left it here; the first one creates it.
+        if let Some(dir) = disk.parent() {
+            ctx(fs::create_dir_all(dir), "creating the pod disk's directory")?;
+        }
+        if !disk.exists() {
+            ctx(
+                kiln_image::scratch::create_scratch(disk, plan.pod_disk_bytes),
+                "creating the pod disk",
+            )?;
+        }
+    }
     let run_dir = plan.vm_dir.join("run");
     ctx(fs::create_dir_all(&run_dir), "creating the run directory")?;
     let kind: VmmKind = plan.vmm.parse()?;
     let vmm = ctx(kiln_run::backend(kind).discover(), "finding the VMM")?;
     ctx(
-        kiln_run::config::check_devices(
+        kiln_run::config::check_devices_with(
             layers.len(),
+            plan.pod_disk.is_some(),
             plan.pod.is_some(),
             vmm.capabilities().available_devices(),
             vmm.name(),
@@ -228,8 +255,10 @@ fn prepare(plan: &WorkerPlan) -> Result<Prepared, Fail> {
         },
         exit_method: kiln_run::exit_method(vmm.as_ref()),
         shutdown_grace_secs: SHUTDOWN_GRACE,
-        volumes: Vec::new(),
-        pod_disk: None,
+        volumes: plan.volumes.clone(),
+        pod_disk: plan.pod_disk.as_ref().map(|_| Scratch {
+            size_bytes: plan.pod_disk_bytes,
+        }),
     };
     ctx(config.validate(), "the guest's configuration")?;
     ctx(kiln_run::config::check_size(&config), "the guest's configuration")?;
@@ -243,14 +272,14 @@ fn prepare(plan: &WorkerPlan) -> Result<Prepared, Fail> {
     })
 }
 
-/// stdin that reads as EOF once the shim relays `CloseIO`.
+/// A stdin FIFO that reads as EOF once the shim relays `CloseIO`.
 struct Stdin {
+    file: File,
     closed: Arc<AtomicBool>,
 }
 
 impl Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let stdin = std::io::stdin();
         let wait = Timespec {
             tv_sec: 0,
             tv_nsec: 200_000_000,
@@ -259,16 +288,39 @@ impl Read for Stdin {
             if self.closed.load(Ordering::SeqCst) {
                 return Ok(0);
             }
-            let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
+            let mut fds = [PollFd::new(&self.file, PollFlags::IN)];
             if poll(&mut fds, Some(&wait))? > 0 {
-                return stdin.lock().read(buf);
+                return self.file.read(buf);
             }
         }
     }
 }
 
+/// Exec `id` with the FIFOs the shim passed for it.
+fn exec_streams(fds: fdpass::ExecFds, tty: bool, closed: &Arc<AtomicBool>) -> ExecStreams {
+    let out = |fd: Option<OwnedFd>| -> Option<Box<dyn Write + Send>> {
+        fd.map(|f| Box::new(File::from(f)) as Box<dyn Write + Send>)
+    };
+    ExecStreams {
+        stdin: fds.stdin.map(|f| {
+            Box::new(Stdin {
+                file: File::from(f),
+                closed: closed.clone(),
+            }) as Box<dyn Read + Send>
+        }),
+        stdout: out(fds.stdout).unwrap_or_else(|| Box::new(std::io::sink())),
+        stderr: if tty { None } else { out(fds.stderr) },
+    }
+}
+
 /// The VM, the session, and the end: the guest's exit code.
-fn boot(plan: &WorkerPlan, p: Prepared, mut lines: Lines<UnixStream>, tx: &mut UnixStream) -> Result<i32, Fail> {
+fn boot(
+    plan: &WorkerPlan,
+    p: Prepared,
+    mut lines: Lines<UnixStream>,
+    tx: &mut UnixStream,
+    fds: Option<OwnedFd>,
+) -> Result<i32, Fail> {
     let console = ctx(ConsoleRelay::start(&p.run_dir), "the console relay")?;
     let mut spec = kiln_run::vm_spec(
         &plan.kernel,
@@ -285,6 +337,13 @@ fn boot(plan: &WorkerPlan, p: Prepared, mut lines: Lines<UnixStream>, tx: &mut U
         tap: TAP.into(),
         mac: pod.mac.clone(),
     });
+    // The pod disk is the disk after the layers (kiln-proto `Config.pod_disk`).
+    if let Some(disk) = &plan.pod_disk {
+        spec.disks.push(vmkit::Disk {
+            path: disk.clone(),
+            read_only: false,
+        });
+    }
     let vm = ctx(p.vmm.create(&spec), "creating the VM")?;
     let vmm_pid = fs::read_to_string(vmkit::sandbox::pid_file(&p.run_dir))
         .ok()
@@ -303,7 +362,20 @@ fn boot(plan: &WorkerPlan, p: Prepared, mut lines: Lines<UnixStream>, tx: &mut U
     let streams = Streams {
         stdin: plan
             .interactive
-            .then(|| Box::new(Stdin { closed: closed.clone() }) as Box<dyn Read + Send>),
+            .then(|| {
+                let file = std::io::stdin()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .map(File::from)
+                    .map_err(|e| format!("stdin: {e}"));
+                file.map(|file| {
+                    Box::new(Stdin {
+                        file,
+                        closed: closed.clone(),
+                    }) as Box<dyn Read + Send>
+                })
+            })
+            .transpose()?,
         stdout: Box::new(std::io::stdout()),
         stderr: Box::new(std::io::stderr()),
     };
@@ -316,21 +388,103 @@ fn boot(plan: &WorkerPlan, p: Prepared, mut lines: Lines<UnixStream>, tx: &mut U
                 boot_timeout: Duration::from_secs(plan.boot_timeout_secs),
                 stop_timeout: SHUTDOWN_GRACE,
                 escape_keys: false,
+                exec: true,
+                after_config: plan
+                    .files
+                    .iter()
+                    .flat_map(|(volume, files)| file_updates(*volume, files))
+                    .map(HostMessage::FileUpdate)
+                    .collect(),
                 ..SessionOptions::default()
             },
         ),
         "starting the VM",
     )?;
-    let _ = send(tx, &FromWorker::Started { vmm_pid });
+    // From here on the exec reports share the channel: one line at a time.
+    let shared = Arc::new(Mutex::new(ctx(tx.try_clone(), "the shim's channel")?));
+    let say = {
+        let shared = shared.clone();
+        move |m: &FromWorker| {
+            let mut tx = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = send(&mut *tx, m);
+        }
+    };
+    say(&FromWorker::Started { vmm_pid });
+    let (report, reports) = std::sync::mpsc::channel::<(u32, ExecEvent)>();
+    std::thread::spawn({
+        let say = say.clone();
+        move || {
+            for (id, e) in reports {
+                say(&match e {
+                    ExecEvent::Started => FromWorker::ExecStarted { id },
+                    ExecEvent::Failed(m) => FromWorker::ExecFailed {
+                        id,
+                        message: clean_line(&m),
+                    },
+                    ExecEvent::Exited(code) => FromWorker::ExecExited { id, code },
+                });
+            }
+        }
+    });
+    // Volume updates, one generation at a time (they wait for the guest to read them).
+    let (updates, pending) = std::sync::mpsc::channel::<(u32, Vec<kiln_proto::VolumeFile>)>();
+    std::thread::spawn({
+        let handle = session.handle();
+        move || {
+            for (volume, files) in pending {
+                if !handle.update_files(file_updates(volume, &files)) {
+                    return;
+                }
+            }
+        }
+    });
     let handle = session.handle();
     std::thread::spawn(move || {
+        let mut closers: HashMap<u32, Arc<AtomicBool>> = HashMap::new();
         loop {
-            match lines.read::<ToWorker>() {
+            match lines.read_within::<ToWorker>(MAX_PLAN) {
                 Ok(Some(ToWorker::Signal(sig))) => handle.signal(sig),
                 Ok(Some(ToWorker::Kill {})) => handle.kill(),
                 Ok(Some(ToWorker::Resize { rows, cols })) => handle.window_size(WindowSize { rows, cols }),
                 Ok(Some(ToWorker::CloseStdin {})) => closed.store(true, Ordering::SeqCst),
                 Ok(Some(ToWorker::Start {})) => {}
+                Ok(Some(ToWorker::Exec { id, process, tty })) => {
+                    let received = match &fds {
+                        Some(f) => fdpass::recv(f).map_err(|e| e.to_string()),
+                        None => Err("no fd channel".into()),
+                    };
+                    let started = match received {
+                        Ok((got, f)) if got == id => {
+                            let closer = Arc::new(AtomicBool::new(false));
+                            let streams = exec_streams(f, tty, &closer);
+                            closers.insert(id, closer);
+                            let start = ExecStart {
+                                id,
+                                process,
+                                tty: tty.then_some(WindowSize { rows: 24, cols: 80 }),
+                                stdin: false,
+                            };
+                            handle.exec(start, streams, report.clone())
+                        }
+                        Ok((got, _)) => Err(format!("the stdio of exec {got} arrived for exec {id}")),
+                        Err(e) => Err(format!("receiving the exec's stdio: {e}")),
+                    };
+                    if let Err(m) = started {
+                        let _ = report.send((id, ExecEvent::Failed(m)));
+                    }
+                }
+                Ok(Some(ToWorker::ExecSignal { id, signal })) => handle.exec_signal(id, signal),
+                Ok(Some(ToWorker::ExecResize { id, rows, cols })) => {
+                    handle.exec_window_size(id, WindowSize { rows, cols })
+                }
+                Ok(Some(ToWorker::ExecCloseStdin { id })) => {
+                    if let Some(c) = closers.get(&id) {
+                        c.store(true, Ordering::SeqCst);
+                    }
+                }
+                Ok(Some(ToWorker::Files { volume, files })) => {
+                    let _ = updates.send((volume, files));
+                }
                 // The shim is gone: so is the container.
                 Ok(None) | Err(_) => {
                     handle.kill();
@@ -365,11 +519,8 @@ fn boot(plan: &WorkerPlan, p: Prepared, mut lines: Lines<UnixStream>, tx: &mut U
     }
     let _ = diag.flush();
     let _ = std::io::stdout().flush();
-    let _ = send(
-        tx,
-        &FromWorker::Exited {
-            code: outcome.exit_code,
-        },
-    );
+    say(&FromWorker::Exited {
+        code: outcome.exit_code,
+    });
     Ok(outcome.exit_code)
 }

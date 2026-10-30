@@ -53,8 +53,12 @@ pub struct VmLaunch {
     /// The container's cgroup v2 directory.
     pub cgroup: Option<PathBuf>,
     pub resolv: Resolv,
-    /// Lines for the container's log before it starts (volumes not delivered).
+    /// Lines for the container's log before it starts.
     pub warnings: Vec<String>,
+    /// The container's volumes, with the files volumes' content.
+    pub volumes: crate::volumes::Resolved,
+    /// The pod (its sandbox's id), whose disk holds its `emptyDir`s.
+    pub pod: Option<String>,
 }
 
 impl Default for Resources {
@@ -212,7 +216,9 @@ pub fn launch(
             .cgroups_path()
             .and_then(|p| cgroup::resolve(p, Path::new(cgroup::ROOT))),
         resolv,
-        warnings: mounts::warning(&checked.not_delivered).into_iter().collect(),
+        warnings: Vec::new(),
+        volumes: crate::volumes::resolve(&checked.volumes, &crate::volumes::host_tmpfs)?,
+        pod: spec.group().map(String::from),
         settings,
     })))
 }

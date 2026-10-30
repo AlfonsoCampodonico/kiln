@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 
 /// The longest message line.
 pub const MAX_LINE: usize = 64 << 10;
-/// The longest plan line: the guest's `Config` (one 64 KiB frame) and the paths around it.
-pub const MAX_PLAN: usize = 1 << 20;
+/// The longest plan line: the guest's `Config` (one 64 KiB frame), the paths around it,
+/// and the volumes' files (at most 32 MiB, base64). The shim's `files` lines to a worker
+/// may be as long; the worker trusts its shim. Lines from a worker stay at [`MAX_LINE`].
+pub const MAX_PLAN: usize = 48 << 20;
 /// The worker's end of the channel.
 pub const WORKER_FD: i32 = 3;
 
@@ -30,6 +32,29 @@ pub enum ToWorker {
     },
     /// Stop relaying stdin: the guest sees EOF.
     CloseStdin {},
+    /// Start exec `id`; its FIFOs came just before, on the fd channel.
+    Exec {
+        id: u32,
+        process: kiln_proto::Process,
+        tty: bool,
+    },
+    ExecSignal {
+        id: u32,
+        signal: i32,
+    },
+    ExecResize {
+        id: u32,
+        rows: u16,
+        cols: u16,
+    },
+    ExecCloseStdin {
+        id: u32,
+    },
+    /// A files volume's new generation (kubelet updated it).
+    Files {
+        volume: u32,
+        files: Vec<kiln_proto::VolumeFile>,
+    },
 }
 
 /// From a worker to the shim.
@@ -44,9 +69,26 @@ pub enum FromWorker {
         vmm_pid: u32,
     },
     /// The session ended with this exit code (kiln §9.5).
-    Exited { code: i32 },
+    Exited {
+        code: i32,
+    },
     /// Preparation or boot failed; `Create` or `Start` returns the message.
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
+    ExecStarted {
+        id: u32,
+    },
+    /// The exec could not start (`Start` of the exec returns the message).
+    ExecFailed {
+        id: u32,
+        message: String,
+    },
+    /// The exec's exit code (`128 + signal`; 137 when its VM ended first).
+    ExecExited {
+        id: u32,
+        code: i32,
+    },
 }
 
 /// Writes `m` as one line.
@@ -108,6 +150,24 @@ mod tests {
                 r#"{"resize":{"rows":40,"cols":120}}"#,
             ),
             (ToWorker::CloseStdin {}, r#"{"closeStdin":{}}"#),
+            (
+                ToWorker::ExecSignal { id: 2, signal: 15 },
+                r#"{"execSignal":{"id":2,"signal":15}}"#,
+            ),
+            (ToWorker::ExecCloseStdin { id: 2 }, r#"{"execCloseStdin":{"id":2}}"#),
+            (
+                ToWorker::Files {
+                    volume: 1,
+                    files: vec![kiln_proto::VolumeFile {
+                        path: "a".into(),
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        data: b"hi".to_vec(),
+                    }],
+                },
+                r#"{"files":{"volume":1,"files":[{"path":"a","mode":420,"uid":0,"gid":0,"data":"aGk="}]}}"#,
+            ),
         ];
         let from = [
             (FromWorker::Ready {}, r#"{"ready":{}}"#),
@@ -116,6 +176,10 @@ mod tests {
             (
                 FromWorker::Failed { message: "no".into() },
                 r#"{"failed":{"message":"no"}}"#,
+            ),
+            (
+                FromWorker::ExecExited { id: 3, code: 137 },
+                r#"{"execExited":{"id":3,"code":137}}"#,
             ),
         ];
         let mut stream = Vec::new();

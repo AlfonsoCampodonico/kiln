@@ -276,7 +276,7 @@ impl Tasks {
         let shared = self.shared.clone();
         let id = task.id;
         std::thread::Builder::new()
-            .name(format!("wait-{}", &id[..id.len().min(8)]))
+            .name(format!("wait-{}", id.chars().take(8).collect::<String>()))
             .spawn(move || {
                 let code = process.wait();
                 let mut tasks = shared.lock();
@@ -456,7 +456,7 @@ impl Tasks {
         let shared = self.shared.clone();
         let (id, exec_id) = (id.to_string(), exec_id.to_string());
         std::thread::Builder::new()
-            .name(format!("exec-{}", &exec_id[..exec_id.len().min(8)]))
+            .name(format!("exec-{}", exec_id.chars().take(8).collect::<String>()))
             .spawn(move || {
                 let code = process.wait();
                 let mut tasks = shared.lock();
