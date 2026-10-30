@@ -63,7 +63,9 @@
 
 Each exec stream is a guest-initiated connection to port **1029** (`port::EXEC`). It starts with a 5-byte header: the exec `id` (u32 LE), then the stream (`0` stdin, `1` stdout, `2` stderr, `3` tty). After that it carries raw bytes, as ports 1025–1028 do, with EOF as a half-close.
 
-The host accepts a connection only for an id it started and a stream that exec expects, at most once each. Anything else is a protocol violation (S5). The header has 5 s to arrive.
+The host accepts a connection only for an id it started and a stream that exec expects, at most once each. Anything else is a protocol violation (S5).
+- The header has 5 s to arrive, in all.
+- At any moment, the connections that have not yet sent their header may number at most the streams the host's execs still expect. Each such connection holds a thread, so a guest that opens more is a violation.
 
 ### 2.4 Limits
 
@@ -91,7 +93,7 @@ The host accepts a connection only for an id it started and a stream that exec e
 - **Stage 3.** The pod disk is mounted detached as ext4, then grown online.
 - **Stage 4, after `pivot_root`.** Every volume is attached at its path inside the new root:
   - `mkdir -p`; for a single file, create an empty file;
-  - a clone of the detached mount (`open_tree`), or of its `name` subdirectory for `emptyDir`, then `move_mount`;
+  - a clone of the detached mount (`open_tree`), then `move_mount`. The kernel clones only a detached mount's root, so the part of a mount that a volume needs (an `emptyDir`'s directory on the pod disk, or a single file) is bound from that mount after it has been attached at a staging directory, `/.kiln-volumes`. The staging mounts are then detached and the directory removed, before the process starts;
   - files volumes are then remounted read-only.
 
   Doing it after the pivot means a symlink in the image resolves inside the container's root, never into init's.
@@ -239,3 +241,4 @@ The v1 table changes as follows:
 | E5 | `subPath` is supported for single files of files volumes, statically, as kubelet does. `subPath` directories are refused. | My call |
 | E6 | `/dev/termination-log` is ignored without a warning. Copying it back to the host is a follow-up. | My call |
 | E7 | An exec's pid is the worker's pid. | My call |
+| E8 | A guest's terminal connection is closed both ways when its output ends. The VMMs pass a half-close on to the host only once the connection is closed, and a terminal's input relay holds a clone of it. | Found by the e2e |
