@@ -1147,3 +1147,28 @@ fn a_rebase_follows_the_merged_services_label() {
     assert_eq!((m.config.schema_version, m.config.services.len()), (1, 0));
     assert!(!m.config.labels.as_ref().unwrap().contains_key(LABEL_SERVICES));
 }
+
+/// A base converted by a kiln before M3d may carry any string in `dev.kiln.services`:
+/// a rebase that merges such a label in fails with `Services` and writes no tag.
+#[test]
+fn a_rebase_refuses_an_unparseable_merged_services_label() {
+    use kiln_image::types::LABEL_SERVICES;
+    let f = Fixture::new();
+    f.base("base:1", &Base::old());
+    f.base("base:2", &Base::patched());
+    // As an older convert would have stored it: no validation of the label.
+    rewrite_config(&f, "base:2", |c| {
+        c.labels
+            .as_mut()
+            .unwrap()
+            .insert(LABEL_SERVICES.into(), "not json".into());
+    });
+    f.app("app:1", "base:1", &Base::old(), &[app_code()]).unwrap();
+    let err = f.rebase("base:1", "base:2", "app:1", "app:2").unwrap_err();
+    assert!(matches!(err, ImageError::Services(_)), "{err}");
+    assert!(
+        err.to_string().starts_with("invalid dev.kiln.services label: "),
+        "{err}"
+    );
+    assert!(resolve_name(&f.store, "app:2").is_err(), "no tag is written");
+}
