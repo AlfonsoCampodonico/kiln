@@ -609,14 +609,19 @@ mod tests {
     #[test]
     fn each_invalid_service_is_refused() {
         type Mutation = Box<dyn Fn(&mut Vec<Service>)>;
-        let cases: Vec<(&str, Mutation)> = vec![
-            ("empty name", Box::new(|s| s[0].name = String::new())),
-            ("upper case", Box::new(|s| s[0].name = "PHP".into())),
-            ("underscore", Box::new(|s| s[0].name = "php_fpm".into())),
-            ("long name", Box::new(|s| s[0].name = "a".repeat(MAX_SERVICE_NAME + 1))),
-            ("duplicate", Box::new(|s| s.push(fpm()))),
+        let cases: Vec<(&str, &str, Mutation)> = vec![
+            ("empty name", "service name", Box::new(|s| s[0].name = String::new())),
+            ("upper case", "service name", Box::new(|s| s[0].name = "PHP".into())),
+            ("underscore", "service name", Box::new(|s| s[0].name = "php_fpm".into())),
+            (
+                "long name",
+                "service name",
+                Box::new(|s| s[0].name = "a".repeat(MAX_SERVICE_NAME + 1)),
+            ),
+            ("duplicate", "two services", Box::new(|s| s.push(fpm()))),
             (
                 "too many",
+                "services (at most",
                 Box::new(|s| {
                     *s = (0..=MAX_SERVICES)
                         .map(|i| Service {
@@ -626,26 +631,36 @@ mod tests {
                         .collect()
                 }),
             ),
-            ("no argv", Box::new(|s| s[0].process = Process::default())),
+            ("no argv", "no command", Box::new(|s| s[0].process = Process::default())),
             (
                 "relative workdir",
+                "workingDir",
                 Box::new(|s| s[0].process.working_dir = Some("app".into())),
             ),
-            ("bad user", Box::new(|s| s[0].process.user = Some("a:b:c".into()))),
-            ("bad env", Box::new(|s| s[0].process.env = vec!["X".into()])),
-            ("stop signal 0", Box::new(|s| s[0].stop_signal = 0)),
-            ("stop signal 34", Box::new(|s| s[0].stop_signal = 34)),
+            (
+                "bad user",
+                "user[:group]",
+                Box::new(|s| s[0].process.user = Some("a:b:c".into())),
+            ),
+            (
+                "bad env",
+                "KEY=value",
+                Box::new(|s| s[0].process.env = vec!["X".into()]),
+            ),
+            ("stop signal 0", "stopSignal", Box::new(|s| s[0].stop_signal = 0)),
+            ("stop signal 34", "stopSignal", Box::new(|s| s[0].stop_signal = 34)),
             (
                 "relative socket",
+                "unix socket path",
                 Box::new(|s| s[0].ready = Ready::Unix("run/x".into())),
             ),
-            ("port 0", Box::new(|s| s[0].ready = Ready::Tcp(0))),
+            ("port 0", "tcp port 0", Box::new(|s| s[0].ready = Ready::Tcp(0))),
         ];
-        for (name, mutate) in cases {
+        for (name, fragment, mutate) in cases {
             let mut services = vec![fpm()];
             mutate(&mut services);
             let err = with_services(services).validate().unwrap_err().to_string();
-            assert!(!err.is_empty(), "{name}");
+            assert!(err.contains(fragment), "{name}: {err:?} lacks {fragment:?}");
         }
         let max: Vec<Service> = (0..MAX_SERVICES)
             .map(|i| Service {
