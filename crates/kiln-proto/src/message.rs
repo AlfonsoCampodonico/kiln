@@ -44,13 +44,28 @@ pub struct Stage {
     pub n: u8,
 }
 
-/// The main process ended, and its stdout and stderr reached EOF. With
-/// `signaled`, `code` is the signal that killed it. Guest-asserted (spec §3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The run ended, and its stdout and stderr reached EOF. With `signaled`, `code`
+/// is the signal that killed the process. Without `service` the status is the
+/// main process's; with it (protocol version 2), that service exited first and
+/// ended the run, and the status is the service's. Guest-asserted (spec §3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Exited {
     pub signaled: bool,
     pub code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+}
+
+impl Exited {
+    /// The main process's status.
+    pub fn main(signaled: bool, code: i32) -> Self {
+        Self {
+            signaled,
+            code,
+            service: None,
+        }
+    }
 }
 
 /// `kiln-init` failed in `stage`. At stage 6, `errno` is set only when exec(2)
@@ -265,7 +280,15 @@ impl Message for GuestMessage {
             GuestMessage::Hello(h) if h.protocol == 0 => Err(ProtoError::invalid("Hello", "protocol 0")),
             GuestMessage::Hello(_) | GuestMessage::Running => Ok(()),
             GuestMessage::Stage(s) => check_stage("Stage", s.n),
-            GuestMessage::Exited(e) => check_code("Exited", e.signaled, e.code),
+            GuestMessage::Exited(e) => {
+                check_code("Exited", e.signaled, e.code)?;
+                match &e.service {
+                    Some(name) if !crate::config::valid_service_name(name) => {
+                        Err(ProtoError::invalid("Exited", "service name"))
+                    }
+                    _ => Ok(()),
+                }
+            }
             GuestMessage::ExecStarted(e) => check_id("ExecStarted", e.id),
             GuestMessage::ExecExited(e) => {
                 check_id("ExecExited", e.id)?;
@@ -451,6 +474,10 @@ mod tests {
         assert!(GuestMessage::decode(EXITED, br#"{"signaled":false,"code":256}"#).is_err());
         assert!(GuestMessage::decode(EXITED, br#"{"signaled":true,"code":0}"#).is_err());
         assert!(GuestMessage::decode(EXITED, br#"{"signaled":true,"code":9}"#).is_ok());
+        assert!(GuestMessage::decode(EXITED, br#"{"signaled":false,"code":1,"service":"php-fpm"}"#).is_ok());
+        assert!(GuestMessage::decode(EXITED, br#"{"signaled":false,"code":1,"service":null}"#).is_ok());
+        assert!(GuestMessage::decode(EXITED, br#"{"signaled":false,"code":1,"service":"Bad Name"}"#).is_err());
+        assert!(GuestMessage::decode(EXITED, br#"{"signaled":false,"code":1,"service":""}"#).is_err());
         assert!(GuestMessage::decode(INIT_FAILED, br#"{"stage":6,"errno":0,"message":""}"#).is_err());
         assert!(GuestMessage::decode(INIT_FAILED, br#"{"stage":6,"errno":null,"message":""}"#).is_ok());
         assert!(HostMessage::decode(SIGNAL, br#"{"sig":0}"#).is_err());

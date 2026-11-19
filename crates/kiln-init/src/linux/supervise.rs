@@ -166,7 +166,7 @@ pub fn run(config: &Config, started: Started, events: &Receiver<Event>, volumes:
 /// An exec ended: once its output has reached EOF, `ExecExited` (from a thread, so a
 /// background process holding its output does not hold the supervisor).
 fn report(e: Exec, status: WaitStatus) {
-    let Exited { signaled, code } = exited(status);
+    let Exited { signaled, code, .. } = exited(status);
     let id = e.id;
     let spawned = std::thread::Builder::new().name("exec-exit".into()).spawn(move || {
         for relay in e.outputs {
@@ -182,11 +182,8 @@ fn report(e: Exec, status: WaitStatus) {
 
 fn exited(status: WaitStatus) -> Exited {
     match (status.exit_status(), status.terminating_signal()) {
-        (Some(code), _) => Exited { signaled: false, code },
-        (None, Some(sig)) => Exited {
-            signaled: true,
-            code: sig,
-        },
+        (Some(code), _) => Exited::main(false, code),
+        (None, Some(sig)) => Exited::main(true, sig),
         (None, None) => unreachable!("waitpid without WUNTRACED reports exits and kills only"),
     }
 }

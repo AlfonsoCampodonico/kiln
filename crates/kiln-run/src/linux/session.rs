@@ -871,7 +871,7 @@ impl Session {
         };
         Outcome {
             exit_code,
-            exited: self.proto.exited(),
+            exited: self.proto.exited().cloned(),
             init_failed: self.proto.init_failed().cloned(),
             stages: self.stages.clone(),
             hello: self.proto.hello(),

@@ -300,6 +300,8 @@ impl Case {
             shutdown_grace_secs: 10,
             volumes: Vec::new(),
             pod_disk: None,
+            services: Vec::new(),
+            ready_timeout_ms: None,
         }
     }
 

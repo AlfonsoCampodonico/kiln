@@ -5,7 +5,7 @@ use std::net::Ipv4Addr;
 
 use kiln_proto::{
     Config, ExitMethod, Exited, GuestMessage, Hello, HostMessage, InitFailed, Ipv6Network, MAX_FRAME, Message, Network,
-    Process, Scratch, Shutdown, Signal, Stage, WindowSize, read_message, write_message,
+    Process, Ready, Scratch, Service, Shutdown, Signal, Stage, WindowSize, read_message, write_message,
 };
 use proptest::prelude::*;
 
@@ -18,11 +18,56 @@ fn guest() -> impl Strategy<Value = GuestMessage> {
         (1u32..).prop_map(|protocol| GuestMessage::Hello(Hello { protocol })),
         (1u8..=7).prop_map(|n| GuestMessage::Stage(Stage { n })),
         Just(GuestMessage::Running),
-        (0i32..=255).prop_map(|code| GuestMessage::Exited(Exited { signaled: false, code })),
-        (1i32..=64).prop_map(|code| GuestMessage::Exited(Exited { signaled: true, code })),
+        (0i32..=255).prop_map(|code| GuestMessage::Exited(Exited::main(false, code))),
+        (1i32..=64).prop_map(|code| GuestMessage::Exited(Exited::main(true, code))),
+        (any::<bool>(), 1i32..=64, "[a-z0-9-]{1,32}").prop_map(|(signaled, code, name)| {
+            GuestMessage::Exited(Exited {
+                service: Some(name),
+                ..Exited::main(signaled, code)
+            })
+        }),
         (1u8..=7, proptest::option::of(1i32..4096), "\\PC{0,200}")
             .prop_map(|(s, e, m)| GuestMessage::InitFailed(InitFailed::new(s, e, &m))),
     ]
+}
+
+fn ready() -> impl Strategy<Value = Ready> {
+    prop_oneof![
+        Just(Ready::None),
+        "/[a-z/.]{0,60}".prop_map(Ready::Unix),
+        (1u16..).prop_map(Ready::Tcp),
+    ]
+}
+
+fn services() -> impl Strategy<Value = Vec<Service>> {
+    proptest::collection::vec(
+        (
+            proptest::collection::vec("[a-z/]{1,10}", 1..3),
+            proptest::collection::vec("[A-Z_]{1,8}=[^\u{0}]{0,10}", 0..3),
+            proptest::option::of("/[a-z/]{0,20}"),
+            proptest::option::of("[a-z0-9]{1,8}(:[a-z0-9]{1,8})?"),
+            ready(),
+            1i32..=31,
+        ),
+        0..4,
+    )
+    .prop_map(|v| {
+        v.into_iter()
+            .enumerate()
+            .map(|(i, (cmd, env, working_dir, user, ready, stop_signal))| Service {
+                name: format!("svc-{i}"),
+                process: Process {
+                    entrypoint: Vec::new(),
+                    cmd,
+                    env,
+                    working_dir,
+                    user,
+                },
+                ready,
+                stop_signal,
+            })
+            .collect()
+    })
 }
 
 fn config() -> impl Strategy<Value = Config> {
@@ -40,49 +85,54 @@ fn config() -> impl Strategy<Value = Config> {
             any::<u32>(),
             any::<bool>(),
         ),
+        (services(), 1u32..),
     )
-        .prop_map(|(entrypoint, cmd, env, working_dir, user, sig, more)| {
-            let (stop_signal, tty, interactive, hostname) = sig;
-            let (layers, blocks, poweroff, grace, net) = more;
-            Config {
-                process: Process {
-                    entrypoint,
-                    cmd,
-                    env,
-                    working_dir,
-                    user,
-                },
-                stop_signal,
-                tty: tty.then_some(WindowSize { rows: 24, cols: 80 }),
-                interactive,
-                hostname,
-                network: net.then(|| Network {
-                    address: Ipv4Addr::new(172, 30, 0, 2),
-                    prefix_len: 30,
-                    gateway: Ipv4Addr::new(172, 30, 0, 1),
-                    dns: vec![Ipv4Addr::new(172, 30, 0, 1)],
-                    search: Vec::new(),
-                    options: Vec::new(),
-                    ipv6: (blocks % 2 == 0).then(|| Ipv6Network {
-                        address: "fd76:6d6b:6974::2".parse().unwrap(),
-                        prefix_len: 64,
-                        gateway: "fd76:6d6b:6974::1".parse().unwrap(),
+        .prop_map(
+            |(entrypoint, cmd, env, working_dir, user, sig, more, (services, ready_ms))| {
+                let (stop_signal, tty, interactive, hostname) = sig;
+                let (layers, blocks, poweroff, grace, net) = more;
+                Config {
+                    process: Process {
+                        entrypoint,
+                        cmd,
+                        env,
+                        working_dir,
+                        user,
+                    },
+                    stop_signal,
+                    tty: tty.then_some(WindowSize { rows: 24, cols: 80 }),
+                    interactive,
+                    hostname,
+                    network: net.then(|| Network {
+                        address: Ipv4Addr::new(172, 30, 0, 2),
+                        prefix_len: 30,
+                        gateway: Ipv4Addr::new(172, 30, 0, 1),
+                        dns: vec![Ipv4Addr::new(172, 30, 0, 1)],
+                        search: Vec::new(),
+                        options: Vec::new(),
+                        ipv6: (blocks % 2 == 0).then(|| Ipv6Network {
+                            address: "fd76:6d6b:6974::2".parse().unwrap(),
+                            prefix_len: 64,
+                            gateway: "fd76:6d6b:6974::1".parse().unwrap(),
+                        }),
                     }),
-                }),
-                layers,
-                scratch: Scratch {
-                    size_bytes: blocks * 4096,
-                },
-                exit_method: if poweroff {
-                    ExitMethod::Poweroff
-                } else {
-                    ExitMethod::Reboot
-                },
-                shutdown_grace_secs: grace,
-                volumes: Vec::new(),
-                pod_disk: None,
-            }
-        })
+                    layers,
+                    scratch: Scratch {
+                        size_bytes: blocks * 4096,
+                    },
+                    exit_method: if poweroff {
+                        ExitMethod::Poweroff
+                    } else {
+                        ExitMethod::Reboot
+                    },
+                    shutdown_grace_secs: grace,
+                    volumes: Vec::new(),
+                    pod_disk: None,
+                    ready_timeout_ms: (!services.is_empty()).then_some(ready_ms),
+                    services,
+                }
+            },
+        )
 }
 
 fn host() -> impl Strategy<Value = HostMessage> {
@@ -128,6 +178,7 @@ fn member() -> impl Strategy<Value = String> {
         4 => proptest::sample::select(vec![
             "protocol", "n", "signaled", "code", "stage", "errno", "message", "graceSecs", "sig", "rows", "cols",
             "process", "stopSignal", "interactive", "hostname", "layers", "scratch", "exitMethod", "shutdownGraceSecs",
+            "services", "readyTimeoutMs", "service", "ready", "name",
         ])
         .prop_map(String::from),
         1 => "[a-zA-Z\\u{1b}]{1,8}",
@@ -138,6 +189,8 @@ fn member() -> impl Strategy<Value = String> {
         1 => Just("true".to_string()),
         1 => Just("null".to_string()),
         1 => "[a-z]{0,6}".prop_map(|s| format!("\"{s}\"")),
+        1 => proptest::sample::select(vec!["\"unix:/s\"", "\"tcp:80\"", "\"tcp:0\"", "\"none\"", "\"unix:x\""])
+            .prop_map(String::from),
         1 => Just("{}".to_string()),
         1 => Just("[]".to_string()),
     ];

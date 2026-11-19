@@ -45,10 +45,7 @@ fn main() {
         "stage-flood" => while send(GuestMessage::Stage(Stage { n: 3 })).is_ok() {},
         "exited-then-hang" => {
             boot(&mut send);
-            let _ = send(GuestMessage::Exited(Exited {
-                signaled: false,
-                code: 0,
-            }));
+            let _ = send(GuestMessage::Exited(Exited::main(false, 0)));
         }
         "second-stdout" => {
             boot(&mut send);

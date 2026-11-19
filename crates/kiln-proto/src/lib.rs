@@ -20,7 +20,10 @@ pub mod sanitize;
 pub mod signal;
 mod volume;
 
-pub use config::{Config, ExitMethod, Ipv6Network, MAX_LAYERS, MIN_SCRATCH_BYTES, Network, Process, Scratch};
+pub use config::{
+    Config, ExitMethod, Ipv6Network, MAX_LAYERS, MAX_SERVICE_NAME, MAX_SERVICES, MAX_SOCKET_PATH, MIN_SCRATCH_BYTES,
+    Network, Process, Ready, Scratch, Service, valid_service_name, validate_services,
+};
 pub use error::{ProtoError, Result};
 pub use exec::{
     EXEC_HEADER, ExecExited, ExecFailed, ExecSignal, ExecStart, ExecStarted, ExecStream, ExecWindowSize, MAX_EXECS,
@@ -36,8 +39,10 @@ pub use volume::{
     check_generation, check_relative_path, file_updates,
 };
 
-/// The protocol version a guest announces in [`Hello`].
-pub const PROTOCOL_VERSION: u32 = 1;
+/// The highest protocol version this crate implements: what a guest announces in
+/// [`Hello`], and the highest a host accepts (spec §9.8). Version 2 adds
+/// `Config.services`, `Config.readyTimeoutMs` and `Exited.service`.
+pub const PROTOCOL_VERSION: u32 = 2;
 /// The host's vsock CID; the guest connects to it.
 pub const HOST_CID: u32 = 2;
 /// The guest's vsock CID (spec §9.1).

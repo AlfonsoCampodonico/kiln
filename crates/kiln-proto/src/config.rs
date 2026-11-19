@@ -16,6 +16,12 @@ pub const MIN_SCRATCH_BYTES: u64 = 64 << 20;
 const MAX_DNS: usize = 3;
 /// The most `search` domains glibc's resolver honours.
 const MAX_SEARCH: usize = 6;
+/// The most services a run may have (protocol version 2).
+pub const MAX_SERVICES: usize = 16;
+/// The longest service name, in bytes.
+pub const MAX_SERVICE_NAME: usize = 32;
+/// The longest `unix:` readiness path, in bytes: `sun_path` holds 108 with its NUL.
+pub const MAX_SOCKET_PATH: usize = 107;
 
 /// One run's configuration, sent once in answer to the guest's `Hello`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,7 +46,8 @@ pub struct Config {
     pub scratch: Scratch,
     /// How the guest ends the VM (`vmkit::Capabilities::guest_exit`).
     pub exit_method: ExitMethod,
-    /// The grace period when init gets SIGINT (Ctrl-Alt-Del) instead of `Shutdown`.
+    /// The grace period when init gets SIGINT (Ctrl-Alt-Del) instead of `Shutdown`,
+    /// and when a process's exit stops the others (protocol version 2).
     pub shutdown_grace_secs: u32,
     /// A pod's volumes; omitted when empty. The host follows `Config` with the files
     /// volumes' first `FileUpdate`s.
@@ -49,6 +56,153 @@ pub struct Config {
     /// The pod disk after the layers (`emptyDir` volumes), grown like the scratch disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_disk: Option<Scratch>,
+    /// Protocol version 2: processes started, in order, before the main process,
+    /// each waiting for the previous one's readiness. Omitted when empty, so a
+    /// `Config` without services is a version 1 `Config`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<Service>,
+    /// Protocol version 2, present exactly when `services` is not empty: how long,
+    /// from `Config`'s arrival, the guest allows every service to become ready.
+    /// The host derives it from what remains of its boot timeout, so that a
+    /// service that never becomes ready is reported (`InitFailed` naming it)
+    /// before the host's own boot timeout ends the VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_timeout_ms: Option<u32>,
+}
+
+/// A process kiln-init starts before the main process and stops after it
+/// (protocol version 2; spec §9.8 `services`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Service {
+    /// `[a-z0-9-]{1,32}`, unique in the run; names the service in failures and in `Exited`.
+    pub name: String,
+    /// As the main process's: argv, the final environment, working directory, user.
+    pub process: Process,
+    /// When the service counts as started.
+    pub ready: Ready,
+    /// Sent when the service is stopped (1-31).
+    pub stop_signal: i32,
+}
+
+/// When a service is ready: `unix:<absolute path>` (a stream socket there accepts
+/// a connection), `tcp:<port>` (127.0.0.1:<port> accepts one), or `none` (as soon
+/// as it has been started). Carried as that string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Ready {
+    None,
+    Unix(String),
+    Tcp(u16),
+}
+
+impl Ready {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Ready::None)
+    }
+
+    /// Checks the value's own rules (the parser applies them too).
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        match self {
+            Ready::None => Ok(()),
+            Ready::Tcp(0) => Err("tcp port 0".into()),
+            Ready::Tcp(_) => Ok(()),
+            Ready::Unix(p) if !p.starts_with('/') => Err(format!("unix socket path {p:?} is not absolute")),
+            Ready::Unix(p) if p.contains('\0') => Err("unix socket path contains a NUL byte".into()),
+            Ready::Unix(p) if p.len() > MAX_SOCKET_PATH => Err(format!(
+                "unix socket path of {} bytes (at most {MAX_SOCKET_PATH})",
+                p.len()
+            )),
+            Ready::Unix(_) => Ok(()),
+        }
+    }
+}
+
+impl TryFrom<String> for Ready {
+    type Error = String;
+
+    fn try_from(s: String) -> std::result::Result<Self, String> {
+        let r = if s == "none" {
+            Ready::None
+        } else if let Some(path) = s.strip_prefix("unix:") {
+            Ready::Unix(path.to_string())
+        } else if let Some(port) = s.strip_prefix("tcp:") {
+            // Digits only: no sign, no spaces.
+            if port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("ready {s:?}: the port is not a number 1-65535"));
+            }
+            Ready::Tcp(
+                port.parse()
+                    .map_err(|_| format!("ready {s:?}: the port is not a number 1-65535"))?,
+            )
+        } else {
+            return Err(format!("ready {s:?} (unix:<path>, tcp:<port> or none)"));
+        };
+        r.validate().map_err(|e| format!("ready {s:?}: {e}"))?;
+        Ok(r)
+    }
+}
+
+impl From<Ready> for String {
+    fn from(r: Ready) -> String {
+        r.to_string()
+    }
+}
+
+impl std::fmt::Display for Ready {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ready::None => f.write_str("none"),
+            Ready::Unix(p) => write!(f, "unix:{p}"),
+            Ready::Tcp(port) => write!(f, "tcp:{port}"),
+        }
+    }
+}
+
+/// A valid service name: `[a-z0-9-]{1,32}`.
+pub fn valid_service_name(name: &str) -> bool {
+    (1..=MAX_SERVICE_NAME).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Checks a run's services: at most [`MAX_SERVICES`], unique valid names, each
+/// process as valid as the main process, a valid readiness and stop signal.
+/// kiln-image calls it for an image's services, and `Config` for its own.
+pub fn validate_services(services: &[Service]) -> Result<()> {
+    if services.len() > MAX_SERVICES {
+        return Err(invalid(format!("{} services (at most {MAX_SERVICES})", services.len())));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for s in services {
+        if !valid_service_name(&s.name) {
+            return Err(invalid(format!(
+                "service name {:?} (1-{MAX_SERVICE_NAME} of [a-z0-9-])",
+                s.name
+            )));
+        }
+        if !seen.insert(s.name.as_str()) {
+            return Err(invalid(format!("two services named {:?}", s.name)));
+        }
+        if let Err(e) = s.process.validate("Config") {
+            let why = match e {
+                ProtoError::Invalid { reason, .. } => reason,
+                other => other.to_string(),
+            };
+            return Err(invalid(format!("service {}: {why}", s.name)));
+        }
+        s.ready
+            .validate()
+            .map_err(|e| invalid(format!("service {}: ready: {e}", s.name)))?;
+        crate::signal::name(s.stop_signal).ok_or_else(|| {
+            invalid(format!(
+                "service {}: stopSignal {} (signals 1-31 only; real-time signals are not supported)",
+                s.name, s.stop_signal
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// The main process (spec §5.1 `process`, minus `stopSignal`).
@@ -222,7 +376,21 @@ impl Config {
         {
             return Err(invalid(format!("pod disk size {}", d.size_bytes)));
         }
+        validate_services(&self.services)?;
+        match (self.services.is_empty(), self.ready_timeout_ms) {
+            (true, Some(_)) => return Err(invalid("readyTimeoutMs without services")),
+            (false, None) => return Err(invalid("services without readyTimeoutMs")),
+            (false, Some(0)) => return Err(invalid("readyTimeoutMs 0")),
+            _ => {}
+        }
         Ok(())
+    }
+
+    /// The lowest protocol version that defines everything this `Config` uses
+    /// (spec §9.8 rule 3): 2 with services, else 1. Everything before version 2
+    /// counts as version 1.
+    pub fn required_version(&self) -> u32 {
+        if self.services.is_empty() { 1 } else { 2 }
     }
 }
 
@@ -357,7 +525,153 @@ mod tests {
             shutdown_grace_secs: 10,
             volumes: Vec::new(),
             pod_disk: None,
+            services: Vec::new(),
+            ready_timeout_ms: None,
         }
+    }
+
+    fn fpm() -> Service {
+        Service {
+            name: "php-fpm".into(),
+            process: Process {
+                entrypoint: vec!["php-fpm".into()],
+                cmd: vec!["-F".into()],
+                env: vec!["APP_ENV=production".into()],
+                working_dir: Some("/app".into()),
+                user: None,
+            },
+            ready: Ready::Unix("/run/php-fpm.sock".into()),
+            stop_signal: 3,
+        }
+    }
+
+    fn with_services(services: Vec<Service>) -> Config {
+        Config {
+            services,
+            ready_timeout_ms: Some(20_000),
+            ..config()
+        }
+    }
+
+    #[test]
+    fn a_config_without_services_is_a_version_1_config() {
+        let c = config();
+        assert_eq!(c.required_version(), 1);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("services") && !json.contains("readyTimeoutMs"), "{json}");
+        let c = with_services(vec![fpm()]);
+        c.validate().unwrap();
+        assert_eq!(c.required_version(), 2);
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(
+            json.contains(r#""services":[{"name":"php-fpm","process":{"#)
+                && json.contains(r#""ready":"unix:/run/php-fpm.sock","stopSignal":3}]"#)
+                && json.contains(r#""readyTimeoutMs":20000"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Config>(&json).unwrap(), c);
+    }
+
+    #[test]
+    fn ready_parses_and_prints_its_three_forms() {
+        for (text, ready) in [
+            ("none", Ready::None),
+            ("unix:/run/php-fpm.sock", Ready::Unix("/run/php-fpm.sock".into())),
+            ("tcp:9000", Ready::Tcp(9000)),
+            ("tcp:65535", Ready::Tcp(65535)),
+        ] {
+            assert_eq!(Ready::try_from(text.to_string()).unwrap(), ready);
+            assert_eq!(ready.to_string(), text);
+        }
+        let long = format!("unix:/{}", "s".repeat(MAX_SOCKET_PATH));
+        for bad in [
+            "",
+            "None",
+            "unix:",
+            "unix:run/x",
+            "unix:/a\0b",
+            "tcp:",
+            "tcp:0",
+            "tcp:65536",
+            "tcp:+80",
+            "tcp: 80",
+            "tcp:80x",
+            "tcp:0080000",
+            "http:80",
+            &long,
+        ] {
+            assert!(Ready::try_from(bad.to_string()).is_err(), "{bad:?} was accepted");
+        }
+        let ok = format!("unix:/{}", "s".repeat(MAX_SOCKET_PATH - 1));
+        Ready::try_from(ok).unwrap();
+    }
+
+    #[test]
+    fn each_invalid_service_is_refused() {
+        type Mutation = Box<dyn Fn(&mut Vec<Service>)>;
+        let cases: Vec<(&str, Mutation)> = vec![
+            ("empty name", Box::new(|s| s[0].name = String::new())),
+            ("upper case", Box::new(|s| s[0].name = "PHP".into())),
+            ("underscore", Box::new(|s| s[0].name = "php_fpm".into())),
+            ("long name", Box::new(|s| s[0].name = "a".repeat(MAX_SERVICE_NAME + 1))),
+            ("duplicate", Box::new(|s| s.push(fpm()))),
+            (
+                "too many",
+                Box::new(|s| {
+                    *s = (0..=MAX_SERVICES)
+                        .map(|i| Service {
+                            name: format!("s{i}"),
+                            ..fpm()
+                        })
+                        .collect()
+                }),
+            ),
+            ("no argv", Box::new(|s| s[0].process = Process::default())),
+            (
+                "relative workdir",
+                Box::new(|s| s[0].process.working_dir = Some("app".into())),
+            ),
+            ("bad user", Box::new(|s| s[0].process.user = Some("a:b:c".into()))),
+            ("bad env", Box::new(|s| s[0].process.env = vec!["X".into()])),
+            ("stop signal 0", Box::new(|s| s[0].stop_signal = 0)),
+            ("stop signal 34", Box::new(|s| s[0].stop_signal = 34)),
+            (
+                "relative socket",
+                Box::new(|s| s[0].ready = Ready::Unix("run/x".into())),
+            ),
+            ("port 0", Box::new(|s| s[0].ready = Ready::Tcp(0))),
+        ];
+        for (name, mutate) in cases {
+            let mut services = vec![fpm()];
+            mutate(&mut services);
+            let err = with_services(services).validate().unwrap_err().to_string();
+            assert!(!err.is_empty(), "{name}");
+        }
+        let max: Vec<Service> = (0..MAX_SERVICES)
+            .map(|i| Service {
+                name: format!("s{i}"),
+                ..fpm()
+            })
+            .collect();
+        with_services(max).validate().unwrap();
+        let mut c = with_services(vec![fpm()]);
+        c.ready_timeout_ms = None;
+        assert!(c.validate().unwrap_err().to_string().contains("readyTimeoutMs"));
+        c.ready_timeout_ms = Some(0);
+        assert!(c.validate().is_err());
+        let mut c = config();
+        c.ready_timeout_ms = Some(1);
+        assert!(c.validate().unwrap_err().to_string().contains("without services"));
+    }
+
+    #[test]
+    fn unknown_service_fields_are_refused() {
+        let mut v = serde_json::to_value(with_services(vec![fpm()])).unwrap();
+        v["services"][0]["restart"] = "always".into();
+        assert!(serde_json::from_value::<Config>(v).is_err());
+        let mut v = serde_json::to_value(with_services(vec![fpm()])).unwrap();
+        v["services"][0]["ready"] = "tcp:x".into();
+        assert!(serde_json::from_value::<Config>(v).is_err());
     }
 
     #[test]

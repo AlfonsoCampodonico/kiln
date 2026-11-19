@@ -104,6 +104,8 @@ pub fn build(image: &ImageProcess, opts: &RunOptions, rt: &Runtime) -> Result<Co
         shutdown_grace_secs: opts.stop_timeout,
         volumes: Vec::new(),
         pod_disk: None,
+        services: Vec::new(),
+        ready_timeout_ms: None,
     };
     check_size(&config)?;
     Ok(config)

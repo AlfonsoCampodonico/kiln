@@ -35,6 +35,8 @@ fn config() -> Config {
         shutdown_grace_secs: 10,
         volumes: Vec::new(),
         pod_disk: None,
+        services: Vec::new(),
+        ready_timeout_ms: None,
     }
 }
 
@@ -216,7 +218,7 @@ fn boot(c: &mut UnixStream) {
 }
 
 fn exited(c: &mut UnixStream, code: i32) {
-    send(c, GuestMessage::Exited(Exited { signaled: false, code }));
+    send(c, GuestMessage::Exited(Exited::main(false, code)));
 }
 
 fn wait_killed(killed: &AtomicBool) {
@@ -467,13 +469,7 @@ fn a_stop_request_ends_at_the_guests_final_message() {
         assert!(matches!(shutdown, Some(HostMessage::Shutdown(_))), "{shutdown:?}");
         // The app ignores its stop signal; init kills it when the grace ends.
         std::thread::sleep(Duration::from_secs(1));
-        send(
-            &mut c,
-            GuestMessage::Exited(Exited {
-                signaled: true,
-                code: 9,
-            }),
-        );
+        send(&mut c, GuestMessage::Exited(Exited::main(true, 9)));
         wait_killed(&killed);
     });
     let (st, _) = streams(None);
@@ -605,13 +601,7 @@ fn the_stop_bound_leaves_the_guest_its_sync_before_exited() {
         assert!(matches!(shutdown, Some(HostMessage::Shutdown(_))), "{shutdown:?}");
         // The grace (0 s) ends: init kills the app, then syncs for 6 s.
         std::thread::sleep(Duration::from_secs(6));
-        send(
-            &mut c,
-            GuestMessage::Exited(Exited {
-                signaled: true,
-                code: 9,
-            }),
-        );
+        send(&mut c, GuestMessage::Exited(Exited::main(true, 9)));
     });
     let (st, _) = streams(None);
     let mut o = opts();
@@ -734,12 +724,15 @@ fn bad_frames_are_violations() {
     }
     let vm = fake(|sock, killed| {
         let mut c = connect(&sock, port::CONTROL);
-        send(&mut c, GuestMessage::Hello(Hello { protocol: 2 }));
+        send(&mut c, GuestMessage::Hello(Hello { protocol: 3 }));
         wait_killed(&killed);
     });
     let (st, _) = streams(None);
     let o = Session::start(vm, config(), st, opts()).unwrap().finish_within(LIMIT);
-    assert_eq!(o.violation.as_deref(), Some("unsupported guest protocol 2"));
+    assert_eq!(
+        o.violation.as_deref(),
+        Some("unsupported guest protocol 3 (this kiln speaks 1 to 2)")
+    );
 }
 
 /// D-6: output still flowing when the VM ends reaches a slow sink in full: the
@@ -982,13 +975,7 @@ fn an_escape_key_right_after_config_is_a_stop_request() {
             assert!(matches!(msg, Some(HostMessage::Shutdown(_))), "{msg:?}");
             boot(&mut c);
             drop(tty);
-            send(
-                &mut c,
-                GuestMessage::Exited(Exited {
-                    signaled: true,
-                    code: 15,
-                }),
-            );
+            send(&mut c, GuestMessage::Exited(Exited::main(true, 15)));
         });
         let mut cfg = config();
         cfg.tty = Some(WindowSize { rows: 24, cols: 80 });

@@ -65,8 +65,11 @@ impl Protocol {
                 if self.hello {
                     return v("a second Hello".into());
                 }
-                if h.protocol != PROTOCOL_VERSION {
-                    return v(format!("unsupported guest protocol {}", h.protocol));
+                if !(1..=PROTOCOL_VERSION).contains(&h.protocol) {
+                    return v(format!(
+                        "unsupported guest protocol {} (this kiln speaks 1 to {PROTOCOL_VERSION})",
+                        h.protocol
+                    ));
                 }
                 self.hello = true;
                 self.stage = 2;
@@ -96,7 +99,7 @@ impl Protocol {
                 if self.stage != 7 {
                     return v(format!("Exited at stage {}", self.stage));
                 }
-                self.exited = Some(*e);
+                self.exited = Some(e.clone());
             }
             GuestMessage::ExecStarted(_) | GuestMessage::ExecExited(_) | GuestMessage::ExecFailed(_) => {
                 if !self.running {
@@ -132,8 +135,8 @@ impl Protocol {
         self.stage
     }
 
-    pub fn exited(&self) -> Option<Exited> {
-        self.exited
+    pub fn exited(&self) -> Option<&Exited> {
+        self.exited.as_ref()
     }
 
     pub fn init_failed(&self) -> Option<&InitFailed> {
@@ -178,7 +181,7 @@ mod tests {
     }
 
     fn exited(code: i32) -> GuestMessage {
-        GuestMessage::Exited(Exited { signaled: false, code })
+        GuestMessage::Exited(Exited::main(false, code))
     }
 
     fn failed(stage: u8, errno: Option<i32>) -> GuestMessage {
@@ -308,8 +311,8 @@ mod tests {
             let (at, why) = run(msgs).unwrap_err();
             assert_eq!(at, msgs.len() - 1, "{msgs:?}: {why}");
         }
-        let (_, why) = run(&[GuestMessage::Hello(Hello { protocol: 2 })]).unwrap_err();
-        assert!(why.0.contains("unsupported guest protocol 2"), "{why}");
+        let (_, why) = run(&[GuestMessage::Hello(Hello { protocol: 3 })]).unwrap_err();
+        assert!(why.0.contains("unsupported guest protocol 3"), "{why}");
     }
 
     #[test]
