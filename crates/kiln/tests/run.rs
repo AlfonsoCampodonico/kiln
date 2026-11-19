@@ -1402,7 +1402,7 @@ fn services_from_the_image_label() {
     let Some(f) = fixture() else { return };
     let label = r#"[
         {"name": "web", "process": {"entrypoint": ["/bin/busybox", "httpd"], "cmd": ["-f", "-p", "8080", "-h", "/www"]}, "ready": "tcp:8080"},
-        {"name": "quitter", "process": {"cmd": ["/bin/sh", "-c", "sleep ${QUIT_AFTER:-1000}; exit 9"]}}
+        {"name": "quitter", "process": {"cmd": ["/bin/sh", "-c", "echo quit-after=$QUIT_AFTER >&2; sleep ${QUIT_AFTER:-60}; exit 9"]}}
     ]"#;
     let mut layer = TarBuilder::new();
     layer
@@ -1442,12 +1442,27 @@ fn services_from_the_image_label() {
         "{shown}"
     );
 
-    let o = f.output(&["web"]);
+    let o = f.output(&["--boot-timeout", "170", "web"]);
     assert_eq!(code(&o), 0, "{}", text(&o.stderr));
     let page = text(&o.stdout);
     assert!(page.contains("200 OK") && page.contains("hello-from-httpd"), "{page}");
 
-    let o = f.output(&["--env", "QUIT_AFTER=1", "web", "--", "/bin/sh", "-c", "sleep 1000"]);
+    let o = f.output(&[
+        "--boot-timeout",
+        "170",
+        "--env",
+        "QUIT_AFTER=1",
+        "web",
+        "--",
+        "/bin/sh",
+        "-c",
+        "sleep 1000",
+    ]);
+    assert!(
+        text(&o.stderr).contains("quit-after=1"),
+        "--env did not reach the service: {}",
+        text(&o.stderr)
+    );
     assert_eq!(code(&o), 9, "{}", text(&o.stderr));
     assert!(
         text(&o.stderr).contains("kiln: service quitter exited with 9, which ended the run"),
