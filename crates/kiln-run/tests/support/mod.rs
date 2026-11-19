@@ -6,6 +6,7 @@
 //! contract suite does), and:
 //!   KILN_TEST_KERNEL=<vmkit kernel>   KILN_TEST_INIT=<static kiln-init>
 //!   KILN_TEST_HOSTILE=<static `hostile` from kiln-testguest>   KILN_TEST_BUSYBOX=<static busybox, default /bin/busybox>
+//!   KILN_TEST_INIT_V1=<a static kiln-init speaking protocol version 1> (optional: the mixed-install tests)
 //! Without the kernel and init each test is skipped, unless KILN_REQUIRE_KVM_TESTS=1.
 //! KILN_TEST_KEEP=1 keeps every run directory (console and VMM logs); KILN_TEST_VCPUS
 //! sets the guests' vCPUs (default 1).
@@ -41,6 +42,7 @@ pub struct Env {
     pub init: PathBuf,
     pub hostile: Option<PathBuf>,
     pub busybox: PathBuf,
+    pub init_v1: Option<PathBuf>,
 }
 
 pub fn require() -> bool {
@@ -57,6 +59,7 @@ pub fn env() -> Option<&'static Env> {
                 init,
                 hostile: get("KILN_TEST_HOSTILE"),
                 busybox: get("KILN_TEST_BUSYBOX").unwrap_or_else(|| "/bin/busybox".into()),
+                init_v1: get("KILN_TEST_INIT_V1"),
             }),
             _ => {
                 assert!(
@@ -88,6 +91,8 @@ pub struct Fixtures {
     pub hostile_init: Option<PathBuf>,
     /// `base` plus a layer that makes `/proc` a symlink to `/dev`.
     pub proc_link: Vec<PathBuf>,
+    /// An init layer around a protocol version 1 kiln-init, when one was given.
+    pub init_v1: Option<PathBuf>,
 }
 
 pub const STACK_LAYERS: usize = 14;
@@ -121,10 +126,17 @@ pub fn fixtures() -> &'static Fixtures {
             std::fs::write(&p, init_layer(&bin, &dir).unwrap()).unwrap();
             p
         });
+        let init_v1 = env.init_v1.as_ref().map(|path| {
+            let bin = std::fs::read(path).expect("read KILN_TEST_INIT_V1");
+            let p = dir.join("init-v1.erofs");
+            std::fs::write(&p, init_layer(&bin, &dir).unwrap()).unwrap();
+            p
+        });
         let link = TarBuilder::new().symlink("proc", "/dev", &Opts::default()).finish();
         Fixtures {
             init,
             hostile_init,
+            init_v1,
             proc_link: convert(&store, &dir, "proc-link", vec![base.clone(), link]),
             base: convert(&store, &dir, "base", vec![base]),
             stack: convert(&store, &dir, "stack", stack),

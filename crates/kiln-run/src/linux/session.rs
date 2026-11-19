@@ -1187,12 +1187,12 @@ fn read_control(
                 if events.send(Event::Guest(msg)).is_err() {
                     return;
                 }
-                // Only what the guest's version defines is sent (spec §9.8).
-                if let Some(why) = version_refusal(proto.version(), config) {
-                    return violation(why);
-                }
                 let sent = match &reply {
                     None => {
+                        // Only what the guest's version defines is sent (spec §9.8).
+                        if let Some(why) = version_refusal(proto.version(), config) {
+                            return violation(why);
+                        }
                         let mut config = config.clone();
                         if !config.services.is_empty() {
                             config.ready_timeout_ms = Some(ready_timeout(boot_deadline, Instant::now()));

@@ -12,7 +12,7 @@
 
 **Tech Stack:**
 - Rust 2024, in the existing workspace. No new external dependency; `kiln-image` depends on `kiln-proto` (in the workspace) from Task 4.
-- Tools (Tasks 7, 8 on Linux): as M3b-1: Firecracker 1.17, Cloud Hypervisor 53, vmkit's 6.18.54 kernel, a static busybox (with `nc` and `httpd`), vmkit's `vmkit-sandbox` with its AppArmor profile. The mixed-version boot case also needs a static `kiln-init` built from kiln `main` (9c891ff), named by `KILN_TEST_INIT_V1`.
+- Tools (Tasks 7, 8 on Linux): as M3b-1: Firecracker 1.17, Cloud Hypervisor 53, vmkit's 6.18.54 kernel, a static busybox (with `nc` and `httpd`), vmkit's `vmkit-sandbox` with its AppArmor profile. The mixed-version boot case also needs a static `kiln-init` built from the merge-base of the branch with `main`, named by `KILN_TEST_INIT_V1`.
 
 **Spec:** `docs/superpowers/specs/2026-09-30-kiln-design.md` (rev 2.10; rev 2.11, committed with this plan, records this plan's rulings). This plan implements milestone M3d (§12):
 - §9.8 `services`: what M3d was to design (a service's `process`, readiness timeouts, how `Exited` reports a service, whether `kiln run` exposes services) and the versioning rules 1 to 4;
@@ -86,7 +86,7 @@ Rulings made while planning (not in the prototype):
 - **P1. Readers require the version that matches the services, both ways** (R1): version 1 with services and version 2 without are refused, as well as any other version. `kiln convert` always writes the matching version (`schema_version_for`), so the rule is exact and needs no "at least" reading; a version 1 config listing services is precisely what an older kiln would run without them.
 - **P2. The share is recomputed at each step** (R3): a process's share is what remains of the grace period divided by the number of processes still to stop, itself included. A process that exits early leaves its unused time to those after it; with one process its share is the whole grace period, which is version 1's behaviour exactly. A later `Shutdown` that shortens the deadline also caps the current share at its share of what remains.
 - **P3. SIGKILL at the end of a share goes to the process only, not its process group**, as its stop signal does; whatever it left behind is killed with everything else once every supervised process has exited (or at the deadline).
-- **P4. The mixed-version boot case skips itself without `KILN_TEST_INIT_V1`**, so `scripts/boot-tests.sh` (and CI) does not build an old `kiln-init`; this plan's validation built one from `main` (9c891ff).
+- **P4. The mixed-version boot case skips itself without `KILN_TEST_INIT_V1`**, so `scripts/boot-tests.sh` (and CI) does not build an old `kiln-init`; build it from the merge-base of the branch with `main` (a `main` that has moved on speaks a different protocol).
 
 From the prototype (findings), kept:
 - **D1.** A service's `process` is the main process's without `stopSignal` (the service's own `stopSignal` sits beside it); unknown fields are refused at every level, including `restart`. Names `[a-z0-9-]{1,32}`, unique, at most 16.
@@ -5231,11 +5231,11 @@ Expected: no clippy warnings; every test passes (527 tests; the boot and `kiln r
 
 - [ ] **Step 7: Build a version 1 kiln-init for the mixed-version case**
 
-In the Lima VM, from a worktree of `main` (9c891ff):
+In the Lima VM, from a worktree of the merge-base of this branch with `main` (the version 1 the branch started from):
 
 Run (Linux):
 ```bash
-git worktree add --detach ../kiln-v1 9c891ff
+git worktree add --detach ../kiln-v1 $(git merge-base HEAD origin/main)
 (cd ../kiln-v1 && CARGO_TARGET_DIR=$HOME/target-m3d-v1 cargo build -q --release --target $(uname -m)-unknown-linux-musl -p kiln-init)
 export KILN_TEST_INIT_V1=$HOME/target-m3d-v1/$(uname -m)-unknown-linux-musl/release/kiln-init
 ```
