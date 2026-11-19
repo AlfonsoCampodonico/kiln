@@ -770,10 +770,22 @@ fn a_service_exiting_first_ends_the_run(backend: Backend) {
         Ready::None,
         15,
     );
-    let b = svc("b", &format!("sleep 1; echo \"b-exit {T}\"; exit 42"), Ready::None, 15);
+    // b exits only once main has installed its TERM trap (a marker file, bounded wait).
+    let b = svc(
+        "b",
+        &format!(
+            "i=0; while [ ! -e /tmp/main-ready ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; \
+             echo \"b-exit {T}\"; exit 42"
+        ),
+        Ready::None,
+        15,
+    );
     let main = sh(
         &c,
-        &format!("trap 'echo \"main-stop {T}\"; exit 0' TERM; echo main-up; sleep 1000 & wait"),
+        &format!(
+            "trap 'echo \"main-stop {T}\"; exit 0' TERM; echo main-up; touch /tmp/main-ready; \
+             sleep 1000 & wait"
+        ),
     );
     let o = c.run(&fixtures().base, with_services(main, vec![a, b]));
     ended_cleanly(&c, &o);
@@ -853,7 +865,7 @@ fn a_stuck_main_process_does_not_cost_a_service_its_stop_signal(backend: Backend
     let fpm = svc(
         "php-fpm",
         &format!(
-            "trap 'echo \"fpm-quit {T}\"; kill $L; exit 0' QUIT; \
+            "trap 'echo \"fpm-quit {T}\"; sleep 1; echo fpm-drained; kill $L; exit 0' QUIT; \
              /bin/hostile listen-unix /tmp/php-fpm.sock & L=$!; wait"
         ),
         Ready::Unix("/tmp/php-fpm.sock".into()),
@@ -876,11 +888,13 @@ fn a_stuck_main_process_does_not_cost_a_service_its_stop_signal(backend: Backend
     ended_cleanly(&c, &o);
     let out = o.stdout();
     assert_eq!(
-        marks(&out, &["nginx-up", "fpm-quit"]),
-        ["nginx-up", "fpm-quit"],
+        marks(&out, &["nginx-up", "fpm-quit", "fpm-drained"]),
+        ["nginx-up", "fpm-quit", "fpm-drained"],
         "{out}\nconsole:\n{}",
         c.tail()
     );
+    // fpm's handler takes 1 s: it finishes only if fpm has a share of the grace
+    // of its own (a deadline shared with nginx would SIGKILL it mid-handler).
     // nginx held its share (2 s) and was killed: the status is its SIGKILL.
     assert!(sent.elapsed() >= Duration::from_secs(2), "{:?}", sent.elapsed());
     assert_eq!(o.exit_code(), 128 + 9);
@@ -909,9 +923,8 @@ fn a_service_that_is_not_ready_fails_the_boot(backend: Backend) {
         .unwrap_or_else(|| panic!("no InitFailed: {o:?}\n{}", c.tail()));
     assert_eq!(f.stage, 6, "{f:?}");
     assert!(f.message.contains("service never was not ready (tcp:9999)"), "{f:?}");
-    // The guest's own deadline ended the boot (no violation above), before the host's.
-    let ended = o.run.ended_after.expect("the VM ended");
-    assert!(ended < boot_timeout, "{ended:?}");
+    // The guest's own deadline ended the boot: `ended_cleanly` found no host
+    // violation (no boot timeout) and the guest sent its own `InitFailed`.
     assert_eq!(o.exit_code(), EXIT_INFRA);
     assert!(!o.running() && o.stdout.is_empty(), "{o:?}");
 
