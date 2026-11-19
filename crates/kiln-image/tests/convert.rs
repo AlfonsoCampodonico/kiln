@@ -296,3 +296,128 @@ fn golden_manifest_digest_is_stable() {
         "sha256:df76535d4264a2fd93139f2a6c12bc8a97e354b1fcc513e751a9ff7ab3ea317a"
     );
 }
+
+/// The label route (spec §9.8 `services`, potter spec §6.1.1): `dev.kiln.services`
+/// on the OCI config becomes the kiln config's `services`, so the image's digest
+/// covers them.
+#[test]
+fn the_services_label_becomes_the_configs_services() {
+    use kiln_image::types::LABEL_SERVICES;
+    use kiln_oci::ContainerConfig;
+    use kiln_oci::testlayout::LayoutBuilder;
+    let label = r#"[{"name":"php-fpm","process":{"cmd":["php-fpm","-F"]},"ready":"unix:/run/php-fpm.sock","stopSignal":"SIGQUIT"}]"#;
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let build = |dir: &std::path::Path, label: &str| {
+        let mut b = LayoutBuilder::new(dir);
+        let cfg = ContainerConfig {
+            cmd: Some(vec!["nginx".into(), "-g".into(), "daemon off;".into()]),
+            labels: Some([(LABEL_SERVICES.to_string(), label.to_string())].into()),
+            ..Default::default()
+        };
+        let d = b.image(&arm(), &[gz(&base(0o1777))], cfg);
+        b.add(d, Some("app")).finish()
+    };
+    let path = build(src.path(), label);
+    let out = convert_local(&store, &path, &req(&[arm()], "web"), &ConvertOptions::default()).unwrap();
+    let m = &load(&store, &out.digest).unwrap().entries[0].1;
+    assert_eq!(m.config.services.len(), 1);
+    assert_eq!(m.config.services[0].name, "php-fpm");
+    assert_eq!(m.config.services[0].stop_signal.as_deref(), Some("SIGQUIT"));
+    let raw = String::from_utf8(store.read_metadata(&m.manifest.config.digest).unwrap()).unwrap();
+    assert!(raw.contains(r#""services":[{"name":"php-fpm","#), "{raw}");
+    // Services make the config schema version 2, which a kiln older than M3d refuses.
+    assert_eq!(m.config.schema_version, 2);
+    assert!(raw.contains(r#""schemaVersion":2,"#), "{raw}");
+
+    // A bad label fails the conversion before any layer is converted.
+    let bad = tempfile::tempdir().unwrap();
+    let home2 = tempfile::tempdir().unwrap();
+    let store2 = Store::open(home2.path()).unwrap();
+    let path = build(
+        bad.path(),
+        r#"[{"name":"php-fpm","process":{"cmd":["x"]},"restart":"always"}]"#,
+    );
+    let err = convert_local(&store2, &path, &req(&[arm()], "web"), &ConvertOptions::default()).unwrap_err();
+    assert!(matches!(err, ImageError::Services(_)), "{err}");
+    assert!(err.to_string().contains("unknown field `restart`"), "{err}");
+    assert_eq!(cache_entries(&store2), 0);
+}
+
+/// potter commits through `convert_resolved` with a `ResolvedImage` it builds
+/// itself: the labels on its hand-built config take the same route.
+#[test]
+fn a_hand_built_resolved_image_carries_services_through_its_labels() {
+    use kiln_image::types::LABEL_SERVICES;
+    use kiln_image::{StoredLayers, convert_resolved};
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let path = layout(src.path(), &[arm()], &[gz(&base(0o1777))]);
+    let mut resolved =
+        kiln_oci::resolve_local(&store, &kiln_oci::LocalSource::detect(&path).unwrap(), None, &[arm()]).unwrap();
+    let cfg = resolved[0].config.config.get_or_insert_with(Default::default);
+    cfg.labels = Some(
+        [(
+            LABEL_SERVICES.to_string(),
+            r#"[{"name":"cache","process":{"cmd":["redis-server"]},"ready":"tcp:6379"}]"#.to_string(),
+        )]
+        .into(),
+    );
+    let out = convert_resolved(&store, &resolved, None, &ConvertOptions::default(), &StoredLayers).unwrap();
+    let m = &load(&store, &out.digest).unwrap().entries[0].1;
+    assert_eq!(m.config.services[0].ready, kiln_proto::Ready::Tcp(6379));
+}
+
+/// Readers accept schema version 1 without services and 2 with them, nothing else:
+/// a version 1 config listing services is what an older kiln would run without them.
+#[test]
+fn the_config_schema_version_must_match_its_services() {
+    use kiln_image::load_manifest;
+    use kiln_oci::ImageManifest;
+    use kiln_oci::canonical_json;
+    let src = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open(home.path()).unwrap();
+    let path = layout(src.path(), &[arm()], &[gz(&base(0o1777))]);
+    let out = convert_local(&store, &path, &req(&[arm()], "plain"), &ConvertOptions::default()).unwrap();
+    let m = load(&store, &out.digest).unwrap().entries[0].1.clone();
+    assert_eq!(m.config.schema_version, 1);
+    // The same manifest, its config changed by `edit`.
+    let with = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&store.read_metadata(&m.manifest.config.digest).unwrap()).unwrap();
+        edit(&mut config);
+        let bytes = canonical_json(&config);
+        let mut manifest: ImageManifest = m.manifest.clone();
+        manifest.config.digest = store.put_bytes(&bytes).unwrap();
+        manifest.config.size = bytes.len() as u64;
+        load_manifest(&store, &store.put_bytes(&canonical_json(&manifest)).unwrap())
+    };
+    let services = serde_json::json!([{"name": "a", "process": {"cmd": ["x"]}}]);
+    let ok = with(&|c| {
+        c["schemaVersion"] = 2.into();
+        c["services"] = services.clone();
+    })
+    .unwrap();
+    assert_eq!(ok.config.services.len(), 1);
+    for (edit, want) in [
+        (
+            Box::new(|c: &mut serde_json::Value| c["services"] = services.clone())
+                as Box<dyn Fn(&mut serde_json::Value)>,
+            "schema version 1 and 1 services",
+        ),
+        (
+            Box::new(|c| c["schemaVersion"] = 2.into()),
+            "schema version 2 and 0 services",
+        ),
+        (
+            Box::new(|c| c["schemaVersion"] = 3.into()),
+            "unsupported kiln image schema version 3",
+        ),
+    ] {
+        let err = with(&*edit).unwrap_err();
+        assert!(err.to_string().contains(want), "{err}");
+    }
+}

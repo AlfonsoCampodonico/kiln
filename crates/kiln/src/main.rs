@@ -601,6 +601,17 @@ fn run(cli: Cli) -> Result<()> {
                 for e in &pr.env {
                     println!("  env:        {}", clean_line(e));
                 }
+                for s in &m.config.services {
+                    let sp = &s.process;
+                    let argv: Vec<String> = sp.entrypoint.iter().chain(&sp.cmd).cloned().collect();
+                    println!(
+                        "  service:    {}  ready {}  stop {}  {}",
+                        clean_line(&s.name),
+                        clean_line(&s.ready.to_string()),
+                        clean_line(s.stop_signal.as_deref().unwrap_or("SIGTERM")),
+                        list(&argv)
+                    );
+                }
                 let reference = m
                     .config
                     .source

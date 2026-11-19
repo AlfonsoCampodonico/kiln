@@ -1485,6 +1485,7 @@ dependencies = [
  "flate2",
  "kiln-erofs",
  "kiln-oci",
+ "kiln-proto",
  "kiln-registry",
  "kiln-store",
  "serde",

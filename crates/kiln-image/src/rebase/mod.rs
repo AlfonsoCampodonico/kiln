@@ -20,7 +20,10 @@ use crate::convert::{
 use crate::error::{ImageError, Result, json};
 use crate::load::{KilnManifest, Loaded, load, resolve_name};
 use crate::pipeline::write_index;
-use crate::types::{ANN_INHERITS, ANN_SOURCE_DIGESTS, BaseRecord, KILN_LAYER, KilnConfig};
+use crate::types::{
+    ANN_INHERITS, ANN_SOURCE_DIGESTS, BaseRecord, KILN_LAYER, KilnConfig, LABEL_SERVICES, schema_version_for,
+    services_from_label,
+};
 use gates::{BaseView, PathSig, Refusal, Shadowed};
 
 /// What to rebase: names or digests in the store.
@@ -452,11 +455,19 @@ fn rebase_one(
     let mut config: KilnConfig = im.config.clone();
     config.process.env = gates::merge_env(&im.config.process.env, &om.config.process.env, &nm.config.process.env);
     let image_labels = labels_of(store, im).unwrap_or_default();
-    config.labels = Some(gates::merge_labels(
+    let merged = gates::merge_labels(
         &image_labels,
         old_labels.as_ref().expect("runtime gate passed"),
         new_labels.as_ref().expect("runtime gate passed"),
-    ));
+    );
+    // The services label is their source (as in convert): what a rebuild on the new base
+    // would give. The schema version follows them, by convert's rule.
+    config.services = match merged.get(LABEL_SERVICES) {
+        Some(label) => services_from_label(label)?,
+        None => Vec::new(),
+    };
+    config.schema_version = schema_version_for(&config.services);
+    config.labels = Some(merged);
     config.base = Some(BaseRecord {
         name: req.new.to_string(),
         manifest_digest: nm.digest.clone(),
