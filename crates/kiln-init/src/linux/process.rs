@@ -1,8 +1,13 @@
-//! Stage 6: start the main process (spec §9.6): user and groups from the image,
-//! environment, stdio on pipes relayed to vsock or on a pty, working directory,
-//! exec. Init keeps no copy of the child's ends of its stdio, so the relays see
-//! EOF once every process holding them has exited. Execs start the same way, with
-//! their stdio on port 1029 (kiln-shim exec and volumes design §3.2).
+//! Stage 6: start the services, then the main process (spec §9.6, §9.8): user and
+//! groups from the image, environment, stdio on pipes relayed to vsock or on a
+//! pty, working directory, exec. Each service is started in `Config` order and
+//! must be ready before the next one starts; the main process starts last. The
+//! main process's stdio is set up once and shared: the services get its stdout
+//! and stderr (with `-t`, the pty as plain output, never their controlling
+//! terminal) and `/dev/null` as stdin. Init keeps no copy of the processes' ends
+//! of their stdio, so the relays see EOF once every process holding them has
+//! exited. Execs start the same way, each with stdio of its own on port 1029
+//! (kiln-shim exec and volumes design §3.2).
 
 use std::fs::File;
 use std::os::fd::{AsFd, OwnedFd};
@@ -10,33 +15,85 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use std::io::Write;
 
-use kiln_proto::{Config, ExecStart, ExecStream, HOST_CID, Process, WindowSize, port};
+use kiln_proto::{Config, ExecStart, ExecStream, HOST_CID, Process, Ready, WindowSize, port};
+use rustix::fs::Mode;
 use rustix::pipe::PipeFlags;
-use rustix::process::{Gid, Pid, Uid};
+use rustix::process::{Gid, Pid, Uid, WaitOptions, WaitStatus};
 use rustix::pty::OpenptFlags;
 use rustix::termios::Winsize;
 use signal_hook::consts::{SIGCHLD, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use super::sys::Vsock;
-use super::{Event, relay};
+use super::{Event, host_ok, relay};
 use crate::error::{Context, Failure, Result};
 use crate::passwd::{Identity, resolve};
 
-/// The running main process.
-pub struct Started {
+/// One process init supervises: a service, or the main process.
+#[derive(Debug, Clone)]
+pub struct Proc {
+    /// The service's name; `None` for the main process.
+    pub name: Option<String>,
     pub pid: Pid,
-    /// The relays carrying its output; joined to drain it.
+    pub stop_signal: i32,
+}
+
+/// The running services and main process.
+pub struct Started {
+    /// The services in start order, then the main process (always last).
+    pub procs: Vec<Proc>,
+    /// The relays carrying their output; joined to drain it.
     pub outputs: Vec<JoinHandle<()>>,
     /// The pty master in `tty` mode, for `WindowSize`.
     pub tty: Option<OwnedFd>,
 }
 
-pub fn start(config: &Config, events: Sender<Event>) -> Result<Started> {
+/// A running exec.
+pub struct Spawned {
+    pub pid: Pid,
+    /// The relays carrying its output; joined to drain it.
+    pub outputs: Vec<JoinHandle<()>>,
+    /// The pty master in `tty` mode, for `ExecWindowSize`.
+    pub tty: Option<OwnedFd>,
+}
+
+/// A process's stdio once set up: the child's ends, the relays carrying them to the
+/// host, and the pty master in `tty` mode.
+struct Ends {
+    /// The stdin pipe's read end with `interactive`, or the pty slave; else `/dev/null`.
+    stdin: Option<File>,
+    /// The stdout and stderr pipes' write ends, or the pty slave twice.
+    stdout: File,
+    stderr: File,
+    outputs: Vec<JoinHandle<()>>,
+    master: Option<OwnedFd>,
+}
+
+/// How long a readiness check waits between attempts, at most.
+const READY_POLL: Duration = Duration::from_millis(50);
+
+/// Starts the services, each ready before the next, then the main process.
+/// `config_at` is when `Config` arrived: the services' readiness deadline
+/// (`Config.readyTimeoutMs`) counts from it.
+pub fn start(config: &Config, config_at: Instant, events: Sender<Event>) -> Result<Started> {
+    let passwd = read_optional("/etc/passwd")?;
+    let group = read_optional("/etc/group")?;
+    let identity = resolve(config.process.user.as_deref(), &passwd, &group)?;
+    let service_ids = config
+        .services
+        .iter()
+        .map(|s| {
+            resolve(s.process.user.as_deref(), &passwd, &group)
+                .map_err(|f| Failure::msg(format!("service {}: {f}", s.name)))
+        })
+        .collect::<Result<Vec<_>>>()?;
     watch_signals(events)?;
+    let workdir = create_workdir(&config.process, "")?;
+
     let main = |s: ExecStream| {
         connect(match s {
             ExecStream::Stdin => port::STDIN,
@@ -45,69 +102,219 @@ pub fn start(config: &Config, events: Sender<Event>) -> Result<Started> {
             ExecStream::Tty => port::TTY,
         })
     };
-    spawn(&config.process, &config.hostname, config.tty, config.interactive, &main)
+    let ends = stdio(config.tty, config.interactive, &identity, &main)?;
+    // A service running as another user must be able to reopen its stdout and
+    // stderr (`/dev/stdout`) as the main process can.
+    if config.tty.is_none() && service_ids.iter().any(|id| id.uid != identity.uid) {
+        for f in [&ends.stdout, &ends.stderr] {
+            rustix::fs::fchmod(f, Mode::from_raw_mode(0o622)).context("chmod the stdio")?;
+        }
+    }
+
+    let deadline = config
+        .ready_timeout_ms
+        .map(|ms| config_at + Duration::from_millis(u64::from(ms)));
+    let mut procs = Vec::new();
+    for (svc, id) in config.services.iter().zip(&service_ids) {
+        let what = format!("service {}: ", svc.name);
+        let env = crate::env::build(&svc.process.env, &id.home, &config.hostname, false);
+        let svc_workdir = create_workdir(&svc.process, &what)?;
+        let stdout = ends.stdout.try_clone().context(format!("{what}dup its stdout"))?;
+        let stderr = ends.stderr.try_clone().context(format!("{what}dup its stderr"))?;
+        let child = (Stdio::null(), stdout.into(), stderr.into());
+        let pid = launch(&svc.process, &env, id, svc_workdir, child, false, &what)?;
+        procs.push(Proc {
+            name: Some(svc.name.clone()),
+            pid,
+            stop_signal: svc.stop_signal,
+        });
+        wait_ready(&svc.name, &svc.ready, deadline, &procs)?;
+    }
+
+    let env = crate::env::build(
+        &config.process.env,
+        &identity.home,
+        &config.hostname,
+        config.tty.is_some(),
+    );
+    let Ends {
+        stdin,
+        stdout,
+        stderr,
+        outputs,
+        master,
+    } = ends;
+    let child = (
+        stdin.map_or_else(Stdio::null, Stdio::from),
+        stdout.into(),
+        stderr.into(),
+    );
+    let pid = launch(
+        &config.process,
+        &env,
+        &identity,
+        workdir,
+        child,
+        config.tty.is_some(),
+        "",
+    )?;
+    procs.push(Proc {
+        name: None,
+        pid,
+        stop_signal: config.stop_signal,
+    });
+    Ok(Started {
+        procs,
+        outputs,
+        tty: master,
+    })
 }
 
 /// Starts exec `e`: each stream is a connection to port 1029 opened by its header.
-pub fn exec(config: &Config, e: &ExecStart) -> Result<Started> {
+pub fn exec(config: &Config, e: &ExecStart) -> Result<Spawned> {
     let id = e.id;
     let open = |s: ExecStream| {
         let mut v = connect(port::EXEC)?;
         v.write_all(&s.header(id)).context("send an exec stream's header")?;
         Ok(v)
     };
-    spawn(&e.process, &config.hostname, e.tty, e.stdin, &open)
-}
-
-/// Starts `process` with its stdio on the connections `connect` opens.
-fn spawn(
-    process: &Process,
-    hostname: &str,
-    tty: Option<WindowSize>,
-    interactive: bool,
-    connect: &dyn Fn(ExecStream) -> Result<Vsock>,
-) -> Result<Started> {
+    let process = &e.process;
     let identity = resolve(
         process.user.as_deref(),
         &read_optional("/etc/passwd")?,
         &read_optional("/etc/group")?,
     )?;
-    let env = crate::env::build(&process.env, &identity.home, hostname, tty.is_some());
-    let workdir = process.working_dir.as_deref().unwrap_or("/");
-    std::fs::create_dir_all(workdir).context(format!("create the working directory {workdir}"))?;
+    let env = crate::env::build(&process.env, &identity.home, &config.hostname, e.tty.is_some());
+    let workdir = create_workdir(process, "")?;
+    let Ends {
+        stdin,
+        stdout,
+        stderr,
+        outputs,
+        master,
+    } = stdio(e.tty, e.stdin, &identity, &open)?;
+    let child = (
+        stdin.map_or_else(Stdio::null, Stdio::from),
+        stdout.into(),
+        stderr.into(),
+    );
+    let pid = launch(process, &env, &identity, workdir, child, e.tty.is_some(), "")?;
+    Ok(Spawned {
+        pid,
+        outputs,
+        tty: master,
+    })
+}
 
+/// Creates `process`'s working directory; returns it. `what` prefixes a failure.
+fn create_workdir<'a>(process: &'a Process, what: &str) -> Result<&'a str> {
+    let workdir = process.working_dir.as_deref().unwrap_or("/");
+    std::fs::create_dir_all(workdir).context(format!("{what}create the working directory {workdir}"))?;
+    Ok(workdir)
+}
+
+/// Sets up stdio for a process on the connections `connect` opens: a pty with
+/// `tty`, else pipes (stdin a pipe only with `interactive`).
+fn stdio(
+    tty: Option<WindowSize>,
+    interactive: bool,
+    id: &Identity,
+    connect: &dyn Fn(ExecStream) -> Result<Vsock>,
+) -> Result<Ends> {
+    match tty {
+        Some(size) => pty_stdio(size, id, connect),
+        None => pipe_stdio(interactive, id, connect),
+    }
+}
+
+/// Starts `process` with the given stdio ends, as `identity`, in `workdir`; with
+/// `tty`, stdin is the pty slave and becomes its controlling terminal. `what`
+/// prefixes failures (empty for the main process and execs).
+fn launch(
+    process: &Process,
+    env: &[String],
+    identity: &Identity,
+    workdir: &str,
+    (stdin, stdout, stderr): (Stdio, Stdio, Stdio),
+    tty: bool,
+    what: &str,
+) -> Result<Pid> {
     let argv = process.argv();
     let mut cmd = Command::new(argv[0]);
     cmd.args(&argv[1..])
         .env_clear()
         .envs(env.iter().filter_map(|e| e.split_once('=')))
-        .current_dir(workdir);
-    let (outputs, master) = match tty {
-        Some(size) => {
-            let (master, outputs) = pty_stdio(&mut cmd, size, &identity, connect)?;
-            (outputs, Some(master))
-        }
-        None => (pipe_stdio(&mut cmd, interactive, &identity, connect)?, None),
-    };
+        .current_dir(workdir)
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr);
     let (hook_failed, hook_report) =
         rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).context("pipe")?;
-    drop_privileges(&mut cmd, &identity, tty.is_some(), hook_report);
+    drop_privileges(&mut cmd, identity, tty, hook_report);
     let child = cmd.spawn().map_err(|e| match hook_step(&hook_failed) {
         // The error came from the setup before exec, not from exec itself.
-        Some(step) => Failure::os(format!("start {}: {step}", argv[0]), &e),
+        Some(step) => Failure::os(format!("{what}start {}: {step}", argv[0]), &e),
         None => Failure {
             errno: e.raw_os_error(),
-            message: format!("exec {}: {e}", argv[0]),
+            message: format!("{what}exec {}: {e}", argv[0]),
             exec: true,
         },
     })?;
     // Dropping the command closes init's copies of the child's stdio.
     drop(cmd);
-    Ok(Started {
-        pid: Pid::from_raw(child.id() as i32).expect("a child's pid is positive"),
-        outputs,
-        tty: master,
-    })
+    Ok(Pid::from_raw(child.id() as i32).expect("a child's pid is positive"))
+}
+
+/// Waits until service `name` is ready, failing when the deadline passes, when
+/// any process started so far exits, or when the host has failed.
+fn wait_ready(name: &str, ready: &Ready, deadline: Option<Instant>, procs: &[Proc]) -> Result<()> {
+    let mut pause = Duration::from_millis(5);
+    loop {
+        for p in procs {
+            if let Ok(Some((_, status))) = rustix::process::waitpid(Some(p.pid), WaitOptions::NOHANG) {
+                let who = p.name.as_deref().unwrap_or("main");
+                let when = if who == name {
+                    "before it was ready".to_string()
+                } else {
+                    format!("while service {name} was starting")
+                };
+                return Err(Failure::msg(format!("service {who} {} {when}", describe(status))));
+            }
+        }
+        if is_ready(ready) {
+            return Ok(());
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(Failure::msg(format!(
+                "service {name} was not ready ({ready}) by the deadline the host set (its boot timeout)"
+            )));
+        }
+        host_ok()?;
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(READY_POLL);
+    }
+}
+
+/// Whether `ready` holds now: a connection to the socket or port is accepted
+/// (and closed at once).
+fn is_ready(ready: &Ready) -> bool {
+    match ready {
+        Ready::None => true,
+        Ready::Unix(path) => std::os::unix::net::UnixStream::connect(path).is_ok(),
+        Ready::Tcp(port) => {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], *port));
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+        }
+    }
+}
+
+/// `exited with 3` or `was killed by signal 9`.
+pub fn describe(status: WaitStatus) -> String {
+    match (status.exit_status(), status.terminating_signal()) {
+        (Some(code), _) => format!("exited with {code}"),
+        (None, Some(sig)) => format!("was killed by signal {sig}"),
+        (None, None) => "ended".into(),
+    }
 }
 
 /// A file's contents, or nothing if it does not exist.
@@ -151,41 +358,35 @@ fn give(fd: impl AsFd, id: &Identity) -> Result<()> {
 }
 
 /// Pipes relayed to ports 1025–1027. Without `interactive`, stdin is `/dev/null`.
-fn pipe_stdio(
-    cmd: &mut Command,
-    interactive: bool,
-    id: &Identity,
-    connect: &dyn Fn(ExecStream) -> Result<Vsock>,
-) -> Result<Vec<JoinHandle<()>>> {
-    if interactive {
+fn pipe_stdio(interactive: bool, id: &Identity, connect: &dyn Fn(ExecStream) -> Result<Vsock>) -> Result<Ends> {
+    let stdin = if interactive {
         let (r, w) = pipe()?;
         give(&r, id)?;
         relay::spawn("stdin", connect(ExecStream::Stdin)?, w, drop)?;
-        cmd.stdin(r);
+        Some(r)
     } else {
-        cmd.stdin(Stdio::null());
-    }
+        None
+    };
     let mut outputs = Vec::new();
+    let mut ends = Vec::new();
     for (name, stream) in [("stdout", ExecStream::Stdout), ("stderr", ExecStream::Stderr)] {
         let (r, w) = pipe()?;
         give(&w, id)?;
         outputs.push(relay::spawn(name, r, connect(stream)?, |v: Vsock| v.shutdown_write())?);
-        if stream == ExecStream::Stdout {
-            cmd.stdout(w);
-        } else {
-            cmd.stderr(w);
-        }
+        ends.push(w);
     }
-    Ok(outputs)
+    let [stdout, stderr] = <[File; 2]>::try_from(ends).expect("two pipes");
+    Ok(Ends {
+        stdin,
+        stdout,
+        stderr,
+        outputs,
+        master: None,
+    })
 }
 
 /// A pty from the guest's devpts, relayed to port 1028; its slave is the child's stdio.
-fn pty_stdio(
-    cmd: &mut Command,
-    size: WindowSize,
-    id: &Identity,
-    connect: &dyn Fn(ExecStream) -> Result<Vsock>,
-) -> Result<(OwnedFd, Vec<JoinHandle<()>>)> {
+fn pty_stdio(size: WindowSize, id: &Identity, connect: &dyn Fn(ExecStream) -> Result<Vsock>) -> Result<Ends> {
     let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
     let master = rustix::pty::openpt(flags).context("open /dev/ptmx")?;
     rustix::pty::grantpt(&master).context("grantpt")?;
@@ -203,10 +404,13 @@ fn pty_stdio(
     )?;
     // The terminal's end is the end of its output: its input relay stops too.
     let output = relay::spawn("tty-out", File::from(dup(&master)?), vsock, |v: Vsock| v.shutdown())?;
-    cmd.stdin(File::from(dup(&slave)?))
-        .stdout(File::from(dup(&slave)?))
-        .stderr(File::from(slave));
-    Ok((master, vec![output]))
+    Ok(Ends {
+        stdin: Some(File::from(dup(&slave)?)),
+        stdout: File::from(dup(&slave)?),
+        stderr: File::from(slave),
+        outputs: vec![output],
+        master: Some(master),
+    })
 }
 
 pub fn set_window_size(master: &OwnedFd, size: WindowSize) -> Result<()> {
