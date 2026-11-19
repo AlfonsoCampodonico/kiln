@@ -1390,3 +1390,68 @@ fn a_rebased_image_boots_on_the_new_base() {
         assert_eq!(text(&o.stdout), want);
     }
 }
+
+/// Spec §9.8 `services` end to end: an OCI image whose `dev.kiln.services` label
+/// declares busybox httpd as a service ready on its TCP port; `kiln convert`
+/// copies the services into the kiln config, `kiln inspect` lists them, and
+/// `kiln run` starts httpd before the main process, which fetches a page from it
+/// with nc. A service that exits first ends the run with its status, and kiln
+/// names it; `--env` reaches the service.
+#[test]
+fn services_from_the_image_label() {
+    let Some(f) = fixture() else { return };
+    let label = r#"[
+        {"name": "web", "process": {"entrypoint": ["/bin/busybox", "httpd"], "cmd": ["-f", "-p", "8080", "-h", "/www"]}, "ready": "tcp:8080"},
+        {"name": "quitter", "process": {"cmd": ["/bin/sh", "-c", "sleep ${QUIT_AFTER:-1000}; exit 9"]}}
+    ]"#;
+    let mut layer = TarBuilder::new();
+    layer
+        .dir("www", &Opts::default().mode(0o755))
+        .file("www/index.html", b"hello-from-httpd\n", &Opts::default());
+    let src = tempfile::tempdir().unwrap();
+    let path = src.path().join("web");
+    let mut b = LayoutBuilder::new(&path);
+    let cfg = ContainerConfig {
+        cmd: Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"/bin/busybox printf 'GET / HTTP/1.0\r\n\r\n' | nc 127.0.0.1 8080"#.into(),
+        ]),
+        labels: Some([("dev.kiln.services".to_string(), label.to_string())].into()),
+        ..Default::default()
+    };
+    let d = b.image(
+        &Platform::host(),
+        &[
+            TestLayer::tar(busybox_layer(&f.env.busybox, "web")),
+            TestLayer::tar(layer.finish()),
+        ],
+        cfg,
+    );
+    b.add(d, None).finish();
+    let out = f
+        .kiln()
+        .args(["convert", "--boot-layers", "none", "--tag", "web"])
+        .arg(&path)
+        .finish();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let inspect = f.kiln().args(["inspect", "web"]).finish();
+    let shown = text(&inspect.stdout);
+    assert!(
+        shown.contains("service:    web  ready tcp:8080  stop SIGTERM  /bin/busybox httpd -f -p 8080 -h /www"),
+        "{shown}"
+    );
+
+    let o = f.output(&["web"]);
+    assert_eq!(code(&o), 0, "{}", text(&o.stderr));
+    let page = text(&o.stdout);
+    assert!(page.contains("200 OK") && page.contains("hello-from-httpd"), "{page}");
+
+    let o = f.output(&["--env", "QUIT_AFTER=1", "web", "--", "/bin/sh", "-c", "sleep 1000"]);
+    assert_eq!(code(&o), 9, "{}", text(&o.stderr));
+    assert!(
+        text(&o.stderr).contains("kiln: service quitter exited with 9, which ended the run"),
+        "{}",
+        text(&o.stderr)
+    );
+}
