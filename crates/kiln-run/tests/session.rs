@@ -586,6 +586,42 @@ fn a_stop_request_ends_at_the_guests_final_message() {
     );
 }
 
+/// A stop requested before `Running` is acted on once stage 6 is over (services
+/// ready), which can take until the boot deadline: the host's stop bound counts
+/// from the boot deadline, so a guest that reaches `Running` later than grace plus
+/// the end bound after the request is not killed, and its exit stands.
+#[test]
+fn a_stop_before_running_waits_for_the_boot_deadline() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let vm = fake(move |sock, _| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        for n in 3..=6 {
+            send(&mut c, GuestMessage::Stage(Stage { n }));
+        }
+        tx.send(()).unwrap();
+        let shutdown = read_message::<_, HostMessage>(&mut c).unwrap();
+        assert!(matches!(shutdown, Some(HostMessage::Shutdown(_))), "{shutdown:?}");
+        // A slow service: stage 6 outlasts the grace and the end bound.
+        std::thread::sleep(Duration::from_millis(2500));
+        send(&mut c, GuestMessage::Running);
+        send(&mut c, GuestMessage::Stage(Stage { n: 7 }));
+        drop((connect(&sock, port::STDOUT), connect(&sock, port::STDERR)));
+        exited(&mut c, 0);
+    });
+    let (st, _) = streams(None);
+    let mut o = opts();
+    o.boot_timeout = Duration::from_secs(6);
+    (o.stop_timeout, o.end_timeout) = (1, Duration::from_millis(500));
+    let s = Session::start(vm, config(), st, o).unwrap();
+    rx.recv().unwrap();
+    s.handle().terminate();
+    let out = s.finish_within(LIMIT);
+    assert_eq!((out.exit_code, out.violation.as_deref()), (0, None), "{out:?}");
+    assert!(!out.killed && out.warnings.is_empty(), "{out:?}");
+    assert_eq!(out.end.reason, EndReason::Exited, "{out:?}");
+}
+
 #[test]
 fn a_guest_not_running_within_the_boot_timeout_is_killed() {
     let vm = fake(|sock, killed| {

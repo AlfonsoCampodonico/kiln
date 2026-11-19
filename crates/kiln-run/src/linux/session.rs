@@ -839,7 +839,21 @@ impl Session {
         // The grace, then as long as the guest has to end the VM after `Exited`: init
         // kills the app when the grace ends, then syncs the scratch disk before
         // `Exited`, and that sync must not be cut short (60 s with `--persist`).
-        let at = Instant::now() + Duration::from_secs(u64::from(grace)) + self.opts.end_timeout;
+        let after = Duration::from_secs(u64::from(grace)).saturating_add(self.opts.end_timeout);
+        // Before `Running` the guest acts on `Shutdown` only once stage 6 is over
+        // (its services are ready), which can take until the boot deadline: count
+        // from there, never from earlier than now. Without a boot deadline (one too
+        // far to represent), from now.
+        let now = Instant::now();
+        let from = if self.proto.running() {
+            now
+        } else {
+            self.boot_deadline.map_or(now, |d| d.max(now))
+        };
+        let Some(at) = from.checked_add(after).or_else(|| now.checked_add(after)) else {
+            // Too far to represent: no stop bound beyond the ones already set.
+            return;
+        };
         self.stop_deadline = Some(self.stop_deadline.map_or(at, |d| d.min(at)));
     }
 
