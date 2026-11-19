@@ -12,8 +12,14 @@
 //! whatever follows `InitFailed` is ignored, so the init failure is what is
 //! reported. So a guest gets at most nine messages accepted, and the host's
 //! memory for a session stays bounded whatever the guest sends.
+//!
+//! Versions (spec §9.8): the guest's `Hello` names the highest version it
+//! speaks; the host accepts 1 to [`PROTOCOL_VERSION`]. A guest may use only what
+//! its version defines (`Exited.service` needs 2, and must name one of the run's
+//! services), and the host sends only what that version defines: a run whose
+//! `Config` needs more ends before `Config` is sent ([`version_refusal`]).
 
-use kiln_proto::{EXIT_INFRA, Exited, GuestMessage, InitFailed, PROTOCOL_VERSION};
+use kiln_proto::{Config, EXIT_INFRA, Exited, GuestMessage, InitFailed, PROTOCOL_VERSION};
 
 /// Why a message was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +47,10 @@ pub enum Accepted {
 /// What the guest has reported so far.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Protocol {
+    /// The run's service names: the only ones `Exited.service` may name.
+    services: Vec<String>,
+    /// The version the guest's `Hello` announced (0 before it).
+    version: u32,
     hello: bool,
     /// The highest stage reported (2 once `Hello` arrived: it stands for stage 2).
     stage: u8,
@@ -50,6 +60,14 @@ pub struct Protocol {
 }
 
 impl Protocol {
+    /// A session for a run with these services (none: [`Protocol::default`]).
+    pub fn new(config: &Config) -> Self {
+        Self {
+            services: config.services.iter().map(|s| s.name.clone()).collect(),
+            ..Self::default()
+        }
+    }
+
     /// Checks `msg` against the sequence and records it.
     pub fn accept(&mut self, msg: &GuestMessage) -> Result<Accepted, Violation> {
         let v = |s: String| Err(Violation(s));
@@ -71,6 +89,7 @@ impl Protocol {
                         h.protocol
                     ));
                 }
+                self.version = h.protocol;
                 self.hello = true;
                 self.stage = 2;
                 return Ok(Accepted::Hello);
@@ -98,6 +117,14 @@ impl Protocol {
             GuestMessage::Exited(e) => {
                 if self.stage != 7 {
                     return v(format!("Exited at stage {}", self.stage));
+                }
+                if let Some(name) = &e.service {
+                    if self.version < 2 {
+                        return v(format!("Exited names a service from a protocol {} guest", self.version));
+                    }
+                    if !self.services.contains(name) {
+                        return v(format!("Exited names service {name:?}, which this run does not have"));
+                    }
                 }
                 self.exited = Some(e.clone());
             }
@@ -139,6 +166,11 @@ impl Protocol {
         self.exited.as_ref()
     }
 
+    /// The protocol version the guest announced (0 before `Hello`).
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
     pub fn init_failed(&self) -> Option<&InitFailed> {
         self.failed.as_ref()
     }
@@ -152,6 +184,18 @@ impl Protocol {
             (None, None) => EXIT_INFRA,
         }
     }
+}
+
+/// Why the host must not send `config` to a guest that speaks `guest`: it needs a
+/// later version (spec §9.8 rule 3). The run then ends with 125, before `Config`.
+pub fn version_refusal(guest: u32, config: &Config) -> Option<String> {
+    let needed = config.required_version();
+    (guest < needed).then(|| {
+        format!(
+            "the image's services need guest protocol version {needed}, and the guest's kiln-init speaks \
+             version {guest}: boot it with a kiln-init from this kiln release"
+        )
+    })
 }
 
 fn name(msg: &GuestMessage) -> &'static str {
@@ -170,10 +214,104 @@ fn name(msg: &GuestMessage) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kiln_proto::{Hello, Stage};
+    use kiln_proto::{ExitMethod, Hello, Process, Ready, Scratch, Service, Stage};
 
     fn hello() -> GuestMessage {
         GuestMessage::Hello(Hello { protocol: 1 })
+    }
+
+    fn config(services: &[&str]) -> Config {
+        Config {
+            process: Process {
+                cmd: vec!["nginx".into()],
+                ..Process::default()
+            },
+            stop_signal: 15,
+            tty: None,
+            interactive: false,
+            hostname: "h".into(),
+            network: None,
+            layers: 1,
+            scratch: Scratch { size_bytes: 64 << 20 },
+            exit_method: ExitMethod::Reboot,
+            shutdown_grace_secs: 10,
+            volumes: Vec::new(),
+            pod_disk: None,
+            ready_timeout_ms: (!services.is_empty()).then_some(1000),
+            services: services
+                .iter()
+                .map(|n| Service {
+                    name: n.to_string(),
+                    process: Process {
+                        cmd: vec!["php-fpm".into()],
+                        ..Process::default()
+                    },
+                    ready: Ready::None,
+                    stop_signal: 3,
+                })
+                .collect(),
+        }
+    }
+
+    fn service_exited(name: &str, code: i32) -> GuestMessage {
+        GuestMessage::Exited(Exited {
+            service: Some(name.into()),
+            ..Exited::main(false, code)
+        })
+    }
+
+    #[test]
+    fn versions_one_and_two_are_accepted_and_the_config_needs_its_own() {
+        for v in [1, 2] {
+            let mut p = Protocol::default();
+            assert_eq!(
+                p.accept(&GuestMessage::Hello(Hello { protocol: v })),
+                Ok(Accepted::Hello)
+            );
+            assert_eq!(p.version(), v);
+        }
+        let mut p = Protocol::default();
+        let why = p.accept(&GuestMessage::Hello(Hello { protocol: 3 })).unwrap_err();
+        assert!(
+            why.0.contains("unsupported guest protocol 3 (this kiln speaks 1 to 2)"),
+            "{why}"
+        );
+        assert_eq!(version_refusal(1, &config(&[])), None);
+        assert_eq!(version_refusal(2, &config(&["php-fpm"])), None);
+        let why = version_refusal(1, &config(&["php-fpm"])).unwrap();
+        assert!(why.contains("version 2") && why.contains("speaks version 1"), "{why}");
+    }
+
+    #[test]
+    fn a_service_ending_the_run() {
+        let c = config(&["php-fpm"]);
+        let boot = |p: &mut Protocol, version: u32| {
+            for m in [
+                GuestMessage::Hello(Hello { protocol: version }),
+                stage(6),
+                GuestMessage::Running,
+                stage(7),
+            ] {
+                p.accept(&m).unwrap();
+            }
+        };
+        let mut p = Protocol::new(&c);
+        boot(&mut p, 2);
+        p.accept(&service_exited("php-fpm", 70)).unwrap();
+        assert_eq!(p.exit_code(), 70);
+        assert_eq!(p.exited().unwrap().service.as_deref(), Some("php-fpm"));
+        // A name the run does not have, or any name from a version 1 guest, is a lie.
+        let mut p = Protocol::new(&c);
+        boot(&mut p, 2);
+        let why = p.accept(&service_exited("nginx", 0)).unwrap_err();
+        assert!(why.0.contains("does not have"), "{why}");
+        let mut p = Protocol::new(&c);
+        boot(&mut p, 1);
+        let why = p.accept(&service_exited("php-fpm", 0)).unwrap_err();
+        assert!(why.0.contains("protocol 1 guest"), "{why}");
+        let mut p = Protocol::default();
+        boot(&mut p, 2);
+        assert!(p.accept(&service_exited("php-fpm", 0)).is_err());
     }
 
     fn stage(n: u8) -> GuestMessage {

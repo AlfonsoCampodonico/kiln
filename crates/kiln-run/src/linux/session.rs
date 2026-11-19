@@ -57,7 +57,7 @@ use vmkit::{EndReason, Vm, VmEnd};
 use crate::error::{Error, Result};
 use crate::escape::{Escape, Key};
 use crate::exec::{ExecReport, ExecStreams, Execs, Relay};
-use crate::protocol::{Accepted, Protocol};
+use crate::protocol::{Accepted, Protocol, version_refusal};
 
 /// How many host messages may wait for the guest to read them.
 const QUEUE: usize = 64;
@@ -69,6 +69,9 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const FILES_WAIT: Duration = Duration::from_secs(60);
 /// How often the main loop looks for the VMM's end (vmkit has no pollable handle).
 const VM_POLL: Duration = Duration::from_millis(20);
+/// What the guest's readiness deadline for services leaves of the boot timeout,
+/// for its `InitFailed` to reach the host before the boot timeout ends the VM.
+const READY_MARGIN: Duration = Duration::from_secs(2);
 /// The exit code of a VM the user killed (second SIGINT, `Ctrl-]` `k`), as `docker kill`.
 pub const EXIT_KILLED: i32 = 137;
 
@@ -476,12 +479,18 @@ impl Session {
         let drain = Arc::new(Drain::default());
         let execs = Arc::new(Execs::default());
         let files = Arc::new(FileBudget::default());
+        let proto = Protocol::new(&config);
+        // Taken before the VM starts, so a guest can never ask for `Config` before it
+        // is known; the boot deadline set after `start` is a little later, so services'
+        // readiness deadline, derived from this one, always ends first.
+        let ready_deadline = Instant::now().checked_add(opts.boot_timeout);
         spawn("control-writer", {
             let (tx, files) = (tx.clone(), files.clone());
             move || writer(&stream_rx, &out_rx, &tx, &files)
         })?;
         let serve = Serve {
             config,
+            boot_deadline: ready_deadline,
             reply: opts.reply.clone(),
             events: tx.clone(),
             writer: stream_tx,
@@ -510,7 +519,7 @@ impl Session {
             wake,
             listener: Some(listener),
             opts,
-            proto: Protocol::default(),
+            proto,
             stages: Vec::new(),
             violation: None,
             killed: false,
@@ -939,6 +948,9 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> Result<JoinHandle<()>
 /// What the listener hands each first connection.
 struct Serve {
     config: Config,
+    /// When the boot timeout ends: services' readiness deadline is derived from it
+    /// when `Config` is sent (none: a boot timeout too far to represent).
+    boot_deadline: Option<Instant>,
     reply: Option<Vec<u8>>,
     events: Sender<Event>,
     writer: Sender<UnixStream>,
@@ -1059,8 +1071,11 @@ impl Serve {
             port::CONTROL => {
                 let (config, reply, writer) = (self.config.clone(), self.reply.take(), self.writer.clone());
                 let (execs, after) = (self.execs.clone(), std::mem::take(&mut self.after_config));
+                let deadline = self.boot_deadline;
                 spawn("control-reader", move || {
-                    control(stream, &config, reply, after, &events, &writer, &drain, &execs)
+                    control(
+                        stream, &config, deadline, reply, after, &events, &writer, &drain, &execs,
+                    )
                 })?;
             }
             port::EXEC => {
@@ -1115,6 +1130,7 @@ impl Serve {
 fn control(
     stream: UnixStream,
     config: &Config,
+    boot_deadline: Option<Instant>,
     reply: Option<Vec<u8>>,
     after: Vec<HostMessage>,
     events: &Sender<Event>,
@@ -1122,14 +1138,16 @@ fn control(
     drain: &Drain,
     execs: &Execs,
 ) {
-    read_control(stream, config, reply, after, events, writer, execs);
+    read_control(stream, config, boot_deadline, reply, after, events, writer, execs);
     drain.ports().remove(&port::CONTROL);
     let _ = events.send(Event::Eof);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_control(
     stream: UnixStream,
     config: &Config,
+    boot_deadline: Option<Instant>,
     reply: Option<Vec<u8>>,
     mut after: Vec<HostMessage>,
     events: &Sender<Event>,
@@ -1149,7 +1167,7 @@ fn read_control(
         Ok(r) => (r, stream),
         Err(e) => return violation(format!("control socket: {e}")),
     };
-    let mut proto = Protocol::default();
+    let mut proto = Protocol::new(config);
     loop {
         let msg = match read_message::<_, GuestMessage>(&mut reader) {
             Ok(Some(m)) => m,
@@ -1169,9 +1187,17 @@ fn read_control(
                 if events.send(Event::Guest(msg)).is_err() {
                     return;
                 }
+                // Only what the guest's version defines is sent (spec §9.8).
+                if let Some(why) = version_refusal(proto.version(), config) {
+                    return violation(why);
+                }
                 let sent = match &reply {
                     None => {
-                        write_message(&mut w, &HostMessage::Config(Box::new(config.clone()))).map_err(|e| e.to_string())
+                        let mut config = config.clone();
+                        if !config.services.is_empty() {
+                            config.ready_timeout_ms = Some(ready_timeout(boot_deadline, Instant::now()));
+                        }
+                        write_message(&mut w, &HostMessage::Config(Box::new(config))).map_err(|e| e.to_string())
                     }
                     Some(raw) => w.write_all(raw).map_err(|e| e.to_string()),
                 };
@@ -1202,6 +1228,19 @@ fn read_control(
                 }
             }
             Err(v) => return violation(v.0),
+        }
+    }
+}
+
+/// The guest's deadline for its services to become ready, from `Config`'s
+/// arrival: what remains of the boot timeout, less [`READY_MARGIN`] (at least
+/// 1 ms; without a boot deadline, the most `Config` can carry).
+fn ready_timeout(boot_deadline: Option<Instant>, now: Instant) -> u32 {
+    match boot_deadline {
+        None => u32::MAX,
+        Some(d) => {
+            let left = d.saturating_duration_since(now).saturating_sub(READY_MARGIN);
+            u32::try_from(left.as_millis()).unwrap_or(u32::MAX).max(1)
         }
     }
 }
