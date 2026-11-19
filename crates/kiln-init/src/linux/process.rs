@@ -111,6 +111,23 @@ pub fn start(config: &Config, config_at: Instant, events: Sender<Event>) -> Resu
         }
     }
 
+    // Under `-t` the services write to the pty through a write-only descriptor of
+    // their own: the read-write slave (terminal input, the main process's) is not theirs.
+    let service_tty = match &ends.master {
+        Some(master) => Some(File::from(service_output(master)?)),
+        None => None,
+    };
+    let (service_out, service_err) = match &service_tty {
+        Some(tty) => (tty, tty),
+        None => (&ends.stdout, &ends.stderr),
+    };
+    // Under `-t` a service is not a session leader, so it can never take the pty as its
+    // controlling terminal (the main process's, below).
+    let service_session = if config.tty.is_some() {
+        Session::Group
+    } else {
+        Session::Own
+    };
     let deadline = config
         .ready_timeout_ms
         .map(|ms| config_at + Duration::from_millis(u64::from(ms)));
@@ -119,10 +136,10 @@ pub fn start(config: &Config, config_at: Instant, events: Sender<Event>) -> Resu
         let what = format!("service {}: ", svc.name);
         let env = crate::env::build(&svc.process.env, &id.home, &config.hostname, false);
         let svc_workdir = create_workdir(&svc.process, &what)?;
-        let stdout = ends.stdout.try_clone().context(format!("{what}dup its stdout"))?;
-        let stderr = ends.stderr.try_clone().context(format!("{what}dup its stderr"))?;
+        let stdout = service_out.try_clone().context(format!("{what}dup its stdout"))?;
+        let stderr = service_err.try_clone().context(format!("{what}dup its stderr"))?;
         let child = (Stdio::null(), stdout.into(), stderr.into());
-        let pid = launch(&svc.process, &env, id, svc_workdir, child, false, &what)?;
+        let pid = launch(&svc.process, &env, id, svc_workdir, child, service_session, &what)?;
         procs.push(Proc {
             name: Some(svc.name.clone()),
             pid,
@@ -130,6 +147,8 @@ pub fn start(config: &Config, config_at: Instant, events: Sender<Event>) -> Resu
         });
         wait_ready(&svc.name, &svc.ready, deadline, &procs)?;
     }
+    // Init keeps no copy of the pty slave, or the terminal's output would never end.
+    drop(service_tty);
 
     let env = crate::env::build(
         &config.process.env,
@@ -155,7 +174,7 @@ pub fn start(config: &Config, config_at: Instant, events: Sender<Event>) -> Resu
         &identity,
         workdir,
         child,
-        config.tty.is_some(),
+        terminal(config.tty.is_some()),
         "",
     )?;
     procs.push(Proc {
@@ -198,7 +217,7 @@ pub fn exec(config: &Config, e: &ExecStart) -> Result<Spawned> {
         stdout.into(),
         stderr.into(),
     );
-    let pid = launch(process, &env, &identity, workdir, child, e.tty.is_some(), "")?;
+    let pid = launch(process, &env, &identity, workdir, child, terminal(e.tty.is_some()), "")?;
     Ok(Spawned {
         pid,
         outputs,
@@ -227,16 +246,41 @@ fn stdio(
     }
 }
 
-/// Starts `process` with the given stdio ends, as `identity`, in `workdir`; with
-/// `tty`, stdin is the pty slave and becomes its controlling terminal. `what`
-/// prefixes failures (empty for the main process and execs).
+/// The pty slave under `-t` opened anew, write-only and never as a controlling
+/// terminal: the services' stdout and stderr.
+fn service_output(master: &OwnedFd) -> Result<OwnedFd> {
+    let flags =
+        OpenptFlags::from_bits_retain(rustix::fs::OFlags::WRONLY.bits()) | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
+    rustix::pty::ioctl_tiocgptpeer(master, flags).context("open the pty slave write-only")
+}
+
+/// How a child is placed among sessions and process groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Session {
+    /// A session of its own, without a controlling terminal.
+    Own,
+    /// A session of its own with stdin, the pty slave, as its controlling terminal:
+    /// the main process and execs under `-t`.
+    Terminal,
+    /// A process group of its own in init's session: a service under `-t`. Not being
+    /// a session leader, it can never take a controlling terminal.
+    Group,
+}
+
+/// The session of the main process or an exec, with a terminal or without.
+fn terminal(tty: bool) -> Session {
+    if tty { Session::Terminal } else { Session::Own }
+}
+
+/// Starts `process` with the given stdio ends, as `identity`, in `workdir`, placed
+/// as `session` says. `what` prefixes failures (empty for the main process and execs).
 fn launch(
     process: &Process,
     env: &[String],
     identity: &Identity,
     workdir: &str,
     (stdin, stdout, stderr): (Stdio, Stdio, Stdio),
-    tty: bool,
+    session: Session,
     what: &str,
 ) -> Result<Pid> {
     let argv = process.argv();
@@ -250,7 +294,7 @@ fn launch(
         .stderr(stderr);
     let (hook_failed, hook_report) =
         rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).context("pipe")?;
-    drop_privileges(&mut cmd, identity, tty, hook_report);
+    drop_privileges(&mut cmd, identity, session, hook_report);
     let child = cmd.spawn().map_err(|e| match hook_step(&hook_failed) {
         // The error came from the setup before exec, not from exec itself.
         Some(step) => Failure::os(format!("{what}start {}: {step}", argv[0]), &e),
@@ -281,7 +325,7 @@ fn wait_ready(name: &str, ready: &Ready, deadline: Option<Instant>, procs: &[Pro
                 return Err(Failure::msg(format!("service {who} {} {when}", describe(status))));
             }
         }
-        if is_ready(ready) {
+        if is_ready(ready, deadline) {
             return Ok(());
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -290,20 +334,29 @@ fn wait_ready(name: &str, ready: &Ready, deadline: Option<Instant>, procs: &[Pro
             )));
         }
         host_ok()?;
-        std::thread::sleep(pause);
+        std::thread::sleep(bounded(pause, deadline, Instant::now()));
         pause = (pause * 2).min(READY_POLL);
     }
 }
 
+/// `wait` cut to what is left until `deadline`, and at least 1 ms.
+fn bounded(wait: Duration, deadline: Option<Instant>, now: Instant) -> Duration {
+    match deadline {
+        Some(d) => wait.min(d.saturating_duration_since(now)).max(Duration::from_millis(1)),
+        None => wait,
+    }
+}
+
 /// Whether `ready` holds now: a connection to the socket or port is accepted
-/// (and closed at once).
-fn is_ready(ready: &Ready) -> bool {
+/// (and closed at once), the attempt bounded by `deadline`.
+fn is_ready(ready: &Ready, deadline: Option<Instant>) -> bool {
     match ready {
         Ready::None => true,
         Ready::Unix(path) => std::os::unix::net::UnixStream::connect(path).is_ok(),
         Ready::Tcp(port) => {
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], *port));
-            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+            let wait = bounded(Duration::from_millis(200), deadline, Instant::now());
+            std::net::TcpStream::connect_timeout(&addr, wait).is_ok()
         }
     }
 }
@@ -425,12 +478,13 @@ pub fn set_window_size(master: &OwnedFd, size: WindowSize) -> Result<()> {
 
 /// What the child's setup was doing when it failed, as `drop_privileges`'s hook
 /// numbers its steps.
-const HOOK_STEPS: [&str; 5] = [
+const HOOK_STEPS: [&str; 6] = [
     "setsid",
     "make the terminal the controlling terminal",
     "setgroups",
     "setresgid",
     "setresuid",
+    "setpgid",
 ];
 
 /// The step the pre-exec hook reported on `pipe`, if it failed (std reports a hook's
@@ -444,9 +498,10 @@ fn hook_step(pipe: &OwnedFd) -> Option<&'static str> {
 }
 
 /// In the child, after std has set up stdio and the working directory: a new
-/// session (with the pty as controlling terminal in `tty` mode), then groups,
-/// gid and uid. A failing step writes its index in [`HOOK_STEPS`] to `report`.
-fn drop_privileges(cmd: &mut Command, id: &Identity, tty: bool, report: OwnedFd) {
+/// session (with the pty as controlling terminal for [`Session::Terminal`]) or, for
+/// [`Session::Group`], a new process group, then groups, gid and uid. A failing step
+/// writes its index in [`HOOK_STEPS`] to `report`.
+fn drop_privileges(cmd: &mut Command, id: &Identity, session: Session, report: OwnedFd) {
     let groups: Vec<Gid> = id.groups.iter().map(|&g| Gid::from_raw(g)).collect();
     let (uid, gid) = (Uid::from_raw(id.uid), Gid::from_raw(id.gid));
     let hook = move || -> std::io::Result<()> {
@@ -456,9 +511,13 @@ fn drop_privileges(cmd: &mut Command, id: &Identity, tty: bool, report: OwnedFd)
                 std::io::Error::from(e)
             })
         };
-        step(0, rustix::process::setsid().map(drop))?;
-        if tty {
-            step(1, rustix::process::ioctl_tiocsctty(rustix::stdio::stdin()))?;
+        match session {
+            Session::Own => step(0, rustix::process::setsid().map(drop))?,
+            Session::Terminal => {
+                step(0, rustix::process::setsid().map(drop))?;
+                step(1, rustix::process::ioctl_tiocsctty(rustix::stdio::stdin()))?;
+            }
+            Session::Group => step(5, rustix::process::setpgid(None, None))?,
         }
         // The child has one thread, so the per-thread calls apply to the process.
         step(2, rustix::thread::set_thread_groups(&groups))?;
@@ -507,9 +566,88 @@ mod tests {
             groups: vec![0],
             home: "/".into(),
         };
-        drop_privileges(&mut cmd, &id, false, w);
+        drop_privileges(&mut cmd, &id, Session::Own, w);
         let err = cmd.spawn().unwrap_err();
         assert_eq!(err.raw_os_error(), Some(rustix::io::Errno::PERM.raw_os_error()));
         assert_eq!(hook_step(&r), Some("setgroups"));
+    }
+
+    fn test_pty() -> OwnedFd {
+        let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
+        let master = rustix::pty::openpt(flags).unwrap();
+        rustix::pty::grantpt(&master).unwrap();
+        rustix::pty::unlockpt(&master).unwrap();
+        master
+    }
+
+    /// Under `-t` the services' output is the pty opened write-only: they cannot read
+    /// the terminal's input, which is the main process's.
+    #[test]
+    fn a_services_terminal_output_is_write_only() {
+        let master = test_pty();
+        let out = service_output(&master).unwrap();
+        let mode = rustix::fs::fcntl_getfl(&out).unwrap() & rustix::fs::OFlags::RWMODE;
+        assert_eq!(mode, rustix::fs::OFlags::WRONLY);
+        assert_eq!(rustix::io::read(&out, &mut [0u8; 1]), Err(rustix::io::Errno::BADF));
+        assert!(
+            rustix::io::fcntl_getfd(&out)
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
+        rustix::io::write(&out, b"x").unwrap();
+        let mut got = [0u8; 1];
+        assert_eq!(rustix::io::read(&master, &mut got), Ok(1));
+        assert_eq!(&got, b"x");
+    }
+
+    /// The hook as root, the way the services run under `-t`: a service in a process
+    /// group of its own (not a session leader) that reopens its terminal output
+    /// read-write without `O_NOCTTY` does not take the pty as its controlling
+    /// terminal; in a session of its own it would (the control case).
+    #[test]
+    fn a_service_under_a_terminal_cannot_take_it_as_its_controlling_terminal() {
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("skipped: the hook's setgroups needs root");
+            return;
+        }
+        let tty_nr = |session: Session| {
+            let master = test_pty();
+            let (_r, w) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).unwrap();
+            let mut cmd = Command::new("/bin/sh");
+            // Field 7 of /proc/<pid>/stat is the controlling terminal (0: none).
+            cmd.args([
+                "-c",
+                "exec 3<>/proc/self/fd/2; read -r l < /proc/self/stat; set -- ${l#*) }; echo $5",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(File::from(service_output(&master).unwrap()));
+            let id = Identity {
+                uid: 0,
+                gid: 0,
+                groups: vec![0],
+                home: "/".into(),
+            };
+            drop_privileges(&mut cmd, &id, session, w);
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        assert_eq!(tty_nr(Session::Group), "0");
+        assert_ne!(tty_nr(Session::Own), "0", "the control case took the terminal");
+    }
+
+    #[test]
+    fn the_readiness_probe_never_waits_past_the_deadline() {
+        let now = Instant::now();
+        let d = Duration::from_millis(200);
+        assert_eq!(bounded(d, None, now), d);
+        assert_eq!(bounded(d, Some(now + Duration::from_secs(5)), now), d);
+        assert_eq!(
+            bounded(d, Some(now + Duration::from_millis(30)), now),
+            Duration::from_millis(30)
+        );
+        // A deadline already passed still allows the shortest wait (connect_timeout refuses zero).
+        assert_eq!(bounded(d, Some(now), now), Duration::from_millis(1));
     }
 }

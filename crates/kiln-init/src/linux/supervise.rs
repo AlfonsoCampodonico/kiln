@@ -107,7 +107,7 @@ pub fn run(config: &Config, started: Started, events: &Receiver<Event>, volumes:
                 // Each child is a supervised process, an exec, or an orphan init
                 // inherited (reaped, nothing more).
                 for (child, status) in sys::reap() {
-                    if let Some(i) = s.procs.iter().position(|p| p.pid == child) {
+                    if let Some(i) = s.running(child) {
                         s.exited(i, status, config.shutdown_grace_secs);
                     } else if let Some(e) = execs.remove(&child) {
                         report(e, status);
@@ -204,6 +204,12 @@ pub fn run(config: &Config, started: Started, events: &Receiver<Event>, volumes:
 impl Supervisor {
     fn done(&self) -> bool {
         self.status.iter().all(Option::is_some)
+    }
+
+    /// The supervised process `pid` is, if it has not been reaped yet: once reaped,
+    /// its pid may be reused by another child (an exec).
+    fn running(&self, pid: Pid) -> Option<usize> {
+        (0..self.procs.len()).find(|&i| self.procs[i].pid == pid && self.status[i].is_none())
     }
 
     /// Records the exit of process `i`; the first one starts the end, with the
@@ -353,5 +359,34 @@ mod tests {
         assert_eq!(share(now, deadline, 0), deadline);
         // A deadline already passed leaves no share.
         assert_eq!(share(deadline, now, 2), deadline);
+    }
+
+    /// A supervised process already reaped is never matched again: its pid may have
+    /// been reused (by an exec started while stopping) and must not overwrite its status.
+    #[test]
+    fn a_reaped_process_is_not_matched_by_its_pid_again() {
+        // Reaped by `waitpid` below, for a real `WaitStatus`.
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = Pid::from_raw(child.id() as i32).unwrap();
+        let (_, status) = rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty())
+            .unwrap()
+            .unwrap();
+        let other = Pid::from_raw(i32::MAX).unwrap();
+        let proc = |pid| Proc {
+            name: None,
+            pid,
+            stop_signal: 15,
+        };
+        let s = Supervisor {
+            procs: vec![proc(pid), proc(other)],
+            status: vec![Some(status), None],
+            ending: Some(Ending::Exit(0)),
+            queue: VecDeque::new(),
+            stopping: None,
+            deadline: None,
+        };
+        assert_eq!(s.running(pid), None);
+        assert_eq!(s.running(other), Some(1));
     }
 }
