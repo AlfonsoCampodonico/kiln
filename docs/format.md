@@ -1,8 +1,8 @@
 # kiln formats
 
-This document is normative. It defines the **kiln image** (schema version 1, provisional until M3 adds kernel and init layers), the **kiln snapshot** (schema version 1) and its lazy index, the **erofs profile** (format version 1), the **guest** that `kiln-init` sets up (devices, init layer, scratch disk, boot sequence) and the **control protocol** (version 1) between `kiln-init` and the host.
+This document is normative. It defines the **kiln image** (schema versions 1 and 2, provisional until M3 adds kernel and init layers), the **kiln snapshot** (schema version 1) and its lazy index, the **erofs profile** (format version 1), the **guest** that `kiln-init` sets up (devices, init layer, scratch disk, boot sequence) and the **control protocol** (versions 1 and 2) between `kiln-init` and the host.
 
-## kiln image, schema version 1
+## kiln image, schema versions 1 and 2
 
 A kiln image is an OCI 1.1 artifact. All JSON kiln writes is serialised with keys sorted and no insignificant whitespace, so identical inputs give identical digests.
 
@@ -49,7 +49,7 @@ An OCI image manifest (`mediaType` `application/vnd.oci.image.manifest.v1+json`,
   "source": { "manifestDigest": "sha256:…", "reference": "docker.io/library/php:8.4-cli" }
 }
 ```
-- `schemaVersion`: 1. Readers reject other values.
+- `schemaVersion`: 2 when `services` is present, otherwise 1. Readers reject other values, and a config whose version does not match its `services` (version 1 with services, version 2 without).
 - `architecture`: `amd64` or `arm64`.
 - `process`: copied from the source OCI config. Empty lists and strings are omitted.
 - `kernel` (`{ "profile", "version" }`) and `init` (`{ "version" }`): set when the image has that boot layer, omitted otherwise. `kiln run` verifies the kernel layer against the digest kiln pins for `kernel` and the image's architecture (a `custom` profile needs `--allow-custom-kernel`); `init` is informational, since the init layer is always replaced.
@@ -57,7 +57,24 @@ An OCI image manifest (`mediaType` `application/vnd.oci.image.manifest.v1+json`,
 - `erofsFormatVersion`: the erofs profile version of every app layer.
 - `labels`: the source OCI config's labels, `{}` when there are none. Always written by kilns that record labels; a config without it comes from an older kiln, whose labels are unknown.
 - `base` (only for images converted with `--base` or made by `kiln rebase`): `{ "name", "manifestDigest", "layers", "sourceLayers" }`. The image's bottom `layers` app layers are exactly the app layers of the kiln manifest `manifestDigest`, the base, and they came from the first `sourceLayers` layers of the source manifest. No squashed layer spans that boundary: layers above it that are merged keep their whiteouts and opaque markers. `name` is informational. `kiln rebase` refuses images without this record.
+- `services` (from M3d, omitted when empty): processes `kiln-init` starts before the main process (below). `kiln convert` takes them from the source OCI config's `dev.kiln.services` label, and `kiln rebase` re-derives them from the merged label (spec §16.5).
 - There is no kernel command line field and no kiln version field.
+
+The config reader ignores fields it does not know, but a kiln from before M3d accepts only schema version 1: it refuses an image with services instead of running it without them.
+
+### Services
+
+The `dev.kiln.services` label of an OCI image config holds a JSON array; `kiln convert` parses it, checks it and stores the result as the kiln config's `services`, so the image digest covers it. The label stays in `labels` too, as the source's text; `kiln run` reads only `services`. A label that does not parse, has an unknown field anywhere, or breaks a rule below fails the conversion before any layer is converted (`invalid dev.kiln.services label: …`). `kiln rebase` derives the merged config's `services` from the merged `dev.kiln.services` label and sets `schemaVersion` by the rule above, as a rebuild on the new base would; a merged label that does not parse refuses the rebase. Each entry, and each entry of `services`:
+
+```json
+{ "name": "php-fpm", "process": { "cmd": ["-F"], "entrypoint": ["php-fpm"], "env": ["A=1"], "user": "root", "workingDir": "/app" }, "ready": "unix:/run/php-fpm.sock", "stopSignal": "SIGQUIT" }
+```
+- `name`: 1 to 32 of `[a-z0-9-]`, unique in the image. At most 16 services.
+- `process`: as the main process's `process` without `stopSignal`: `entrypoint` and `cmd` (together a non-empty argv with a non-empty argv[0]), `env`, `workingDir` (absolute), `user`. Empty lists and unset strings are omitted. The service does not inherit the main process's environment.
+- `ready`: `unix:<path>` (an absolute path of at most 107 bytes), `tcp:<port>` (1-65535, digits only) or `none`, the default (omitted).
+- `stopSignal`: a signal name or number as for `STOPSIGNAL` (1-31; real-time signals are refused), default SIGTERM (omitted).
+
+`kiln inspect` prints one `service:` line per service: its name, `ready`, stop signal and argv.
 
 ### Local store (informative)
 
@@ -327,8 +344,8 @@ Growing online to 64 GiB works on Firecracker. On Cloud Hypervisor 53 the resize
 | 3 | storage | A tmpfs at `/kiln`; app layer `n` mounted read-only (erofs) at `/kiln/layers/<n>`; the scratch disk mounted at `/kiln/rw` with `noinit_itable` and grown online with `EXT4_IOC_RESIZE_FS` (it fails if `vdb` is smaller than `Config.scratch.sizeBytes`); `upper/` and `work/` created on it; the overlay mounted at `/kiln/root` with one mount(2) call and the data `lowerdir=<top…bottom>,upperdir=/kiln/rw/upper,workdir=/kiln/rw/work,xino=on,redirect_dir=off,index=off,metacopy=off`. Without layers, the only lower directory is the empty `/kiln/empty`. |
 | 4 | root | Refuses an image whose `/proc`, `/sys`, `/dev` or `/etc` exists as a symlink or another non-directory (runc refuses such a `/proc` and `/sys`; for `/dev` and `/etc` it is kiln's own rule, where runc resolves the symlink inside the rootfs); creates missing `/etc`, `/proc`, `/sys`, `/dev` in the overlay (they land in the upper layer); mounts `proc`, `sysfs`, `cgroup2` on `/sys/fs/cgroup` and `mqueue` on `/dev/mqueue` (each `nosuid,nodev,noexec`), `devtmpfs` (`nosuid`), `devpts` (`nosuid,noexec`, `newinstance,ptmxmode=0666,mode=0620,gid=5`) and a tmpfs on `/dev/shm` (`nosuid,nodev`, mode 1777); replaces `/dev/fd`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and `/dev/ptmx` with symlinks to `/proc/self/fd`, `/proc/self/fd/0`, `/proc/self/fd/1`, `/proc/self/fd/2` and `pts/ptmx`; `pivot_root(".", ".")` and detaches the old root. Nothing is mounted on `/run` or `/tmp`. |
 | 5 | identity | Sets the hostname; writes `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf` as new regular files (mode 0644, after unlinking whatever was there, so a symlink is replaced, never followed); brings up `lo`, and with `Config.network` brings up `eth0`, adds its address and a default route over rtnetlink (on-link when the gateway is outside the address's prefix, as for a CNI's `/32` pod address), and with `Config.network.ipv6` its IPv6 address (without duplicate address detection, so it is usable at once) and IPv6 default route. A kernel without IPv6 fails this stage. |
-| 6 | process | Starts the main process (below) and sends `Running`. |
-| 7 | supervise | Reaps every process and handles host messages and signals until the main process exits (below). |
+| 6 | process | Starts the services, each ready before the next, then the main process (below), and sends `Running`. |
+| 7 | supervise | Reaps every process and handles host messages and signals until the run ends (below). |
 
 `/etc/hosts` has Docker's layout: `127.0.0.1 localhost`, the IPv6 loopback and multicast names, then the guest's address (or `127.0.1.1` without a network) with the hostname, and with IPv6 the guest's IPv6 address with the hostname. `/etc/resolv.conf` lists `Config.network.dns` as `nameserver` lines, then `Config.network.search` as one `search` line and `Config.network.options` as one `options` line when they are set. Without a network it holds the comment `# kiln: this VM has no network`, and with a network but no DNS servers the comment `# kiln: no DNS servers configured`; either is followed by `nameserver 127.0.0.1`, as Docker's `--network none` still lists a resolver, so that lookups fail at once (nothing answers there) instead of tools that need a resolver refusing to start.
 
@@ -339,15 +356,26 @@ Growing online to 64 GiB works on Firecracker. On Cloud Hypervisor 53 the resize
 - **Stdio:** without `tty`, pipes relayed to vsock ports 1025–1027 (stdin is `/dev/null` and port 1025 is not connected unless `interactive`). With `tty`, a pseudo-terminal from the guest's devpts, set to the given size and relayed to port 1028; the process gets it as its controlling terminal.
 - The process runs in a new session. Then groups, gid and uid are set (all three real, effective and saved IDs), and argv (`entrypoint` followed by `cmd`) is executed, searching the environment's `PATH` when argv[0] has no `/`.
 
+**Services** (stage 6, protocol version 2): before the main process, each of `Config.services` is started in order:
+- Its user, groups, environment and working directory follow the main process's rules above, from its own `process` (without `TERM`). Its stdin is `/dev/null`. Without `tty` it runs in a new session; with `tty` it runs in its own process group of init's session and is never a session leader, so it can never take the pseudo-terminal as its controlling terminal.
+- It shares the main process's stdout and stderr. Without `tty` these are the same pipes (relayed to ports 1026 and 1027). The pipes are owned by the main process's user; when a service runs as another uid they are made writable by everyone (mode 0622), so that it too can reopen `/dev/stdout`.
+- With `tty`, a service's stdout and stderr are a write-only handle (`O_WRONLY|O_NOCTTY`) on the pseudo-terminal, never the read-write slave the main process has. So a service cannot read the terminal's input, and, since it is not a session leader, cannot take the terminal. The 0622 mode applies to pipes only: a service running as another uid cannot reopen `/dev/stdout` under `-t`. A service running as root or as the main process's uid can still reopen the pseudo-terminal by its path, read its input or change its termios. It is in the main process's trust domain (it could equally ptrace the main process), so this is an accepted residual; a separate terminal or an output relay for services is the later option.
+- It is ready when a connection to its Unix stream socket, or to `127.0.0.1:<port>`, is accepted (init connects and closes at once, retrying every 5 to 50 ms), or at once with `none`. The next service, or the main process, starts only then. A `tcp:` service must listen on the loopback address or the wildcard address (`0.0.0.0`); one listening only on `::1` or on the network's address is never ready. The probes are real connections, closed without a byte sent, and may show up in the service's log.
+- `Config.readyTimeoutMs`, counted from `Config`'s arrival, bounds every service's readiness (including what stage 3 took). A service not ready by then, any process exiting while a service is starting, or a service that cannot be started fails stage 6 with a message naming the service; an exec failure keeps its errno, as the main process's does. A service that exits after the last readiness check ends the run, as in stage 7.
+
 **Supervision** (stage 7):
 - `Signal { sig }` is sent to the main process. `WindowSize` resizes the pseudo-terminal (ignored without `tty`).
-- `Shutdown { graceSecs }`, or SIGINT or SIGTERM to init (with `Config.shutdownGraceSecs`): `stopSignal` is sent to the main process (once), and when the grace period ends every process but init gets SIGKILL. A later request can shorten the deadline, never extend it.
-- When the main process exits, every other process gets SIGKILL and is reaped; then stdout and stderr (or the terminal) are relayed to EOF; then the scratch filesystem is synced and, on a best-effort basis, made read-only (EBUSY is ignored); then `Exited` is sent, and init ends the VM with `Config.exitMethod`. `Exited` therefore means the scratch disk is safe: the host never kills the VM on `Exited` itself, but a VM killed after it keeps every write (`--persist` relies on this). `InitFailed` paths do not sync first.
+- The run ends with the first of its processes (services and the main process) to exit, or with `Shutdown { graceSecs }`, or SIGINT or SIGTERM to init (with `Config.shutdownGraceSecs`). The processes still running are then stopped one at a time in reverse start order, so the main process first: each gets its stop signal (the main process `stopSignal`, a service its own). The grace period (`graceSecs`, or `Config.shutdownGraceSecs` when a process's exit ended the run) is split evenly between the processes still to stop: when one is sent its stop signal, its share is what remains of the grace period divided by the number of processes still running that have not yet been sent theirs, itself included. The next one gets its stop signal once that one has exited, or, if it has not exited when its share ends, once it has been sent SIGKILL. So a process that ignores its stop signal costs the ones after it only its share, never their stop signals. When the grace period ends, every process but init gets SIGKILL. A later request can shorten the deadline, never extend it. Without services this is: `stopSignal` to the main process once, and SIGKILL to everything at the deadline. Execs (protocol version 1) never end the run and are not stopped in turn: they are killed with everything else once the processes above have exited.
+- When every one of them has exited, every other process gets SIGKILL and is reaped; then stdout and stderr (or the terminal) are relayed to EOF; then the scratch filesystem is synced and, on a best-effort basis, made read-only (EBUSY is ignored); then `Exited` is sent, with the status of the process whose exit ended the run (and its name in `service` when it was a service), or after a shutdown request the main process's; init ends the VM with `Config.exitMethod`. `Exited` therefore means the scratch disk is safe: the host never kills the VM on `Exited` itself, but a VM killed after it keeps every write (`--persist` relies on this). `InitFailed` paths do not sync first.
 - The host's bounds around this (kiln): after `Shutdown` it kills the VM when the guest's final message has not come within the grace period plus the end bound (10 s, 60 s with `--persist`), the time init has for the sync; after `Exited`, `InitFailed` or the control connection closing, the VM has the end bound to end. Without a stop request no bound applies between `Running` and the final message: a guest stuck before `Exited` (in the sync, say) is like a main process that still runs, and the host waits, as `docker run` does; the user's second SIGINT kills it.
 
 **Failure:** a failing stage prints `kiln-init: <stage name>: <error>` on the console, sends `InitFailed` when the control connection is up, sends SIGKILL to every other process, and ends the VM with `Config.exitMethod`, or with a reboot before `Config` arrived. A panic does the same. A protocol error from the host, a second `Config`, or the host closing the control connection, is a failure too: it is detected by a reader thread once `Config` has arrived and acted on when init enters its next stage (and at the end of stage 6, before `Running`), or at once during stage 7; the failure names it rather than a send that failed because of it.
 
-## Control protocol, version 1
+## Control protocol
+
+This section defines versions 1 and 2. Version 2 adds `Config.services`, `Config.readyTimeoutMs` and `Exited.service` and nothing else; a version adds message types, optional fields and values, and never changes what an earlier version defines (spec §9.8).
+
+Version 1 was frozen at the first `kiln-init` release. It includes what the kiln-shim exec and volumes work added before any release (spec §9.8): the exec message types 10 to 16, vsock port 1029, `Config.volumes` and `Config.podDisk`, and `Config.network.search`, `options` and `ipv6`. Those are specified for now by `docs/superpowers/specs/2026-10-30-kiln-shim-exec-volumes-design.md` (and the IPv6 design), not in the tables below.
 
 ### Transport
 
@@ -371,12 +399,12 @@ A frame is a `u32` little-endian length, then a `u8` message type, then the payl
 
 | Type | Name | Direction | Payload |
 |---|---|---|---|
-| 1 | `Hello` | guest → host | `{"protocol": 1}`: the protocol version, at least 1. |
+| 1 | `Hello` | guest → host | `{"protocol": 2}`: the highest protocol version the guest implements, at least 1. |
 | 2 | `Config` | host → guest | The run's configuration (below). |
 | 3 | `Stage` | guest → host | `{"n": 3}`: init entered stage `n` (1–7). Sent for stages 3 to 7; stages 1 and 2 precede it. |
-| 4 | `Running` | guest → host | `{}`: the main process started. |
-| 5 | `Exited` | guest → host | `{"signaled": false, "code": 0}`: the main process ended, its output reached EOF, and the scratch disk was synced and remounted read-only (best effort). `code` is the exit status (0–255), or with `signaled` the signal that killed it (1–64). |
-| 6 | `InitFailed` | guest → host | `{"stage": 6, "errno": 2, "message": "…"}`: init failed at `stage` (1–7). `errno` (1–4095) is present at stage 6 only when executing the entrypoint failed; it may be present at other stages. `message` has at most 4096 bytes and is untrusted text. |
+| 4 | `Running` | guest → host | `{}`: the main process started (after every service was ready). |
+| 5 | `Exited` | guest → host | `{"signaled": false, "code": 0}`: the run ended, its output reached EOF, and the scratch disk was synced and remounted read-only (best effort). `code` is the exit status (0–255), or with `signaled` the signal that killed it (1–64), of the main process, or (version 2) of the service named in the optional `service` (`[a-z0-9-]{1,32}`), whose exit ended the run. |
+| 6 | `InitFailed` | guest → host | `{"stage": 6, "errno": 2, "message": "…"}`: init failed at `stage` (1–7). `errno` (1–4095) is present at stage 6 only when executing the entrypoint (the main process's, or a service's) failed; it may be present at other stages. `message` has at most 4096 bytes and is untrusted text. |
 | 7 | `Shutdown` | host → guest | `{"graceSecs": 10}`. |
 | 8 | `Signal` | host → guest | `{"sig": 1}`: a signal number from 1 to 31. |
 | 9 | `WindowSize` | host → guest | `{"rows": 24, "cols": 80}` (each 0–65535). |
@@ -398,7 +426,9 @@ A frame is a `u32` little-endian length, then a `u8` message type, then the payl
 | `layers` | integer | The number of app layers, 0–128. |
 | `scratch.sizeBytes` | integer | A multiple of 4096, at least 67108864. |
 | `exitMethod` | `"reboot"` or `"poweroff"` | How the guest ends the VM (vmkit's `guest_exit` capability). |
-| `shutdownGraceSecs` | integer | The grace period for SIGINT or SIGTERM to init. |
+| `shutdownGraceSecs` | integer | The grace period for SIGINT or SIGTERM to init, and (version 2) for stopping the other processes when one exits. |
+| `services` | list, optional (version 2) | The services, as in the kiln config (above) with these differences: `process.env` is the final environment (the image's, then the run's overrides, which the host adds to every service too); `ready` is always present; `stopSignal` is an integer 1–31. At most 16, unique names. Omitted when empty, so a `Config` without services is a version 1 `Config`. |
+| `readyTimeoutMs` | integer, optional (version 2) | 1–4294967295; present exactly when `services` is. How long, from `Config`'s arrival, the guest allows for every service to be ready. The host sets it when it sends `Config`, to at most what remains of its boot timeout less 2 seconds (the boot deadline is taken just before the VM starts, so it can be shorter by the VM's start time; it is 1 at the least), so that the guest reports a service that is never ready (`InitFailed`) before the host's boot timeout ends the VM. |
 
 No string may contain a NUL byte.
 
@@ -407,6 +437,8 @@ The whole `Config` is one frame, and a frame is at most 65536 bytes including th
 ### Session
 
 1. The guest connects port 1024 and sends `Hello`. The host answers the first `Hello` with `Config`, once per VM.
+   - **Versions.** A host supports every version from 1 to its own (2). A `Hello` naming a higher version is a violation, so a version 1 host refuses a version 2 `kiln-init`; that is by design, since `kiln run` boots the `kiln-init` pinned to it (spec §8.1) and the two ship together: only a `kiln-init` named with `--init` can be of another release. The host sends only what the guest's version defines for services: when the run has services (they need version 2) and the guest speaks version 1, the host sends no `Config`, kills the VM and reports 125 with an error naming the version required. The exec and volume additions of version 1 are not gated on the guest's version. A guest may use only what its version defines: `Exited.service` from a version 1 guest, or naming a service the run does not have, is a violation. The guest decodes strictly, so a version 1 `kiln-init` refuses a version 2 field (`InitFailed` at stage 2).
+   - **kiln-shim** sends no services in M3d: it cannot see the image's `dev.kiln.services` label (it never reaches the OCI runtime spec), so under it an image with services runs without them. This is a known gap; the M4 follow-up has the shim read the image config through containerd's image service and either pass the services or refuse.
 2. The guest sends `Stage` for stages 3 to 7, `Running` once the main process has started, then `Exited`, or `InitFailed` at any point. The host sends `Shutdown`, `Signal` and `WindowSize` at any time after `Config`.
 
 The host checks the order of the guest's messages: `Stage` numbers strictly increase (gaps allowed) and only stages 3 to 6 come before `Running`; `Running` comes once, at stage 6; `Stage 7` comes only after `Running`; `Exited` only at stage 7; `InitFailed` once, anywhere after `Hello`, naming a stage no earlier than the last one reported (`Running` counts as stage 7). Nothing may follow `Exited`; anything after `InitFailed` is ignored, so the failure is what is reported.
@@ -416,8 +448,8 @@ The host kills the VM, and reports 125, on any violation: a message out of that 
 ### Exit codes
 
 The host reports, as Docker does:
-- after `Exited`: `code`, or `128 + code` when `signaled`;
-- after `InitFailed` at stage 6: 127 when `errno` is 2 (ENOENT: the entrypoint was not found), 126 when `errno` is 13 or 21 (EACCES, EISDIR: found but not invokable);
+- after `Exited`: `code`, or `128 + code` when `signaled` (a service's when `service` is set; `kiln run` then prints `service <name> exited with <code>, which ended the run`, or `was killed by SIG<name>`);
+- after `InitFailed` at stage 6: 127 when `errno` is 2 (ENOENT: the entrypoint, the main process's or a service's, was not found), 126 when `errno` is 13 or 21 (EACCES, EISDIR: found but not invokable);
 - after any other `InitFailed` (an unknown user or group, setgroups, ENOEXEC, ENOTDIR, any earlier stage), a protocol violation, a boot timeout, or a VM that ended without either message: 125;
 - when the user killed the VM (a second SIGINT, `Ctrl-]` `k`, or a stop request before `Hello`) before the guest's final message: 137, as `docker kill`. A kill after `Exited` or `InitFailed` keeps the code above.
 
