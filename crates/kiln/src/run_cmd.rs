@@ -183,6 +183,9 @@ pub fn run(open_store: impl FnOnce() -> Result<kiln_store::Store>, args: &RunArg
         eprintln!("kiln: {}", clean_line(&f.describe()));
     } else if o.exited.is_none() && !o.killed {
         eprintln!("kiln: {}", report.no_final_message());
+    } else if let Some(line) = o.exited.as_ref().and_then(|e| e.describe_service()) {
+        // describe_service() is sanitised already.
+        eprintln!("kiln: {}", clean_line(&line));
     }
     if !report.console_tail.is_empty() {
         eprintln!("kiln: the end of the guest's console:");
