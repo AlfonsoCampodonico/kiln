@@ -35,6 +35,10 @@ pub enum ImageError {
     NotAKilnImage(Digest),
     #[error("unsupported kiln image schema version {0}")]
     UnknownSchema(u32),
+    #[error(
+        "kiln image config has schema version {version} and {services} services (version 2 is for configs with services, 1 for those without)"
+    )]
+    SchemaMismatch { version: u32, services: usize },
     #[error("{0} is not a kiln image (use `kiln convert` for OCI images)")]
     NotKilnRemote(String),
     #[error("{0} is a kiln image, not an OCI image to convert (use `kiln pull` to fetch it)")]
@@ -53,6 +57,8 @@ pub enum ImageError {
     BadOption(String),
     #[error("fetching the pinned {what}: {source}")]
     Artifact { what: String, source: Box<ImageError> },
+    #[error("invalid dev.kiln.services label: {0}")]
+    Services(String),
 }
 
 pub type Result<T> = std::result::Result<T, ImageError>;

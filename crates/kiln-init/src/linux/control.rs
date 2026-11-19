@@ -4,6 +4,7 @@
 
 use std::sync::Mutex;
 use std::sync::mpsc::Sender;
+use std::time::Instant;
 
 use std::collections::BTreeSet;
 
@@ -15,9 +16,10 @@ use super::sys::Vsock;
 use super::{CONTROL, EXIT, Event, HOST_FAILED, send};
 use crate::error::{Context, Failure, Result};
 
-/// Returns the validated `Config` and the files volumes' first `FileUpdate`s; host
-/// messages after them go to `events`.
-pub fn connect(events: Sender<Event>) -> Result<(Config, Vec<FileUpdate>)> {
+/// Returns the validated `Config`, when it arrived (the services' readiness deadline
+/// counts from then), and the files volumes' first `FileUpdate`s; host messages after
+/// them go to `events`.
+pub fn connect(events: Sender<Event>) -> Result<(Config, Instant, Vec<FileUpdate>)> {
     let stream = Vsock::connect(HOST_CID, port::CONTROL).context("connect to the host on vsock port 1024")?;
     let mut reader = stream.try_clone().context("dup the control socket")?;
     CONTROL
@@ -36,6 +38,7 @@ pub fn connect(events: Sender<Event>) -> Result<(Config, Vec<FileUpdate>)> {
         Ok(None) => return Err(Failure::msg("the host closed the control connection before Config")),
         Err(e) => return Err(Failure::msg(format!("protocol violation: {e}"))),
     };
+    let config_at = Instant::now();
     EXIT.set(config.exit_method).expect("Config arrives once");
     let initial = first_files(&config, &mut reader)?;
     std::thread::Builder::new()
@@ -64,7 +67,7 @@ pub fn connect(events: Sender<Event>) -> Result<(Config, Vec<FileUpdate>)> {
             }
         })
         .context("spawn the control reader")?;
-    Ok((config, initial))
+    Ok((config, config_at, initial))
 }
 
 /// The host follows `Config` with each files volume's first generation, before any

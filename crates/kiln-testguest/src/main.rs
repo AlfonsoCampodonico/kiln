@@ -8,6 +8,9 @@
 //!   `stage-flood`, `exited-then-hang`, `second-stdout`, `no-read`, `hang-before-running`.
 //!
 //! The host must end the VM in every case.
+//!
+//! - `hostile listen-unix <path>`: listens on a Unix stream socket at `<path>`
+//!   and accepts connections forever (a service with `ready: unix:<path>`).
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "linux")]
@@ -19,6 +22,17 @@ fn main() {
         Exited, GuestMessage, HOST_CID, Hello, HostMessage, PROTOCOL_VERSION, Stage, port, read_message, write_message,
     };
 
+    let args: Vec<String> = std::env::args().collect();
+    if let [_, mode, path] = args.as_slice()
+        && mode == "listen-unix"
+    {
+        let listener = std::os::unix::net::UnixListener::bind(path).expect("bind the socket");
+        println!("listening on {path}");
+        for conn in listener.incoming() {
+            drop(conn);
+        }
+        return;
+    }
     let hello = GuestMessage::Hello(Hello {
         protocol: PROTOCOL_VERSION,
     });
@@ -45,10 +59,7 @@ fn main() {
         "stage-flood" => while send(GuestMessage::Stage(Stage { n: 3 })).is_ok() {},
         "exited-then-hang" => {
             boot(&mut send);
-            let _ = send(GuestMessage::Exited(Exited {
-                signaled: false,
-                code: 0,
-            }));
+            let _ = send(GuestMessage::Exited(Exited::main(false, 0)));
         }
         "second-stdout" => {
             boot(&mut send);

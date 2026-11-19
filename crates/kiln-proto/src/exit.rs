@@ -24,6 +24,18 @@ impl Exited {
     pub fn exit_code(&self) -> i32 {
         if self.signaled { 128 + self.code } else { self.code }
     }
+
+    /// When a service ended the run: one sanitised line for the user (T8),
+    /// `service <name> exited with <code>` or `... was killed by SIG<name>`.
+    pub fn describe_service(&self) -> Option<String> {
+        let name = clean_line(self.service.as_deref()?);
+        Some(if self.signaled {
+            let sig = crate::signal::name(self.code).map_or_else(|| self.code.to_string(), |n| format!("SIG{n}"));
+            format!("service {name} was killed by {sig}, which ended the run")
+        } else {
+            format!("service {name} exited with {}, which ended the run", self.code)
+        })
+    }
 }
 
 impl InitFailed {
@@ -55,21 +67,25 @@ mod tests {
 
     #[test]
     fn exit_codes_match_docker() {
+        assert_eq!(Exited::main(false, 3).exit_code(), 3);
+        assert_eq!(Exited::main(true, 9).exit_code(), 137);
+        let svc = Exited {
+            service: Some("php-fpm".into()),
+            ..Exited::main(false, 70)
+        };
+        assert_eq!(svc.exit_code(), 70);
         assert_eq!(
-            Exited {
-                signaled: false,
-                code: 3
-            }
-            .exit_code(),
-            3
+            svc.describe_service().unwrap(),
+            "service php-fpm exited with 70, which ended the run"
         );
+        assert_eq!(Exited::main(false, 0).describe_service(), None);
+        let killed = Exited {
+            service: Some("web".into()),
+            ..Exited::main(true, 9)
+        };
         assert_eq!(
-            Exited {
-                signaled: true,
-                code: 9
-            }
-            .exit_code(),
-            137
+            killed.describe_service().unwrap(),
+            "service web was killed by SIGKILL, which ended the run"
         );
         assert_eq!(InitFailed::new(6, Some(2), "").exit_code(), 127);
         assert_eq!(InitFailed::new(6, Some(13), "").exit_code(), 126);

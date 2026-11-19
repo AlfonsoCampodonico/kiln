@@ -4,7 +4,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use kiln_image::types::Process as ImageProcess;
+use kiln_image::types::{Process as ImageProcess, Service as ImageService};
 use kiln_proto::{
     Config, ExitMethod, HostMessage, Ipv6Network, MAX_FRAME, Network, Process, ProtoError, Scratch, WindowSize,
 };
@@ -42,20 +42,28 @@ pub struct Runtime {
     pub ipv6: bool,
 }
 
-/// Builds and checks the guest's `Config`.
-pub fn build(image: &ImageProcess, opts: &RunOptions, rt: &Runtime) -> Result<Config> {
-    let mut env = image.env.clone();
+/// Builds and checks the guest's `Config`. Run-time `--env` values are added to
+/// the main process's environment and to every service's.
+pub fn build(image: &ImageProcess, services: &[ImageService], opts: &RunOptions, rt: &Runtime) -> Result<Config> {
+    let mut overrides = Vec::new();
     for e in &opts.env {
         match e.split_once('=') {
-            Some(_) => env.push(e.clone()),
+            Some(_) => overrides.push(e.clone()),
             // As Docker: `--env KEY` passes kiln's value, and nothing when it is unset.
             None => {
                 if let Some((_, v)) = rt.host_env.iter().find(|(k, _)| k == e) {
-                    env.push(format!("{e}={v}"));
+                    overrides.push(format!("{e}={v}"));
                 }
             }
         }
     }
+    let mut env = image.env.clone();
+    env.extend(overrides.iter().cloned());
+    let services = services
+        .iter()
+        .map(|s| s.to_proto(&overrides))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::refused(format!("the image's services: {e}")))?;
     let cmd = if opts.cmd.is_empty() {
         image.cmd.clone()
     } else {
@@ -104,6 +112,10 @@ pub fn build(image: &ImageProcess, opts: &RunOptions, rt: &Runtime) -> Result<Co
         shutdown_grace_secs: opts.stop_timeout,
         volumes: Vec::new(),
         pod_disk: None,
+        // The session sets what remains of the boot timeout when it sends
+        // `Config`; the largest value is what the size check must allow for.
+        ready_timeout_ms: (!services.is_empty()).then_some(u32::MAX),
+        services,
     };
     check_size(&config)?;
     Ok(config)
@@ -118,10 +130,16 @@ pub fn check_size(config: &Config) -> Result<()> {
         Err(ProtoError::Oversize(n)) => {
             let argv: usize = config.process.argv().iter().map(|a| a.len()).sum();
             let env: usize = config.process.env.iter().map(String::len).sum();
+            let services = if config.services.is_empty() {
+                String::new()
+            } else {
+                let bytes = serde_json::to_vec(&config.services).map_or(0, |v| v.len());
+                format!(", and its {} services encode to {bytes} bytes", config.services.len())
+            };
             Err(Error::refused(format!(
                 "the run's configuration encodes to {n} bytes, over the control protocol's \
                  {MAX_FRAME}-byte frame: the command line has {argv} bytes and the environment {env} \
-                 bytes ({} variables); pass large values in a file instead",
+                 bytes ({} variables){services}; pass large values in a file instead",
                 config.process.env.len()
             )))
         }
@@ -203,7 +221,7 @@ mod tests {
     #[test]
     fn image_and_options_merge_as_docker_merges_them() {
         let mut o = RunOptions::new("img");
-        let c = build(&image(), &o, &rt()).unwrap();
+        let c = build(&image(), &[], &o, &rt()).unwrap();
         assert_eq!(c.process.argv(), ["/entry", "default"]);
         assert_eq!(c.stop_signal, 3);
         assert_eq!((c.tty, c.interactive, c.network.is_none()), (None, false, true));
@@ -213,7 +231,7 @@ mod tests {
         o.interactive = true;
         o.net = Some(Default::default());
         o.stop_timeout = 3;
-        let c = build(&image(), &o, &rt()).unwrap();
+        let c = build(&image(), &[], &o, &rt()).unwrap();
         assert_eq!(c.process.argv(), ["/entry", "other", "arg"]);
         assert_eq!(c.process.env, ["A=1", "A=2", "HOSTVAR=hv"]);
         assert_eq!(c.tty, Some(WindowSize { rows: 24, cols: 80 }));
@@ -234,7 +252,7 @@ mod tests {
             })
         );
         // A host without IPv6: the guest gets none either.
-        let no6 = build(&image(), &o, &Runtime { ipv6: false, ..rt() }).unwrap();
+        let no6 = build(&image(), &[], &o, &Runtime { ipv6: false, ..rt() }).unwrap();
         assert_eq!(no6.network.map(|n| n.ipv6), Some(None));
         assert_eq!(c.shutdown_grace_secs, 3);
     }
@@ -244,19 +262,24 @@ mod tests {
         let o = RunOptions::new("img");
         let mut p = image();
         p.stop_signal = Some("SIGRTMIN+3".into());
-        assert!(build(&p, &o, &rt()).unwrap_err().to_string().contains("real-time"));
+        assert!(build(&p, &[], &o, &rt()).unwrap_err().to_string().contains("real-time"));
         let empty = ImageProcess::default();
-        assert!(build(&empty, &o, &rt()).unwrap_err().to_string().contains("after --"));
+        assert!(
+            build(&empty, &[], &o, &rt())
+                .unwrap_err()
+                .to_string()
+                .contains("after --")
+        );
     }
 
     #[test]
     fn an_oversized_config_is_refused_before_boot_naming_the_environment() {
         let mut o = RunOptions::new("img");
         o.env = (0..20).map(|i| format!("CERT{i}={}", "x".repeat(4000))).collect();
-        let err = build(&image(), &o, &rt()).unwrap_err().to_string();
+        let err = build(&image(), &[], &o, &rt()).unwrap_err().to_string();
         assert!(err.contains("environment") && err.contains("21 variables"), "{err}");
         o.env.truncate(10);
-        build(&image(), &o, &rt()).unwrap();
+        build(&image(), &[], &o, &rt()).unwrap();
     }
 
     #[cfg(unix)]
@@ -274,7 +297,41 @@ mod tests {
         let mut o = RunOptions::new("img");
         o.env = vec!["GOOD".into(), "BADVALUE".into()];
         let r = Runtime { host_env: env, ..rt() };
-        assert_eq!(build(&image(), &o, &r).unwrap().process.env, ["A=1", "GOOD=yes"]);
+        assert_eq!(build(&image(), &[], &o, &r).unwrap().process.env, ["A=1", "GOOD=yes"]);
+    }
+
+    #[test]
+    fn services_get_the_run_time_environment_and_a_readiness_placeholder() {
+        let services = kiln_image::types::services_from_label(
+            r#"[{"name":"php-fpm","process":{"cmd":["php-fpm"],"env":["A=svc"]},"ready":"unix:/run/php-fpm.sock","stopSignal":"SIGQUIT"}]"#,
+        )
+        .unwrap();
+        let mut o = RunOptions::new("img");
+        o.env = vec!["APP_KEY=k".into(), "HOSTVAR".into()];
+        let c = build(&image(), &services, &o, &rt()).unwrap();
+        assert_eq!(c.services.len(), 1);
+        assert_eq!(c.services[0].process.env, ["A=svc", "APP_KEY=k", "HOSTVAR=hv"]);
+        assert_eq!(c.process.env, ["A=1", "APP_KEY=k", "HOSTVAR=hv"]);
+        assert_eq!(c.services[0].stop_signal, 3);
+        assert_eq!(c.ready_timeout_ms, Some(u32::MAX));
+        assert_eq!(c.required_version(), 2);
+        assert_eq!(build(&image(), &[], &o, &rt()).unwrap().ready_timeout_ms, None);
+    }
+
+    #[test]
+    fn oversized_services_are_named_in_the_refusal() {
+        let one = |i: usize| {
+            format!(
+                r#"{{"name":"s{i}","process":{{"cmd":["x"],"env":["BIG={}"]}}}}"#,
+                "x".repeat(5000)
+            )
+        };
+        let label = format!("[{}]", (0..14).map(one).collect::<Vec<_>>().join(","));
+        let services = kiln_image::types::services_from_label(&label).unwrap();
+        let err = build(&image(), &services, &RunOptions::new("img"), &rt())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("its 14 services encode to"), "{err}");
     }
 
     #[test]

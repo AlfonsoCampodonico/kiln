@@ -12,8 +12,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use kiln_proto::{
-    Config, EXIT_INFRA, ExitMethod, Exited, GuestMessage, Hello, HostMessage, InitFailed, Process, Scratch, Shutdown,
-    Stage, WindowSize, port, read_message, write_message,
+    Config, EXIT_INFRA, ExitMethod, Exited, GuestMessage, Hello, HostMessage, InitFailed, Process, Ready, Scratch,
+    Service, Shutdown, Stage, WindowSize, port, read_message, write_message,
 };
 use kiln_run::{EXIT_KILLED, Session, SessionOptions, Streams};
 use vmkit::{Capabilities, EndReason, SnapshotBundle, Vm, VmEnd};
@@ -35,6 +35,8 @@ fn config() -> Config {
         shutdown_grace_secs: 10,
         volumes: Vec::new(),
         pod_disk: None,
+        services: Vec::new(),
+        ready_timeout_ms: None,
     }
 }
 
@@ -216,7 +218,7 @@ fn boot(c: &mut UnixStream) {
 }
 
 fn exited(c: &mut UnixStream, code: i32) {
-    send(c, GuestMessage::Exited(Exited { signaled: false, code }));
+    send(c, GuestMessage::Exited(Exited::main(false, code)));
 }
 
 fn wait_killed(killed: &AtomicBool) {
@@ -254,6 +256,102 @@ fn a_normal_run_streams_output_and_reports_the_exit_code() {
         io.out.bytes().len()
     );
     assert_eq!(io.err.bytes(), b"done\n");
+}
+
+fn with_service() -> Config {
+    Config {
+        services: vec![Service {
+            name: "php-fpm".into(),
+            process: Process {
+                cmd: vec!["php-fpm".into()],
+                ..Process::default()
+            },
+            ready: Ready::Unix("/run/php-fpm.sock".into()),
+            stop_signal: 3,
+        }],
+        ready_timeout_ms: Some(10_000),
+        ..config()
+    }
+}
+
+/// Spec §9.8 rule 3: a version 1 guest never gets a `Config` with services; the
+/// run ends with 125 naming the version it needs.
+#[test]
+fn a_version_1_guest_is_refused_a_config_with_services() {
+    let got = Arc::new(Mutex::new(None));
+    let seen = got.clone();
+    let vm = fake(move |sock, killed| {
+        let mut c = connect(&sock, port::CONTROL);
+        send(&mut c, GuestMessage::Hello(Hello { protocol: 1 }));
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        *seen.lock().unwrap() = Some(read_message::<_, HostMessage>(&mut c).map_err(|e| e.to_string()));
+        wait_killed(&killed);
+    });
+    let (st, _) = streams(None);
+    let o = Session::start(vm, with_service(), st, opts())
+        .unwrap()
+        .finish_within(LIMIT);
+    assert_eq!(o.exit_code, EXIT_INFRA, "{o:?}");
+    let why = o.violation.unwrap();
+    assert!(
+        why.contains("need guest protocol version 2") && why.contains("speaks version 1"),
+        "{why}"
+    );
+    // The guest read EOF or an error, never a Config.
+    let got = got.lock().unwrap().take().unwrap();
+    assert!(!matches!(got, Ok(Some(HostMessage::Config(_)))), "{got:?}");
+}
+
+/// A version 2 guest gets the services and a readiness deadline within the boot
+/// timeout; a service that ends the run is reported with its status.
+#[test]
+fn a_version_2_guest_gets_services_and_reports_a_service_exit() {
+    let got = Arc::new(Mutex::new(None));
+    let seen = got.clone();
+    let vm = fake(move |sock, _| {
+        let mut c = connect(&sock, port::CONTROL);
+        send(&mut c, GuestMessage::Hello(Hello { protocol: 2 }));
+        let Ok(Some(HostMessage::Config(cfg))) = read_message::<_, HostMessage>(&mut c) else {
+            return;
+        };
+        *seen.lock().unwrap() = Some(*cfg);
+        boot(&mut c);
+        drop((connect(&sock, port::STDOUT), connect(&sock, port::STDERR)));
+        send(
+            &mut c,
+            GuestMessage::Exited(Exited {
+                service: Some("php-fpm".into()),
+                ..Exited::main(false, 70)
+            }),
+        );
+    });
+    let (st, _) = streams(None);
+    let o = Session::start(vm, with_service(), st, opts())
+        .unwrap()
+        .finish_within(LIMIT);
+    assert_eq!((o.violation.as_deref(), o.exit_code), (None, 70), "{o:?}");
+    assert_eq!(o.exited.unwrap().service.as_deref(), Some("php-fpm"));
+    let cfg = got.lock().unwrap().take().unwrap();
+    assert_eq!(cfg.services, with_service().services);
+    // The boot timeout is 10 s, less the 2 s margin, less what the boot took.
+    let ms = cfg.ready_timeout_ms.unwrap();
+    assert!((6_000..=8_000).contains(&ms), "{ms}");
+}
+
+/// A version 1 guest without services: the `Config` it gets is a version 1
+/// `Config` (no `services`, no `readyTimeoutMs`), byte for byte as before.
+#[test]
+fn a_version_1_guest_without_services_runs_as_before() {
+    let vm = fake(move |sock, _| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        boot(&mut c);
+        drop((connect(&sock, port::STDOUT), connect(&sock, port::STDERR)));
+        exited(&mut c, 0);
+    });
+    let (st, _) = streams(None);
+    let o = Session::start(vm, config(), st, opts()).unwrap().finish_within(LIMIT);
+    assert_eq!((o.violation.as_deref(), o.exit_code), (None, 0), "{o:?}");
 }
 
 /// `kiln run img | head -1`: a sink that fails is dropped, but the guest's output
@@ -467,13 +565,7 @@ fn a_stop_request_ends_at_the_guests_final_message() {
         assert!(matches!(shutdown, Some(HostMessage::Shutdown(_))), "{shutdown:?}");
         // The app ignores its stop signal; init kills it when the grace ends.
         std::thread::sleep(Duration::from_secs(1));
-        send(
-            &mut c,
-            GuestMessage::Exited(Exited {
-                signaled: true,
-                code: 9,
-            }),
-        );
+        send(&mut c, GuestMessage::Exited(Exited::main(true, 9)));
         wait_killed(&killed);
     });
     let (st, _) = streams(None);
@@ -492,6 +584,42 @@ fn a_stop_request_ends_at_the_guests_final_message() {
         out.warnings,
         ["the VM did not end within 3.0s of the guest's final message; it was killed"]
     );
+}
+
+/// A stop requested before `Running` is acted on once stage 6 is over (services
+/// ready), which can take until the boot deadline: the host's stop bound counts
+/// from the boot deadline, so a guest that reaches `Running` later than grace plus
+/// the end bound after the request is not killed, and its exit stands.
+#[test]
+fn a_stop_before_running_waits_for_the_boot_deadline() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let vm = fake(move |sock, _| {
+        let mut c = connect(&sock, port::CONTROL);
+        handshake(&mut c);
+        for n in 3..=6 {
+            send(&mut c, GuestMessage::Stage(Stage { n }));
+        }
+        tx.send(()).unwrap();
+        let shutdown = read_message::<_, HostMessage>(&mut c).unwrap();
+        assert!(matches!(shutdown, Some(HostMessage::Shutdown(_))), "{shutdown:?}");
+        // A slow service: stage 6 outlasts the grace and the end bound.
+        std::thread::sleep(Duration::from_millis(2500));
+        send(&mut c, GuestMessage::Running);
+        send(&mut c, GuestMessage::Stage(Stage { n: 7 }));
+        drop((connect(&sock, port::STDOUT), connect(&sock, port::STDERR)));
+        exited(&mut c, 0);
+    });
+    let (st, _) = streams(None);
+    let mut o = opts();
+    o.boot_timeout = Duration::from_secs(6);
+    (o.stop_timeout, o.end_timeout) = (1, Duration::from_millis(500));
+    let s = Session::start(vm, config(), st, o).unwrap();
+    rx.recv().unwrap();
+    s.handle().terminate();
+    let out = s.finish_within(LIMIT);
+    assert_eq!((out.exit_code, out.violation.as_deref()), (0, None), "{out:?}");
+    assert!(!out.killed && out.warnings.is_empty(), "{out:?}");
+    assert_eq!(out.end.reason, EndReason::Exited, "{out:?}");
 }
 
 #[test]
@@ -605,13 +733,7 @@ fn the_stop_bound_leaves_the_guest_its_sync_before_exited() {
         assert!(matches!(shutdown, Some(HostMessage::Shutdown(_))), "{shutdown:?}");
         // The grace (0 s) ends: init kills the app, then syncs for 6 s.
         std::thread::sleep(Duration::from_secs(6));
-        send(
-            &mut c,
-            GuestMessage::Exited(Exited {
-                signaled: true,
-                code: 9,
-            }),
-        );
+        send(&mut c, GuestMessage::Exited(Exited::main(true, 9)));
     });
     let (st, _) = streams(None);
     let mut o = opts();
@@ -734,12 +856,15 @@ fn bad_frames_are_violations() {
     }
     let vm = fake(|sock, killed| {
         let mut c = connect(&sock, port::CONTROL);
-        send(&mut c, GuestMessage::Hello(Hello { protocol: 2 }));
+        send(&mut c, GuestMessage::Hello(Hello { protocol: 3 }));
         wait_killed(&killed);
     });
     let (st, _) = streams(None);
     let o = Session::start(vm, config(), st, opts()).unwrap().finish_within(LIMIT);
-    assert_eq!(o.violation.as_deref(), Some("unsupported guest protocol 2"));
+    assert_eq!(
+        o.violation.as_deref(),
+        Some("unsupported guest protocol 3 (this kiln speaks 1 to 2)")
+    );
 }
 
 /// D-6: output still flowing when the VM ends reaches a slow sink in full: the
@@ -982,13 +1107,7 @@ fn an_escape_key_right_after_config_is_a_stop_request() {
             assert!(matches!(msg, Some(HostMessage::Shutdown(_))), "{msg:?}");
             boot(&mut c);
             drop(tty);
-            send(
-                &mut c,
-                GuestMessage::Exited(Exited {
-                    signaled: true,
-                    code: 15,
-                }),
-            );
+            send(&mut c, GuestMessage::Exited(Exited::main(true, 15)));
         });
         let mut cfg = config();
         cfg.tty = Some(WindowSize { rows: 24, cols: 80 });

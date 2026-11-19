@@ -6,7 +6,9 @@ use kiln_registry::Reference;
 use kiln_store::{Digest, Store};
 
 use crate::error::{ImageError, Result, json};
-use crate::types::{KILN_ARTIFACT, KILN_CONFIG, KilnConfig, SCHEMA_VERSION};
+use crate::types::{
+    KILN_ARTIFACT, KILN_CONFIG, KilnConfig, SCHEMA_VERSION, SCHEMA_VERSION_SERVICES, schema_version_for,
+};
 
 /// One platform's kiln manifest and config.
 #[derive(Debug, Clone)]
@@ -49,8 +51,16 @@ pub fn load_manifest(store: &Store, digest: &Digest) -> Result<KilnManifest> {
         return Err(ImageError::NotAKilnImage(digest.clone()));
     }
     let config: KilnConfig = json("kiln config", &store.read_metadata(&manifest.config.digest)?)?;
-    if config.schema_version != SCHEMA_VERSION {
+    if config.schema_version != SCHEMA_VERSION && config.schema_version != SCHEMA_VERSION_SERVICES {
         return Err(ImageError::UnknownSchema(config.schema_version));
+    }
+    // Version 2 exactly when there are services: a version 1 config listing
+    // services is one an older kiln would run without them.
+    if config.schema_version != schema_version_for(&config.services) {
+        return Err(ImageError::SchemaMismatch {
+            version: config.schema_version,
+            services: config.services.len(),
+        });
     }
     Ok(KilnManifest {
         digest: digest.clone(),

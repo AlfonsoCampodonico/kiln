@@ -66,7 +66,7 @@ fn boot() -> Result<()> {
     early()?;
     let (events, rx) = channel();
     enter(2)?;
-    let (config, files) = control::connect(events.clone())?;
+    let (config, config_at, files) = control::connect(events.clone())?;
     enter(3)?;
     let scratch = storage::mount_all(&config)?;
     let mut volumes = volumes::Volumes::prepare(&config, &files)?;
@@ -77,7 +77,7 @@ fn boot() -> Result<()> {
     enter(5)?;
     identity::configure(&config)?;
     enter(6)?;
-    let started = process::start(&config, events)?;
+    let started = process::start(&config, config_at, events)?;
     // A host that failed during this stage: its recorded reason, not a failed send.
     host_ok()?;
     send(&GuestMessage::Running)?;

@@ -78,6 +78,8 @@ pub struct Prepared {
     pub manifest: Digest,
     pub arch: String,
     pub process: Process,
+    /// Started before the main process (spec §9.8).
+    pub services: Vec<kiln_image::types::Service>,
     /// App layers, lowest first, and their blobs' paths.
     pub layers: Vec<Digest>,
     pub layer_paths: Vec<PathBuf>,
@@ -337,6 +339,7 @@ pub fn prepare(
         manifest: image.digest.clone(),
         arch: arch.to_string(),
         process: image.config.process.clone(),
+        services: image.config.services.clone(),
         layers,
         layer_paths,
         kernel,

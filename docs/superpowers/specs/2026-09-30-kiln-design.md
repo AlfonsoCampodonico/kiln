@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.14: 2026-10-22)
-**Status:** Draft rev 2.14, awaiting review
+**Date:** 2026-09-30 (rev 2.15: 2026-11-19)
+**Status:** Draft rev 2.15, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:**
 - `../../../../ROADMAP.md`: the three-repo roadmap (`vmkit`, `kiln`, `potter`).
@@ -111,6 +111,12 @@
   - IPv6 anti-spoofing;
   - neighbour discovery handled in the VM's namespace.
 
+- **rev 2.15 (2026-11-19):** M3d (services) is implemented on branch `m3d-services`; the spec records what its implementation settled (`docs/format.md` is normative):
+  - §9.8, versions: exec message types 10-16, vsock port 1029, `Config.volumes`, `Config.podDisk` and `network.search`/`options`/`ipv6` landed with the kiln-shim S1 work at protocol version 1. That breaks rule 1 (each milestone bumps once, in landing order); it is accepted as a pre-release exception, since no `kiln-init` has been released or pinned. Version 1 is frozen at the first `kiln-init` release and includes them. Services are version 2, and the host's version gate applies only to services.
+  - §9.8: the exec and file-update shapes are corrected to what is implemented (separate `ExecSignal` and `ExecWindowSize` messages, exec stdio on port 1029, `Config.volumes` with `FileUpdate{volume, files, commit}`).
+  - §9.8 and §12 (M4): `kiln-shim` does not support services in M3d and sends none, because image labels never reach the OCI runtime spec. Known gap; the M4 follow-up has the shim read the image config through containerd's image service and either pass the services or refuse.
+  - §16.5: `kiln rebase` re-derives `services` from the merged `dev.kiln.services` label and recomputes `schemaVersion`; a merged label that does not parse refuses the rebase.
+  - §12: M3d is done, in review on `m3d-services`.
 ---
 
 ## 1. Goals
@@ -723,7 +729,7 @@ Each stage reports `Stage { n }`. A failure reports `InitFailed` when the contro
    - Reap all children.
    - Handle `Shutdown`, `Signal` and `WindowSize`. SIGINT (from Ctrl-Alt-Del) is treated as `Shutdown`.
    - With services, the first of the processes to exit, or `Shutdown`, ends the run: the others are stopped in reverse start order (the main process first), each with its own stop signal, the grace period split evenly between those still to stop; one still running when its share ends gets SIGKILL and the next gets its stop signal. `Exited` carries the status of the process whose exit ended the run (naming it when it was a service), or after `Shutdown` the main process's. Signals the host forwards go to the main process. Once all of them have exited, the rest follows as below.
-   - When the main process exits: SIGKILL and reap every remaining process, drain stdout and stderr to EOF, `syncfs`, remount the scratch disk read-only on a best-effort basis (EBUSY ignored), send `Exited`, and exit via `exitMethod`. `Exited` therefore means the scratch disk is safe: a VM killed after it keeps every write (`--persist` relies on this); the host still never kills on `Exited` itself. Killing the rest before draining matches Docker (a container ends with its PID 1) and keeps a background process that holds stdout from blocking the drain forever.
+   - When every supervised process has exited: SIGKILL and reap every remaining process, drain stdout and stderr to EOF, `syncfs`, remount the scratch disk read-only on a best-effort basis (EBUSY ignored), send `Exited`, and exit via `exitMethod`. `Exited` therefore means the scratch disk is safe: a VM killed after it keeps every write (`--persist` relies on this); the host still never kills on `Exited` itself. Killing the rest before draining matches Docker (a container ends with its PID 1) and keeps a background process that holds stdout from blocking the drain forever.
    - Stop signals and forwarded signals are numbers 1–31; images whose `STOPSIGNAL` is a real-time signal are refused with an error.
 
 ### 9.7 `kiln run`
@@ -751,7 +757,7 @@ kiln run <ref> [--vmm firecracker|cloud-hypervisor] [--cpus N] [--memory MiB]
 
 kiln-proto is extended, never replaced. Every host that drives a kiln guest (`kiln run`, potter's VM executor, `kiln-shim`, later sagger) speaks kiln-proto to `kiln-init`. None of them adds a second protocol or a second PID 1.
 
-**Versioning** (ruling, rev 2.8; it keeps version 1's `Hello` handling in `docs/format.md`):
+**Versioning** (ruling, rev 2.8; it keeps version 1's `Hello` handling in `docs/format.md`). Version 1 was frozen at the first `kiln-init` release. It includes the kiln-shim S1 additions (exec message types 10-16, vsock port 1029, `Config.volumes`, `Config.podDisk`, `network.search`/`options`/`ipv6`), which landed before any release as a pre-release exception to rule 1 (rev 2.15). Services are version 2, and the host gates only services on the guest's version:
 1. Each milestone below that changes the protocol bumps the version once: 2, 3, … in the order they land. A version only adds things: message types (new type numbers), optional `Config` fields and new values. It never changes or removes what an earlier version defines.
 2. The guest's `Hello { protocol }` carries the highest version it implements. A host supports every version from 1 up to its own. A version higher than the host's still ends the VM (125), as in version 1.
 3. The host sends only messages, fields and values that the guest's version defines. If the run needs something the guest's version lacks (for example `services` or build mode), the host ends the VM instead of sending `Config` and reports 125 with an error naming the version required.
@@ -765,7 +771,7 @@ kiln-init is pinned to the kiln release that boots it (§8.1), and potter and `k
 |---|---|---|
 | `services` | M3d | potter spec §4, §6.1.1 |
 | Build mode | M3e | potter spec §9.3 |
-| Exec, `Stats`, `OomKill`, `FileUpdate` | M4 (shim S1) | shim spec §4.1, §4.2, §4.5 |
+| Exec, `FileUpdate` (version 1, implemented); `Stats`, `OomKill` (not yet) | M4 (shim S1) | shim spec §4.1, §4.2, §4.5 |
 
 **`services` (M3d):**
 - `Config.services: [Service{name, process, ready, stop_signal}]`, where `ready` is `unix:<path> | tcp:<port> | none`.
@@ -773,7 +779,7 @@ kiln-init is pinned to the kiln release that boots it (§8.1), and potter and `k
 - If any of them exits, the rest are stopped in reverse order with their `stop_signal`, within the shutdown grace period. The VM's exit status is that of the first process to exit.
 - Signals the host delivers go to the main process. Every service shares the main process's stdout and stderr.
 - Users: potter's PHP web images run php-fpm as a service (`ready = unix:/run/php/fpm.sock`) with nginx as the main process (potter spec §6.1.1); `kiln-shim` runs sidecars this way (shim spec §4.4).
-- Designed in M3d (rev 2.11, normative in `docs/format.md`): a service's `process` is the main process's without `stopSignal`, and an image declares services with its `dev.kiln.services` label (§5.1); readiness is bounded by `Config.readyTimeoutMs`, which the host derives from its boot timeout; `Exited.service` names a service whose exit ended the run; `kiln run` takes services from the image only, passes them its `--env` values and names a service that ended the run. Stopping splits the grace period between the processes still to stop (ruling 3), and a config with services has `schemaVersion` 2 (ruling 1).
+- Designed in M3d (rev 2.11, normative in `docs/format.md`): a service's `process` is the main process's without `stopSignal`, and an image declares services with its `dev.kiln.services` label (§5.1); readiness is bounded by `Config.readyTimeoutMs`, which the host derives from its boot timeout; `Exited.service` names a service whose exit ended the run; `kiln run` takes services from the image only, passes them its `--env` values and names a service that ended the run. `kiln-shim` passes no services in M3d (it cannot see the image's labels); the M4 follow-up has it read the image config through containerd's image service (the CRI `io.kubernetes.cri.image-name` annotation) and either pass the services or refuse the pod. Stopping splits the grace period between the processes still to stop (ruling 3), and a config with services has `schemaVersion` 2 (ruling 1).
 
 **Build mode (M3e):**
 - `Config.mode = Run | Build`. In build mode, `Config` carries the layer and mount table and limits.
@@ -789,17 +795,17 @@ kiln-init is pinned to the kiln release that boots it (§8.1), and potter and `k
 - Designed in M3e: the session order (§9.5's `Hello`-first rule stands; see the note below), the build-mode device order (output disk, cache-mount disks) against §9.1, how a step's stdout and stderr are carried, how a step's `Exited` is told apart from the main process's, and the size bound on `RunStep`.
 
 **Exec, guest stats and file updates (M4):**
-- **Exec:**
-  - Host → guest `ExecStart{exec_id, argv, env, cwd, user, tty, window}`. Guest → host `ExecStarted{exec_id, pid}`, then `ExecExited{exec_id, code|signal}`.
-  - Stdio, `Signal` and `WindowSize` gain a `proc` field, `main | exec:<id>`. The main process stays `main`, so its messages are unchanged on the wire.
+- **Exec** (implemented at version 1, `2026-10-30-kiln-shim-exec-volumes-design.md` §2):
+  - Host → guest `ExecStart{id, process, tty, stdin}` (type 10), `ExecSignal{id, sig}` (11) and `ExecWindowSize{id, rows, cols}` (12). Guest → host `ExecStarted{id}` (14), then `ExecExited{id, signaled, code}` (15), or `ExecFailed{id, errno?, message}` (16).
+  - Each exec stream is a guest-initiated connection to vsock port 1029 that starts with a header (the exec `id`, then the stream). The main process's `Signal`, `WindowSize` and stdio ports are unchanged.
   - At most 32 concurrent execs per VM (configurable), each with stdio bounded like the main process's.
   - Exec ids are host-chosen and validated. The guest can report only on ids the host created.
   - An exec runs in the guest's root with the image env merged with `env`. `user` follows kiln-init's id rules. Execs are killed when the main process exits.
 - **Stats:** guest → host `Stats{mem_total, mem_available, mem_rss_main, cpu_usage_ns, pressure{cpu,mem,io}}`, every 10 s by default and on request, read from `/proc/meminfo`, `/proc/stat` and PSI.
 - **OOM:** guest → host `OomKill{pid, proc, comm}` when the guest kernel OOM-kills a process. kiln-init watches `/proc/vmstat` `oom_kill` and the kernel log. Stats and OOM reports are used for reporting only (§3).
-- **Files:** projected volumes are delivered as files in `Config` at start. Updates arrive as `FileUpdate{path, content, mode}`, and kiln-init reproduces kubelet's atomic symlink swap. Their size is bounded.
+- **Files** (implemented at version 1): `Config.volumes` (at most 64) describes the volumes and `Config.podDisk` the per-pod disk. A volume's files, and later updates, arrive as `FileUpdate{volume, files, commit}` (type 13), and kiln-init reproduces kubelet's atomic symlink swap. Their size is bounded.
 - Designed in M4:
-  - how exec stdio is carried (version 1 relays stdio as raw vsock streams on ports 1025–1028, not as messages);
+  - how exec stdio is carried (raw vsock streams on port 1029, as the main process's on ports 1025–1028, not messages);
   - the stats request message;
   - the `Config` field for initial files, and its bound against the 64 KiB frame;
   - the `Config.network` additions the shim needs for the pod's IP, routes and DNS (shim spec §3.2);
@@ -902,10 +908,10 @@ One parametrised suite runs against both backends, using a test guest (the kerne
 | **M2: vmkit** | `vmkit` | `Vmm` trait (snapshot/restore shapes only), Firecracker and Cloud Hypervisor drivers, `sandbox`, `net` (tap, nftables, `pasta`), `Capabilities`, the kernel profiles pipeline, the contract suite, and the hostile-guest network tests (with the busybox guest). | Yes | Done |
 | **M3a: guest** | `kiln` | `kiln-proto` (protocol version 1), `kiln-init`, the ext4 template, the init layer (§6.5), the guest side of §9, the boot suite on both VMMs, and the control protocol in `docs/format.md`. | Yes | Done (PR #5) |
 | **M3b: run** (planned as **M3b-1**, the runtime and CLI, and **M3b-2**, pinned artifacts, `--persist`, `--net` and Lima) | `kiln` | `kiln run` (§9.7): the host runtime, its CLI flags, host signal handling and console tails; kernel and init layers in images with their pins and run-time verification (§6.5, §8.1); the Lima template (§10). | Yes | Planned (M3b-1: `docs/superpowers/plans/2026-10-06-m3b1-run.md`; M3b-2: `docs/superpowers/plans/2026-10-07-m3b2-artifacts-persist-net.md`) |
-| **M3d: services** | `kiln` | kiln-proto and `kiln-init` `services` (§9.8), as a protocol version bump. Needed by potter P2 (PHP web images). | Yes | Planned (`docs/superpowers/plans/2026-10-11-m3d-services.md`) |
+| **M3d: services** | `kiln` | kiln-proto and `kiln-init` `services` (§9.8), as a protocol version bump. Needed by potter P2 (PHP web images). | Yes | Done, in review on branch `m3d-services` (`docs/superpowers/plans/2026-10-11-m3d-services.md`) |
 | **M3c: build** | `kiln` | `kiln build` backend dispatch: potter, BuildKit, Podman or Buildah (§6). The end-to-end matrix (§11.4), the kernel and init swap tests (§11.5), the release pipeline and the docs (§15). | Yes | Planned |
 | **M3e: build mode** | `kiln` | kiln-proto `Config.mode = Build`, the build-mode messages and `kiln-init` build mode (§9.8), as a protocol version bump. Lands with potter P4 (the VM executor). | Yes | Planned |
-| **M4: `kiln-shim`** (slip) | `kiln` | The containerd shim, in the phases of the shim spec (§8 there): **S0** a KVM node-group spike, nested C8i against metal, with kiln's bench and end-to-end matrix (after M3b); **S1** kiln-proto exec, `Stats`, `OomKill` and `FileUpdate` (§9.8; after M3a); **S2** media type alignment with containerd 2.3's erofs snapshotter, plus a test (§5.1; after M1); **S3** `kiln-shim`: lifecycle, networking, logs, exec, stats, projected volumes (after S1, S2 and M3b); **S4** resize, verity, init containers (after S3; uses the vmkit hotplug capabilities in §4.1). The shim spec's S5, a platform canary, is a rollout step, not kiln work. | Yes | Planned |
+| **M4: `kiln-shim`** (slip) | `kiln` | The containerd shim, in the phases of the shim spec (§8 there): **S0** a KVM node-group spike, nested C8i against metal, with kiln's bench and end-to-end matrix (after M3b); **S1** kiln-proto exec, `Stats`, `OomKill` and `FileUpdate` (§9.8; after M3a); **S2** media type alignment with containerd 2.3's erofs snapshotter, plus a test (§5.1; after M1); **S3** `kiln-shim`: lifecycle, networking, logs, exec, stats, projected volumes (after S1, S2 and M3b); **S4** resize, verity, init containers (after S3; uses the vmkit hotplug capabilities in §4.1). The shim spec's S5, a platform canary, is a rollout step, not kiln work. **Follow-up to M3d:** `kiln-shim` passes no services, as it cannot see the image's `dev.kiln.services` label; it reads the image config through containerd's image service and either passes the services or refuses the pod (§9.8). | Yes | Planned |
 | **sagger** (agent sandbox) | `kiln`, `vmkit` | Snapshot, restore and fork of `kiln run` guests: `kiln-init` reconnects after restore, on `vmkit`'s snapshot and restore. | Yes | Needs a spec |
 | **sherd** and **raku** | `kiln` (sherd), `vmkit` (raku) | Snapshot artifacts in OCI registries with chunk dedup (sherd); lazy restore below the VMM (raku); `vmkit` snapshot and restore. | Yes | First cut done (`2026-10-21-lazy-restore-design.md`) |
 
@@ -1049,6 +1055,7 @@ Each gate is a pure function in `kiln-image` with its own unit tests. `rebase` r
   - **`source`:** unchanged. The app's provenance is still the source manifest.
   - **`env`:** a variable whose value in `IMAGE` equals `OLD`'s value was inherited, so it takes `NEW`'s value. A variable the app set itself, so that its value differs from `OLD`'s, is kept. Variables `NEW` adds are appended in `NEW`'s order.
   - **`labels`:** the same rule, keyed by name. An inherited label that `NEW` drops is dropped.
+  - **`services` and `schemaVersion`:** `services` is re-derived from the merged `dev.kiln.services` label (§5.1), and `schemaVersion` recomputed from it (2 with services, else 1), so the result is what a rebuild on the new base would give. A merged label that does not parse refuses the rebase.
   - Entrypoint, cmd, user, working directory and stop signal are kept from `IMAGE`. The `process` gate guarantees the base did not change them.
 - **Determinism:** rebase is deterministic. Rebasing the same inputs twice gives the same digest, and rebasing back onto `OLD` gives `IMAGE`'s layers again.
 

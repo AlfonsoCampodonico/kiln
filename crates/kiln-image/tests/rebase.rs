@@ -1096,3 +1096,79 @@ fn a_chained_base_matching_exactly_needs_no_inner_base() {
         .unwrap();
     assert_eq!(f.manifest("app:1").config.base.unwrap().layers, 3);
 }
+
+/// A rebase re-derives the services from the merged `dev.kiln.services` label (what a
+/// rebuild on the new base would give), and the config's schema version follows them.
+#[test]
+fn a_rebase_follows_the_merged_services_label() {
+    use kiln_image::types::LABEL_SERVICES;
+    let svc_a = r#"[{"name":"php-fpm","process":{"cmd":["php-fpm","-F"]},"ready":"unix:/run/php-fpm.sock"}]"#;
+    let svc_b = r#"[{"name":"php-fpm","process":{"cmd":["php-fpm","-F"]},"ready":"tcp:9000","stopSignal":"SIGQUIT"},{"name":"cron","process":{"cmd":["crond"]}}]"#;
+    let f = Fixture::new();
+    let b = Base::old().layers();
+    f.convert(
+        "b:1",
+        &b,
+        labelled(&[(LABEL_SERVICES, svc_a)]),
+        &ConvertOptions::default(),
+    );
+    f.convert(
+        "b:2",
+        &b,
+        labelled(&[(LABEL_SERVICES, svc_b)]),
+        &ConvertOptions::default(),
+    );
+    f.convert("b:3", &b, labelled(&[]), &ConvertOptions::default());
+    let mut tars = b.clone();
+    tars.push(app_code());
+    f.convert_for(
+        "app:1",
+        &[arm()],
+        &tars,
+        labelled(&[(LABEL_SERVICES, svc_a)]),
+        &f.on_base("b:1"),
+    )
+    .unwrap();
+    let m = f.manifest("app:1");
+    assert_eq!((m.config.schema_version, m.config.services.len()), (2, 1));
+
+    // The label the app inherited from the old base changes: the services follow it.
+    f.rebase("b:1", "b:2", "app:1", "app:2").unwrap();
+    let m = f.manifest("app:2");
+    assert_eq!(m.config.schema_version, 2);
+    let names: Vec<_> = m.config.services.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["php-fpm", "cron"]);
+    assert_eq!(m.config.services[0].ready, kiln_proto::Ready::Tcp(9000));
+    assert_eq!(m.config.labels.as_ref().unwrap()[LABEL_SERVICES], svc_b);
+
+    // The new base drops it: no services, and the version goes back to 1.
+    f.rebase("b:2", "b:3", "app:2", "app:3").unwrap();
+    let m = f.manifest("app:3");
+    assert_eq!((m.config.schema_version, m.config.services.len()), (1, 0));
+    assert!(!m.config.labels.as_ref().unwrap().contains_key(LABEL_SERVICES));
+}
+
+/// A base converted by a kiln before M3d may carry any string in `dev.kiln.services`:
+/// a rebase that merges such a label in fails with `Services` and writes no tag.
+#[test]
+fn a_rebase_refuses_an_unparseable_merged_services_label() {
+    use kiln_image::types::LABEL_SERVICES;
+    let f = Fixture::new();
+    f.base("base:1", &Base::old());
+    f.base("base:2", &Base::patched());
+    // As an older convert would have stored it: no validation of the label.
+    rewrite_config(&f, "base:2", |c| {
+        c.labels
+            .as_mut()
+            .unwrap()
+            .insert(LABEL_SERVICES.into(), "not json".into());
+    });
+    f.app("app:1", "base:1", &Base::old(), &[app_code()]).unwrap();
+    let err = f.rebase("base:1", "base:2", "app:1", "app:2").unwrap_err();
+    assert!(matches!(err, ImageError::Services(_)), "{err}");
+    assert!(
+        err.to_string().starts_with("invalid dev.kiln.services label: "),
+        "{err}"
+    );
+    assert!(resolve_name(&f.store, "app:2").is_err(), "no tag is written");
+}

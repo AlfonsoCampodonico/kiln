@@ -499,6 +499,7 @@ impl Run {
         let window = if opts.tty { super::tty::window_size() } else { None };
         let config = config::build(
             &prepared.process,
+            &prepared.services,
             opts,
             &Runtime {
                 hostname: config::hostname(&run_dir.id),

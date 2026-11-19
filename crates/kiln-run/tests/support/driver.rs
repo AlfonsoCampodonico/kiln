@@ -55,7 +55,7 @@ pub struct Outcome {
 
 impl Outcome {
     pub fn exited(&self) -> Option<Exited> {
-        self.run.exited
+        self.run.exited.clone()
     }
 
     pub fn init_failed(&self) -> Option<&InitFailed> {

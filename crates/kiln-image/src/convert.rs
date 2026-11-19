@@ -562,6 +562,11 @@ pub fn convert_image(
     }
     let platform = img.config.platform();
     check_platform(&platform)?;
+    // Before any layer work: a bad label fails the conversion at once.
+    let services = match img.config.config.as_ref().and_then(|c| c.label(LABEL_SERVICES)) {
+        Some(label) => services_from_label(label)?,
+        None => Vec::new(),
+    };
     let reports = convert_layers(store, img, 0..img.manifest.layers.len(), Vec::new(), opts, source)?;
     let (layers, squashed, base) = match &opts.base {
         None => {
@@ -617,7 +622,7 @@ pub fn convert_image(
         }
     }
     let config = KilnConfig {
-        schema_version: SCHEMA_VERSION,
+        schema_version: schema_version_for(&services),
         architecture: platform.architecture.clone(),
         process: Process::from_oci(img.config.config.as_ref()),
         kernel: kernel_pin.map(|p| KernelRef {
@@ -640,6 +645,7 @@ pub fn convert_image(
                 .unwrap_or_default(),
         ),
         base,
+        services,
     };
     let (manifest_digest, manifest_size) = commit_manifest(store, &config, boot_layers, &layers)?;
     Ok(Converted {

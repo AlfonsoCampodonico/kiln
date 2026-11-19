@@ -7,8 +7,8 @@ mod support;
 use std::time::Duration;
 
 use kiln_proto::{
-    EXIT_CANNOT_INVOKE, EXIT_INFRA, EXIT_NOT_FOUND, HostMessage, Ipv6Network, MAX_FRAME, Network, Shutdown, Signal,
-    WindowSize,
+    EXIT_CANNOT_INVOKE, EXIT_INFRA, EXIT_NOT_FOUND, HostMessage, Ipv6Network, MAX_FRAME, Network, Ready, Service,
+    Shutdown, Signal, WindowSize,
 };
 use support::driver::{Outcome, Reply};
 use support::{BOOT, Case, DEEP_LAYERS, END, STACK_LAYERS, fixtures};
@@ -657,6 +657,356 @@ fn the_boot_timeout_kills_a_stuck_guest(backend: Backend) {
     assert_eq!(o.exit_code(), EXIT_INFRA);
 }
 
+/// A service for `Config.services`: `sh -c <script>`.
+fn svc(name: &str, script: &str, ready: Ready, stop_signal: i32) -> Service {
+    Service {
+        name: name.into(),
+        process: kiln_proto::Process {
+            cmd: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            ..kiln_proto::Process::default()
+        },
+        ready,
+        stop_signal,
+    }
+}
+
+/// `config` with `services`; the session sets the real readiness deadline.
+fn with_services(mut config: kiln_proto::Config, services: Vec<Service>) -> kiln_proto::Config {
+    config.services = services;
+    config.ready_timeout_ms = Some(1);
+    config
+}
+
+/// The layers with the `hostile` program (its `listen-unix` mode is a socket service).
+fn hostile_layers() -> Option<&'static Vec<std::path::PathBuf>> {
+    let layers = fixtures().hostile.as_ref();
+    assert!(
+        layers.is_some() || !support::require(),
+        "KILN_REQUIRE_KVM_TESTS=1 but KILN_TEST_HOSTILE is unset"
+    );
+    layers
+}
+
+/// The lines of `out` starting with one of `marks`, in order, without what follows the mark.
+fn marks(out: &str, marks: &[&str]) -> Vec<String> {
+    out.lines()
+        .filter_map(|l| {
+            marks
+                .iter()
+                .find(|m| l.split(' ').next() == Some(**m))
+                .map(|m| m.to_string())
+        })
+        .collect()
+}
+
+/// The guest's uptime that a line starting with `mark` carries after it.
+fn uptime(out: &str, mark: &str) -> f64 {
+    out.lines()
+        .find_map(|l| l.strip_prefix(&format!("{mark} ")))
+        .and_then(|rest| rest.split(' ').next()?.parse().ok())
+        .unwrap_or_else(|| panic!("no {mark} line with an uptime in {out:?}"))
+}
+
+/// Prints `<mark> <uptime>`.
+const T: &str = r#"$(cut -d" " -f1 /proc/uptime)"#;
+
+/// Spec §9.8 `services`: each service starts in order and is ready (here a Unix
+/// socket, then a TCP port) before the next one, with its own user, environment
+/// and working directory; the main process starts last. When the main process
+/// exits, the services are stopped in reverse order, each with its stop signal,
+/// and the run's status is the main process's.
+fn services_start_in_order_and_stop_in_reverse(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let Some(layers) = hostile_layers() else { return };
+    let a = svc(
+        "a",
+        &format!(
+            "trap 'echo \"a-stop {T}\"; kill $L; exit 0' TERM; echo a-start; \
+             /bin/hostile listen-unix /tmp/a.sock & L=$!; wait"
+        ),
+        Ready::Unix("/tmp/a.sock".into()),
+        15,
+    );
+    let mut b = svc(
+        "b",
+        &format!(
+            "trap 'echo \"b-stop {T}\"; kill $L; exit 0' USR1; [ -S /tmp/a.sock ] && echo b-sees-a; \
+             echo \"b-id $(id -u) $FOO $(pwd)\"; nc -ll -p 9000 -e /bin/cat & L=$!; wait"
+        ),
+        Ready::Tcp(9000),
+        10,
+    );
+    b.process.user = Some("app".into());
+    b.process.env = vec!["FOO=bar".into()];
+    b.process.working_dir = Some("/srv".into());
+    let main = c.config(
+        layers,
+        &["/bin/sh", "-c", &format!("echo \"main-up {T}\"; sleep 0.3; exit 3")],
+    );
+    let o = c.run(layers, with_services(main, vec![a, b]));
+    ended_cleanly(&c, &o);
+    let out = o.stdout();
+    assert_eq!(
+        marks(&out, &["a-start", "b-sees-a", "b-id", "main-up", "b-stop", "a-stop"]),
+        ["a-start", "b-sees-a", "b-id", "main-up", "b-stop", "a-stop"],
+        "{out}\nconsole:\n{}",
+        c.tail()
+    );
+    assert!(out.contains("b-id 1000 bar /srv\n"), "{out}");
+    let (up, b_stop, a_stop) = (uptime(&out, "main-up"), uptime(&out, "b-stop"), uptime(&out, "a-stop"));
+    assert!(up <= b_stop && b_stop <= a_stop, "{out}");
+    assert_eq!(o.exit_code(), 3);
+    assert_eq!(o.exited().unwrap().service, None);
+}
+
+/// The first process to exit ends the run, even a service: the others are
+/// stopped in reverse start order (the main process first), and the service's
+/// status is the run's, named in `Exited`.
+fn a_service_exiting_first_ends_the_run(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let a = svc(
+        "a",
+        &format!("trap 'echo \"a-stop {T}\"; exit 0' TERM; sleep 1000 & wait"),
+        Ready::None,
+        15,
+    );
+    // b exits only once main has installed its TERM trap (a marker file, bounded wait).
+    let b = svc(
+        "b",
+        &format!(
+            "i=0; while [ ! -e /tmp/main-ready ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; \
+             echo \"b-exit {T}\"; exit 42"
+        ),
+        Ready::None,
+        15,
+    );
+    let main = sh(
+        &c,
+        &format!(
+            "trap 'echo \"main-stop {T}\"; exit 0' TERM; echo main-up; touch /tmp/main-ready; \
+             sleep 1000 & wait"
+        ),
+    );
+    let o = c.run(&fixtures().base, with_services(main, vec![a, b]));
+    ended_cleanly(&c, &o);
+    let out = o.stdout();
+    assert_eq!(
+        marks(&out, &["b-exit", "main-stop", "a-stop"]),
+        ["b-exit", "main-stop", "a-stop"],
+        "{out}\nconsole:\n{}",
+        c.tail()
+    );
+    assert!(uptime(&out, "main-stop") <= uptime(&out, "a-stop"), "{out}");
+    assert_eq!(o.exit_code(), 42);
+    assert_eq!(o.exited().unwrap().service.as_deref(), Some("b"));
+}
+
+/// potter's PHP web image (potter spec §6.1.1): php-fpm a service ready on its
+/// socket and stopped with SIGQUIT, nginx the main process. `Shutdown` stops
+/// everything in reverse order (nginx first), each with its own stop signal; a
+/// service that ignores its signal, stopped last, is killed when the grace ends;
+/// the status is the main process's.
+fn shutdown_stops_the_services_in_reverse_order(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let Some(layers) = hostile_layers() else { return };
+    let stubborn = svc("stubborn", "trap '' TERM; sleep 1000 & wait", Ready::None, 15);
+    let fpm = svc(
+        "php-fpm",
+        &format!(
+            "trap 'echo \"fpm-quit {T}\"; kill $L; exit 0' QUIT; \
+             /bin/hostile listen-unix /tmp/php-fpm.sock & L=$!; wait"
+        ),
+        Ready::Unix("/tmp/php-fpm.sock".into()),
+        3,
+    );
+    let nginx = c.config(
+        layers,
+        &[
+            "/bin/sh",
+            "-c",
+            &format!(
+                "trap 'echo \"nginx-stop {T}\"; exit 7' TERM; [ -S /tmp/php-fpm.sock ] && echo nginx-up; \
+                 sleep 1000 & wait"
+            ),
+        ],
+    );
+    let mut s = c.start(
+        layers,
+        with_services(nginx, vec![stubborn, fpm]),
+        Reply::Config,
+        Vec::new(),
+    );
+    assert!(s.wait_output("nginx-up", BOOT), "console:\n{}", c.tail());
+    let sent = std::time::Instant::now();
+    s.send(&HostMessage::Shutdown(Shutdown { grace_secs: 3 }))
+        .expect("send to the guest");
+    let o = s.finish(END);
+    ended_cleanly(&c, &o);
+    let out = o.stdout();
+    assert_eq!(
+        marks(&out, &["nginx-up", "nginx-stop", "fpm-quit"]),
+        ["nginx-up", "nginx-stop", "fpm-quit"],
+        "{out}\nconsole:\n{}",
+        c.tail()
+    );
+    assert!(uptime(&out, "nginx-stop") <= uptime(&out, "fpm-quit"), "{out}");
+    assert_eq!(o.exit_code(), 7);
+    assert_eq!(o.exited().unwrap().service, None);
+    // The stubborn service held the run until the grace ended.
+    assert!(sent.elapsed() >= Duration::from_secs(3), "{:?}", sent.elapsed());
+}
+
+/// The grace period is split between the processes still to stop: a main process
+/// that ignores its stop signal is killed when its share (half of it here) ends,
+/// and php-fpm still gets its SIGQUIT instead of SIGKILL when the grace ends.
+fn a_stuck_main_process_does_not_cost_a_service_its_stop_signal(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let Some(layers) = hostile_layers() else { return };
+    let fpm = svc(
+        "php-fpm",
+        &format!(
+            "trap 'echo \"fpm-quit {T}\"; sleep 1; echo fpm-drained; kill $L; exit 0' QUIT; \
+             /bin/hostile listen-unix /tmp/php-fpm.sock & L=$!; wait"
+        ),
+        Ready::Unix("/tmp/php-fpm.sock".into()),
+        3,
+    );
+    let nginx = c.config(
+        layers,
+        &[
+            "/bin/sh",
+            "-c",
+            "trap '' TERM; [ -S /tmp/php-fpm.sock ] && echo nginx-up; sleep 1000 & wait",
+        ],
+    );
+    let mut s = c.start(layers, with_services(nginx, vec![fpm]), Reply::Config, Vec::new());
+    assert!(s.wait_output("nginx-up", BOOT), "console:\n{}", c.tail());
+    let sent = std::time::Instant::now();
+    s.send(&HostMessage::Shutdown(Shutdown { grace_secs: 4 }))
+        .expect("send to the guest");
+    let o = s.finish(END);
+    ended_cleanly(&c, &o);
+    let out = o.stdout();
+    assert_eq!(
+        marks(&out, &["nginx-up", "fpm-quit", "fpm-drained"]),
+        ["nginx-up", "fpm-quit", "fpm-drained"],
+        "{out}\nconsole:\n{}",
+        c.tail()
+    );
+    // fpm's handler takes 1 s: it finishes only if fpm has a share of the grace
+    // of its own (a deadline shared with nginx would SIGKILL it mid-handler).
+    // nginx held its share (2 s) and was killed: the status is its SIGKILL.
+    assert!(sent.elapsed() >= Duration::from_secs(2), "{:?}", sent.elapsed());
+    assert_eq!(o.exit_code(), 128 + 9);
+    assert_eq!(o.exited().unwrap().service, None);
+}
+
+/// A service that never becomes ready, exits first, or cannot be executed stops
+/// the boot at stage 6 with `InitFailed` naming it; the main process never runs.
+fn a_service_that_is_not_ready_fails_the_boot(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let main = || sh(&c, "echo should-not-run");
+    // Long enough for a loaded host's slow boot to leave the readiness wait time.
+    let boot_timeout = Duration::from_secs(30);
+    let run = |config: kiln_proto::Config| {
+        let spec = c.spec(&fixtures().base, &config, None);
+        let vm = c.vmm.create(&spec).expect("create the VM");
+        let mut opts = c.options();
+        opts.boot_timeout = boot_timeout;
+        support::driver::Session::start(vm, config, Reply::Config, Vec::new(), opts).finish(END)
+    };
+    let never = svc("never", "sleep 1000", Ready::Tcp(9999), 15);
+    let o = run(with_services(main(), vec![never]));
+    ended_cleanly(&c, &o);
+    let f = o
+        .init_failed()
+        .unwrap_or_else(|| panic!("no InitFailed: {o:?}\n{}", c.tail()));
+    assert_eq!(f.stage, 6, "{f:?}");
+    assert!(f.message.contains("service never was not ready (tcp:9999)"), "{f:?}");
+    // The guest's own deadline ended the boot: `ended_cleanly` found no host
+    // violation (no boot timeout) and the guest sent its own `InitFailed`.
+    assert_eq!(o.exit_code(), EXIT_INFRA);
+    assert!(!o.running() && o.stdout.is_empty(), "{o:?}");
+
+    let dies = svc("dies", "exit 3", Ready::Unix("/run/x.sock".into()), 15);
+    let o = run(with_services(main(), vec![dies]));
+    ended_cleanly(&c, &o);
+    let f = o.init_failed().expect("InitFailed");
+    assert!(
+        f.message.contains("service dies exited with 3 before it was ready"),
+        "{f:?}"
+    );
+    assert_eq!(o.exit_code(), EXIT_INFRA);
+
+    let mut missing = svc("missing", "", Ready::None, 15);
+    missing.process.cmd = vec!["/nonexistent".into()];
+    let o = run(with_services(main(), vec![missing]));
+    ended_cleanly(&c, &o);
+    let f = o.init_failed().expect("InitFailed");
+    assert!(f.message.contains("service missing: exec /nonexistent"), "{f:?}");
+    assert_eq!(o.exit_code(), EXIT_NOT_FOUND);
+}
+
+/// With `-t` the main process gets the terminal; services write to it too, as
+/// neither its controlling terminal nor its input.
+fn services_in_tty_mode_write_to_the_terminal(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let side = svc(
+        "side",
+        "echo svc-line; [ -t 0 ] || echo svc-no-tty-input; sleep 1000",
+        Ready::None,
+        15,
+    );
+    let mut main = sh(&c, "sleep 0.5; echo main-line");
+    main.tty = Some(WindowSize { rows: 24, cols: 80 });
+    let o = c.run(&fixtures().base, with_services(main, vec![side]));
+    ended_cleanly(&c, &o);
+    let tty = o.tty();
+    assert!(
+        tty.contains("svc-line\r\n") && tty.contains("svc-no-tty-input\r\n") && tty.contains("main-line\r\n"),
+        "{tty:?}"
+    );
+    assert_eq!(o.exit_code(), 0);
+}
+
+/// Mixed installs (spec §9.8): a version 1 kiln-init still runs a run without
+/// services; a run with services is refused before `Config` (125, naming the
+/// version); and a version 1 kiln-init refuses a version 2 `Config` (strict decoding).
+fn a_version_1_guest_and_services(backend: Backend) {
+    let Some(mut c) = Case::new(backend) else { return };
+    let Some(v1) = fixtures().init_v1.clone() else {
+        eprintln!("skipped: KILN_TEST_INIT_V1 is unset");
+        return;
+    };
+    c.init = Some(v1);
+    let o = c.run(&fixtures().base, sh(&c, "echo old; exit 4"));
+    ended_cleanly(&c, &o);
+    assert_eq!((o.exit_code(), o.stdout()), (4, "old\n".into()));
+
+    let svc_config = with_services(sh(&c, "true"), vec![svc("s", "true", Ready::None, 15)]);
+    let o = c.run(&fixtures().base, svc_config.clone());
+    assert_eq!(o.exit_code(), EXIT_INFRA, "{o:?}");
+    let why = o.violation.as_deref().unwrap_or_default();
+    assert!(
+        why.contains("need guest protocol version 2") && why.contains("speaks version 1"),
+        "{why}"
+    );
+    assert!(!o.running() && o.init_failed().is_none(), "{o:?}");
+
+    let mut raw = Vec::new();
+    let mut sent = svc_config.clone();
+    sent.ready_timeout_ms = Some(10_000);
+    kiln_proto::write_message(&mut raw, &HostMessage::Config(Box::new(sent))).unwrap();
+    let o = c
+        .start(&fixtures().base, svc_config, Reply::Raw(raw), Vec::new())
+        .finish(END);
+    let f = o
+        .init_failed()
+        .unwrap_or_else(|| panic!("no InitFailed: {o:?}\n{}", c.tail()));
+    assert_eq!(f.stage, 2, "{f:?}");
+    assert!(f.message.contains("unknown field `services`"), "{f:?}");
+}
+
 macro_rules! boot_tests {
     ($($name:ident),* $(,)?) => {
         mod firecracker {
@@ -692,6 +1042,13 @@ boot_tests!(
     a_second_stdout_connection_is_a_violation,
     a_guest_not_reading_control_is_killed,
     the_boot_timeout_kills_a_stuck_guest,
+    services_start_in_order_and_stop_in_reverse,
+    a_service_exiting_first_ends_the_run,
+    shutdown_stops_the_services_in_reverse_order,
+    a_stuck_main_process_does_not_cost_a_service_its_stop_signal,
+    a_service_that_is_not_ready_fails_the_boot,
+    services_in_tty_mode_write_to_the_terminal,
+    a_version_1_guest_and_services,
 );
 
 /// The kernel prints on the same serial console as kiln-init, so its records can land inside

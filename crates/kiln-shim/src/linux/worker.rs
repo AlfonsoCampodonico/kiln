@@ -264,6 +264,9 @@ fn prepare(plan: &WorkerPlan) -> Result<Prepared, Fail> {
         pod_disk: plan.pod_disk.as_ref().map(|_| Scratch {
             size_bytes: plan.pod_disk_bytes,
         }),
+        // kiln-shim does not support services (recorded known gap): a pod's Config is version 1.
+        services: Vec::new(),
+        ready_timeout_ms: None,
     };
     ctx(config.validate(), "the guest's configuration")?;
     ctx(kiln_run::config::check_size(&config), "the guest's configuration")?;

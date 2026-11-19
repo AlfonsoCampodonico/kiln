@@ -109,6 +109,12 @@ pub struct ContainerConfig {
     pub labels: Option<BTreeMap<String, String>>,
 }
 
+impl ContainerConfig {
+    pub fn label(&self, key: &str) -> Option<&str> {
+        self.labels.as_ref()?.get(key).map(String::as_str)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootFs {
     #[serde(rename = "type")]
@@ -139,8 +145,16 @@ mod tests {
         let json = br#"{"architecture":"arm64","os":"linux","config":{"Env":["PATH=/bin"],"Cmd":["sh"],"WorkingDir":"/w","User":"1000:1000","StopSignal":"SIGQUIT","Labels":{"a":"b"}},"rootfs":{"type":"layers","diff_ids":[]},"history":[]}"#;
         let c: ImageConfig = serde_json::from_slice(json).unwrap();
         let cc = c.config.unwrap();
-        assert_eq!(cc.cmd.unwrap(), vec!["sh"]);
+        assert_eq!(cc.cmd.as_deref(), Some(&["sh".to_string()][..]));
         assert_eq!(cc.stop_signal.as_deref(), Some("SIGQUIT"));
         assert_eq!(cc.working_dir.as_deref(), Some("/w"));
+        assert_eq!(cc.label("a"), Some("b"));
+        assert_eq!(cc.label("c"), None);
+        // Serialised back under the OCI name; `null` labels read as none.
+        let s = String::from_utf8(canonical_json(&cc)).unwrap();
+        assert!(s.contains(r#""Labels":{"a":"b"}"#), "{s}");
+        let none: ContainerConfig = serde_json::from_str(r#"{"Labels":null}"#).unwrap();
+        assert_eq!(none.labels, None);
+        assert!(!String::from_utf8(canonical_json(&none)).unwrap().contains("Labels"));
     }
 }
