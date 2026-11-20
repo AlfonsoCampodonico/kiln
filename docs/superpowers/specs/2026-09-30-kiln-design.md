@@ -1,7 +1,7 @@
 # kiln — Design Spec
 
-**Date:** 2026-09-30 (rev 2.15: 2026-11-19)
-**Status:** Draft rev 2.15, awaiting review
+**Date:** 2026-09-30 (rev 2.16: 2026-11-20)
+**Status:** Draft rev 2.16, awaiting review
 **Scope:** `kiln` (OCI image / Dockerfile → bootable microVM image builder) and the v1 scope of `vmkit` (shared VMM crate)
 **Related:**
 - `../../../../ROADMAP.md`: the three-repo roadmap (`vmkit`, `kiln`, `potter`).
@@ -117,6 +117,15 @@
   - §9.8 and §12 (M4): `kiln-shim` does not support services in M3d and sends none, because image labels never reach the OCI runtime spec. Known gap; the M4 follow-up has the shim read the image config through containerd's image service and either pass the services or refuse.
   - §16.5: `kiln rebase` re-derives `services` from the merged `dev.kiln.services` label and recomputes `schemaVersion`; a merged label that does not parse refuses the rebase.
   - §12: M3d is done, in review on `m3d-services`.
+
+- **rev 2.16 (2026-11-20):** M3e (build mode) is planned (`docs/superpowers/plans/2026-11-20-m3e-build-mode.md`); the spec records what its prototype and rulings settled (`docs/format.md` is normative):
+  - §9.8: build mode is protocol version 3. Its message types are 17 to 20 (`RunStep`, `Finish`, `StepExited`, `StepSealed`), after version 1's exec and file types 10 to 16. `Hello` comes first and the host answers it with `Config { mode: build }` (the note on potter §9.3 is settled that way); the guest's `Running` is potter's `Ready`.
+  - §9.8 and §9.1: a build VM's disks are init, scratch, the output disk (`vdc`), the base layers, then `Config.disks` (erofs layers a step stacks, ext4 cache disks it mounts), all attached at boot. A step's stdout and stderr are fresh connections to ports 1026 and 1027 per step; its exit is `StepExited`, a message of its own. A `RunStep`, secrets included, is one 64 KiB frame.
+  - §9.8, isolation (ruling 1 and the security review): a step sees a minimal read-only `/dev` with no block devices, a read-only `/sys`, runs in its own mount namespace pivoted into the overlay, with Docker's default bounding set less `CAP_MKNOD`; the overlay, cache disks and tmpfs mounts are `nodev`. A root step cannot open the output disk or a layer disk.
+  - §9.8: at most 230 lower layers per build VM; the host refuses a step past it with its own error (ruling 2). `Config.sourceDateEpoch` clamps every sealed entry's mtime, copied-up directories included (ruling 3). Secrets are mode 0400, owned by the step's uid:gid (ruling 4). Seals keep `user.*` and `security.capability` attributes only.
+  - §9.3 and §9.8: per-step egress goes through vmkit's runtime `Vm::set_egress` (ruling 5).
+  - Accepted deviations (ruling 7): per-step stdio connections; a timed-out step kills the VM; directories copied up for mount points stay in the diff.
+  - kiln-shim never boots build mode, and a build VM has no services, volumes or pod disk.
 ---
 
 ## 1. Goals
@@ -792,7 +801,7 @@ kiln-init is pinned to the kiln release that boots it (§8.1), and potter and `k
   - appends the diff to the raw output disk at the next 4 KiB-aligned offset;
   - remounts with the sealed upper as the topmost lower and a fresh upper. Mounts use per-layer `lowerdir+` or mount(2), never one long `lowerdir` string.
 - The host trusts none of `StepSealed`'s values. potter reads the range itself, checks its bounds, hashes it, and ingests it through kiln's untrusted tar path (potter spec §9.3, P4).
-- Designed in M3e: the session order (§9.5's `Hello`-first rule stands; see the note below), the build-mode device order (output disk, cache-mount disks) against §9.1, how a step's stdout and stderr are carried, how a step's `Exited` is told apart from the main process's, and the size bound on `RunStep`.
+- Designed in M3e (rev 2.16, normative in `docs/format.md`): `Hello` first, then `Config { mode: build }`, `Running` as the guest's ready; message types 17 to 20; the disks (output disk `vdc`, base layers, then `Config.disks`, nothing hot-plugged); a step's stdout and stderr as fresh connections to ports 1026 and 1027; `StepExited` as the step's exit; one 64 KiB frame per `RunStep`, secrets inline; a minimal read-only `/dev`, a per-step mount namespace and a reduced bounding set (no `CAP_SYS_ADMIN`, `CAP_MKNOD`, `CAP_SYS_PTRACE`); at most 230 lowers; `Config.sourceDateEpoch`; per-step egress through vmkit's `Vm::set_egress`.
 
 **Exec, guest stats and file updates (M4):**
 - **Exec** (implemented at version 1, `2026-10-30-kiln-shim-exec-volumes-design.md` §2):
@@ -811,7 +820,7 @@ kiln-init is pinned to the kiln release that boots it (§8.1), and potter and `k
   - the `Config.network` additions the shim needs for the pod's IP, routes and DNS (shim spec §3.2);
   - the dm-verity root hashes the shim passes to kiln-init (shim spec §3.1, S4).
 
-**Note on potter spec §9.3:** it has the host send `Config{mode: Build}` and the guest reply with `Hello`, then `Ready`. Under §9.5 the guest's `Hello` always comes first and the host answers it with `Config`. M3e keeps that order unless the user decides otherwise.
+**Note on potter spec §9.3:** it has the host send `Config{mode: Build}` and the guest reply with `Hello`, then `Ready`. Under §9.5 the guest's `Hello` always comes first and the host answers it with `Config`. M3e keeps that order (rev 2.16); the guest's `Running` is potter's `Ready`.
 
 ---
 
@@ -910,7 +919,7 @@ One parametrised suite runs against both backends, using a test guest (the kerne
 | **M3b: run** (planned as **M3b-1**, the runtime and CLI, and **M3b-2**, pinned artifacts, `--persist`, `--net` and Lima) | `kiln` | `kiln run` (§9.7): the host runtime, its CLI flags, host signal handling and console tails; kernel and init layers in images with their pins and run-time verification (§6.5, §8.1); the Lima template (§10). | Yes | Planned (M3b-1: `docs/superpowers/plans/2026-10-06-m3b1-run.md`; M3b-2: `docs/superpowers/plans/2026-10-07-m3b2-artifacts-persist-net.md`) |
 | **M3d: services** | `kiln` | kiln-proto and `kiln-init` `services` (§9.8), as a protocol version bump. Needed by potter P2 (PHP web images). | Yes | Done, in review on branch `m3d-services` (`docs/superpowers/plans/2026-10-11-m3d-services.md`) |
 | **M3c: build** | `kiln` | `kiln build` backend dispatch: potter, BuildKit, Podman or Buildah (§6). The end-to-end matrix (§11.4), the kernel and init swap tests (§11.5), the release pipeline and the docs (§15). | Yes | Planned |
-| **M3e: build mode** | `kiln` | kiln-proto `Config.mode = Build`, the build-mode messages and `kiln-init` build mode (§9.8), as a protocol version bump. Lands with potter P4 (the VM executor). | Yes | Planned |
+| **M3e: build mode** | `kiln` | kiln-proto `Config.mode = Build`, the build-mode messages and `kiln-init` build mode (§9.8), as a protocol version bump. Lands with potter P4 (the VM executor). | Yes | Planned (rev 2.16) |
 | **M4: `kiln-shim`** (slip) | `kiln` | The containerd shim, in the phases of the shim spec (§8 there): **S0** a KVM node-group spike, nested C8i against metal, with kiln's bench and end-to-end matrix (after M3b); **S1** kiln-proto exec, `Stats`, `OomKill` and `FileUpdate` (§9.8; after M3a); **S2** media type alignment with containerd 2.3's erofs snapshotter, plus a test (§5.1; after M1); **S3** `kiln-shim`: lifecycle, networking, logs, exec, stats, projected volumes (after S1, S2 and M3b); **S4** resize, verity, init containers (after S3; uses the vmkit hotplug capabilities in §4.1). The shim spec's S5, a platform canary, is a rollout step, not kiln work. **Follow-up to M3d:** `kiln-shim` passes no services, as it cannot see the image's `dev.kiln.services` label; it reads the image config through containerd's image service and either passes the services or refuses the pod (§9.8). | Yes | Planned |
 | **sagger** (agent sandbox) | `kiln`, `vmkit` | Snapshot, restore and fork of `kiln run` guests: `kiln-init` reconnects after restore, on `vmkit`'s snapshot and restore. | Yes | Needs a spec |
 | **sherd** and **raku** | `kiln` (sherd), `vmkit` (raku) | Snapshot artifacts in OCI registries with chunk dedup (sherd); lazy restore below the VMM (raku); `vmkit` snapshot and restore. | Yes | First cut done (`2026-10-21-lazy-restore-design.md`) |
