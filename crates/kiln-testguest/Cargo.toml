@@ -11,5 +11,7 @@ name = "hostile"
 path = "src/main.rs"
 
 [dependencies]
+# Only the Linux build uses these (kiln-init for its vsock helper); cargo warns about unused dependencies elsewhere.
+[target.'cfg(target_os = "linux")'.dependencies]
 kiln-init = { path = "../kiln-init" }
 kiln-proto = { path = "../kiln-proto" }
