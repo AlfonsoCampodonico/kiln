@@ -229,6 +229,9 @@ impl RunStep {
             .chain(self.secrets.iter().map(|s| ("secret target", &s.target)));
         for (what, t) in targets_of {
             check_target(what, t).map_err(v)?;
+            if what == "secret target" && t.ends_with('/') {
+                return Err(v(format!("secret target {t:?} ends in '/': a secret is a file")));
+            }
             if !targets.insert(t.trim_end_matches('/')) {
                 return Err(v(format!("two mounts or secrets at {t:?}")));
             }
@@ -356,6 +359,18 @@ mod tests {
         let mut s = step();
         s.secrets[0].target = "/root/.cache/".into();
         assert!(s.validate().is_err(), "a trailing slash names the same target");
+    }
+
+    #[test]
+    fn a_secret_target_is_a_file_not_a_directory_path() {
+        let mut s = step();
+        s.secrets[0].target = "/run/secrets/npmrc/".into();
+        let why = s.validate().unwrap_err().to_string();
+        assert!(why.contains("ends in '/'"), "{why}");
+        // A mount may still end in a slash.
+        let mut s = step();
+        s.mounts[0].target = "/root/.cache/".into();
+        s.validate().unwrap();
     }
 
     pub(crate) fn step() -> RunStep {
