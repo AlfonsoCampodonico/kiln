@@ -457,10 +457,11 @@ fn a_seal_outside_the_disk_is_passed_through(backend: Backend) {
 /// Egress is per step in a VM with a network: off, on, off again, through
 /// vmkit's `Vm::set_egress` (needs pasta, nft and the internet: KILN_TEST_NET=1).
 /// Each step probes a new TCP connection to 1.1.1.1:80 (printing `nc`'s own exit
-/// status and the first bytes of the reply) and a DNS query to the guest's resolver
-/// (the gateway). Open steps must connect (the open probe is retried up to 3
+/// status and the first bytes of the reply) and two DNS queries (the guest's resolver, the gateway,
+/// and 1.1.1.1 directly). Open steps must connect (the open probe is retried up to 3
 /// times, as the internet may blink; the closed probes never are). Closed steps
-/// must neither connect nor resolve. Not checked: a connection an earlier step
+/// must neither connect nor resolve. (Whether an open step's DNS answers depends on the
+/// host's resolver and is only reported, not asserted.) Not checked: a connection an earlier step
 /// opened, since the guest kills every process when a step's command exits, so no
 /// straggler survives into the next step to be cut.
 fn egress_follows_each_step(backend: Backend) {
@@ -473,12 +474,13 @@ fn egress_follows_each_step(backend: Backend) {
     spec.network = true;
     let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
     let gateway = kiln_run::config::GATEWAY;
-    // No pipe, so `$?` is `nc`'s own exit status.
+    // `nc` ends the pipeline, so `$?` is its own exit status. DNS goes to the
+    // guest's resolver (the gateway) and straight to 1.1.1.1.
     let probe = format!(
-        "printf 'HEAD / HTTP/1.0\\r\\n\\r\\n' > /dev/shm/req; \
-         nc -w 5 1.1.1.1 80 < /dev/shm/req > /dev/shm/rep 2>/dev/null; rc=$?; \
+        "printf 'HEAD / HTTP/1.0\\r\\n\\r\\n' | nc -w 5 1.1.1.1 80 > /dev/shm/rep 2>/dev/null; rc=$?; \
          echo \"nc={{$rc}} head=[$(head -c 8 /dev/shm/rep)]\"; \
-         nslookup example.com {gateway} >/dev/null 2>&1; echo \"dns={{$?}}\""
+         nslookup example.com {gateway} >/dev/null 2>&1; echo \"dns={{$?}}\"; \
+         nslookup example.com 1.1.1.1 >/dev/null 2>&1; echo \"dnsx={{$?}}\""
     );
     let mut next_id = 1;
     // (label, network) in order; the open step may take up to 3 attempts.
@@ -497,10 +499,10 @@ fn egress_follows_each_step(backend: Backend) {
                     .map(|(v, _)| v.to_string())
                     .unwrap_or_default()
             };
-            let (nc, dns) = (field("nc"), field("dns"));
+            let (nc, dns, dnsx) = (field("nc"), field("dns"), field("dnsx"));
             let connected = nc == "0" && out.contains("head=[HTTP/1.");
             let context = format!(
-                "step {index} (attempt {attempt}/{attempts}, id {}), network expected {}: nc rc {nc:?}, dns rc {dns:?}, \
+                "step {index} (attempt {attempt}/{attempts}, id {}), network expected {}: nc rc {nc:?}, dns rc {dns:?}, dns to 1.1.1.1 rc {dnsx:?}, \
                  stdout {out:?}, stderr {err:?}",
                 next_id - 1,
                 if open { "open" } else { "closed" }
@@ -514,10 +516,12 @@ fn egress_follows_each_step(backend: Backend) {
             } else {
                 assert!(!connected, "egress did not close: {context}");
                 assert!(nc != "0" && !nc.is_empty(), "a closed step's nc must fail: {context}");
-                assert!(
-                    dns != "0" && !dns.is_empty(),
-                    "a closed step's DNS must fail: {context}"
-                );
+                for (what, rc) in [("DNS", &dns), ("DNS to 1.1.1.1", &dnsx)] {
+                    assert!(
+                        rc != "0" && !rc.is_empty(),
+                        "a closed step's {what} must fail: {context}"
+                    );
+                }
             }
         }
     }
