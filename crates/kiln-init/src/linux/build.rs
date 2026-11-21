@@ -31,7 +31,14 @@
 //! reach init's root through `/proc/1/root`), as its uid and gid, in its own
 //! session and process group, in its working directory (created as root when
 //! missing; that is part of the step's diff, as Docker's WORKDIR). So a step,
-//! root or not, cannot open the output disk or a layer disk (ruling 1).
+//! root or not, cannot open the output disk or a layer disk (ruling 1). Before
+//! `Running`, init also sets `/proc/sys/user/max_user_namespaces` to 0, so no step
+//! can create a user namespace (and get `CAP_SYS_ADMIN` inside it).
+//!
+//! A step that cannot be started (its mounts, its working directory, its ids or
+//! its command) ends with `StepExited` code 125, 126 or 127 and kiln-init's
+//! reason on its stderr stream; the VM goes on. Only a message that breaks the
+//! protocol, or a failure outside the step's own setup, ends the VM.
 //!
 //! When the step's process exits, every process but init is killed (stragglers,
 //! and anything that left the group), its output is drained, and `StepExited`
@@ -86,6 +93,7 @@ pub fn run(config: &Config, events: Sender<Event>, rx: &Receiver<Event>) -> Resu
     enter(5)?;
     identity::network(config)?;
     enter(6)?;
+    disable_user_namespaces()?;
     watch_signals(events)?;
     // One descriptor per directory level while sealing.
     if let Some(max) = rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum {
@@ -138,6 +146,18 @@ pub fn run(config: &Config, events: Sender<Event>, rx: &Receiver<Event>) -> Resu
     Ok(())
 }
 
+/// No process may create a user namespace from now on, so a step cannot get
+/// `CAP_SYS_ADMIN` inside one (to mount, or to reach what its bounding set and
+/// its read-only `/proc` keep from it). Docker's default seccomp profile blocks
+/// them too. A kernel with no user namespaces has no limit to set.
+fn disable_user_namespaces() -> Result<()> {
+    match std::fs::write("/proc/sys/user/max_user_namespaces", "0") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Failure::os("disable user namespaces", &e)),
+    }
+}
+
 struct Builder<'a> {
     config: &'a Config,
     /// The root's lower directories, bottom first: base layers, stacked layers
@@ -178,9 +198,10 @@ impl Builder<'_> {
             .context("mount the step's overlay")?;
 
         let mut mounts = Mounts::new()?;
-        let ran = self
-            .mount_all(step, &mut mounts)
-            .and_then(|()| run_command(self.config, step, rx));
+        // A mount that cannot be set up fails the step (125, the reason on its
+        // stderr), not the VM, as a working directory that cannot be made does.
+        let setup = self.mount_all(step, &mut mounts);
+        let ran = run_command(self.config, step, rx, setup);
         mounts.teardown();
         match rustix::mount::unmount(ROOT, UnmountFlags::empty()) {
             Ok(()) => {}
@@ -271,7 +292,7 @@ impl Builder<'_> {
         for mount in &step.mounts {
             let dev = device(mount.disk as usize);
             let fs = new_fs("ext4", Some(&dev), &[], &[], mount.read_only)?;
-            if !mount.read_only && self.grown.insert(mount.disk) {
+            if !mount.read_only && !self.grown.contains(&mount.disk) {
                 let root = rustix::fs::openat(
                     &fs,
                     c".",
@@ -280,6 +301,7 @@ impl Builder<'_> {
                 )
                 .context(format!("open the cache disk {dev}"))?;
                 storage::grow_to_device(&root, &dev)?;
+                self.grown.insert(mount.disk);
             }
             m.attach(fs, &mount.target, true)?;
         }
@@ -669,8 +691,10 @@ const STEP_CAPS: u64 = (1 << 0)
     | (1 << 31);
 
 /// Runs the command; returns its exit code (`None` when a signal killed it),
-/// once `StepExited` is sent.
-fn run_command(config: &Config, step: &RunStep, rx: &Receiver<Event>) -> Result<Option<i32>> {
+/// once `StepExited` is sent. When `setup` (the step's mounts) failed, nothing
+/// runs: the step ends with 125 and the reason on its stderr, like any other
+/// setup failure.
+fn run_command(config: &Config, step: &RunStep, rx: &Receiver<Event>, setup: Result<()>) -> Result<Option<i32>> {
     let id = Identity {
         uid: step.uid,
         gid: step.gid,
@@ -701,17 +725,19 @@ fn run_command(config: &Config, step: &RunStep, rx: &Receiver<Event>) -> Result<
     drop(out);
     let (hook_failed, report) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).context("pipe")?;
     step_hook(&mut cmd, &id, &step.workdir, report);
-    let spawned = cmd.spawn();
+    let spawned = match setup {
+        Ok(()) => cmd.spawn().map_err(|e| match failed_hook_step(&hook_failed) {
+            Some(step) => (125, format!("kiln-init: {step}: {e}\n")),
+            None => (
+                if e.raw_os_error() == Some(2) { 127 } else { 126 },
+                format!("kiln-init: exec {}: {e}\n", argv[0]),
+            ),
+        }),
+        Err(f) => Err((125, format!("kiln-init: set up the step's mounts: {f}\n"))),
+    };
     drop(cmd);
     let code = match spawned {
-        Err(e) => {
-            let (code, msg) = match failed_hook_step(&hook_failed) {
-                Some(step) => (125, format!("kiln-init: {step}: {e}\n")),
-                None => (
-                    if e.raw_os_error() == Some(2) { 127 } else { 126 },
-                    format!("kiln-init: exec {}: {e}\n", argv[0]),
-                ),
-            };
+        Err((code, msg)) => {
             let _ = err.write_all(msg.as_bytes());
             drop(err);
             for r in outputs {

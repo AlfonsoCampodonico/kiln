@@ -362,6 +362,61 @@ fn steps_cannot_reach_the_output_disk(backend: Backend) {
     vm.finish().expect("the guest ends the VM");
 }
 
+/// A step whose mounts cannot be set up (a secret whose parent is a regular
+/// file in the image) ends with 125 and the reason on its stderr; the VM goes on
+/// and the next step runs, on the state before the failed one.
+fn a_failed_mount_setup_fails_the_step_not_the_vm(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let spec = spec(&c, backend, vec![fixtures().base[0].clone()], 1);
+    let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
+    let mut bad = sh(1, "echo must-not-run > /ran; echo must-not-run");
+    bad.secrets = vec![("/bin/busybox/token".into(), Secret(SECRET.to_vec()))];
+    let (o, out, err) = run(&mut vm, bad);
+    assert_eq!(
+        o,
+        StepOutcome {
+            exit: Exit::Code(125),
+            sealed: None
+        },
+        "{out}\n{err}"
+    );
+    assert_eq!(out, "");
+    assert!(
+        err.contains("set up the step's mounts") && err.contains("/bin/busybox/token"),
+        "{err}"
+    );
+    assert!(!err.contains(&String::from_utf8_lossy(SECRET).to_string()), "{err}");
+    // The VM is still there, and the failed step left nothing behind.
+    let (o, out, err) = run(&mut vm, sh(2, "test ! -e /ran && echo ok"));
+    assert_eq!(o.exit, Exit::Code(0), "{out}\n{err}");
+    assert_eq!(out, "ok\n");
+    assert!(o.sealed.is_some());
+    vm.finish().expect("the guest ends the VM");
+}
+
+/// Before `Running` kiln-init sets `max_user_namespaces` to 0: a step cannot
+/// create a user namespace, and the steps after the attempt still run.
+fn a_step_cannot_create_user_namespaces(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let spec = spec(&c, backend, vec![fixtures().base[0].clone()], 1);
+    let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
+    let script = "cat /proc/sys/user/max_user_namespaces; unshare -U true 2>&1; echo rc=$?";
+    let (o, out, err) = run(&mut vm, sh(1, script));
+    assert_eq!(o.exit, Exit::Code(0), "{out}\n{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.first(), Some(&"0"), "{out}");
+    let rc = lines.last().and_then(|l| l.strip_prefix("rc=")).unwrap_or_default();
+    assert!(
+        !rc.is_empty() && rc != "0" && rc != "127",
+        "unshare -U must fail, not be missing: {out}"
+    );
+    assert!(out.contains("No space left on device"), "{out}");
+    let (o, out, err) = run(&mut vm, sh(2, "echo still-works"));
+    assert_eq!(o.exit, Exit::Code(0), "{out}\n{err}");
+    assert_eq!(out, "still-works\n");
+    vm.finish().expect("the guest ends the VM");
+}
+
 /// Ruling 3: with a `SOURCE_DATE_EPOCH` every entry's mtime is at most it, a
 /// parent directory copied up for a mount point included; without one the
 /// guest's times are kept.
@@ -548,6 +603,8 @@ macro_rules! boot_tests {
 boot_tests!(
     build_steps_seal_stack_and_convert,
     steps_cannot_reach_the_output_disk,
+    a_failed_mount_setup_fails_the_step_not_the_vm,
+    a_step_cannot_create_user_namespaces,
     source_date_epoch_clamps_the_diff,
     a_version_2_guest_is_refused_build_mode,
     a_step_past_its_timeout_is_killed,
