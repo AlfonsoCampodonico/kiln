@@ -99,6 +99,18 @@ pub struct BuildVm {
     run_dir: Option<RunDir>,
 }
 
+/// Whether the VMM ended the way a guest ending its own VM looks: the VMM
+/// exited with code 0 and no signal, or the guest reset and vmkit stopped it
+/// there. vmkit's `Exited` also covers a VMM that failed, hence the code check.
+fn ended_by_the_guest(end: &vmkit::VmEnd) -> bool {
+    match end.reason {
+        EndReason::Exited => end.code == Some(0) && end.signal.is_none(),
+        EndReason::ResetStopped => true,
+        // Killed, BackstopFailed, and any reason added later: not the guest's doing.
+        _ => false,
+    }
+}
+
 /// `t + d`, never panicking: a duration too large for `Instant` (a caller's
 /// `Duration::MAX` timeout) is clamped to a year from `t`, which is effectively
 /// never for a step or a boot. Every `Instant + Duration` in this file goes through it.
@@ -288,6 +300,9 @@ impl BuildVm {
     /// Runs `step`, streaming its output to `sink`. Returns within
     /// `step.timeout + STEP_GRACE + KILL_WAIT`. An error means the VM is gone (a
     /// protocol violation, the guest failed, the VMM ended): no more steps.
+    /// A [`Exit::TimedOut`] outcome is `Ok` but also ends the VM (kiln kills
+    /// it, as the guest's state after a killed step is not known): the next
+    /// `run_step` and `finish` return `Err`.
     pub fn run_step(&mut self, step: RunStep, sink: &mut dyn FnMut(Stream, &[u8])) -> Result<StepOutcome> {
         if let Some(why) = &self.dead {
             return Err(Error::refused(format!("the build VM has ended: {why}")));
@@ -359,7 +374,9 @@ impl BuildVm {
     }
 
     /// `Finish`: the guest syncs and ends the VM; killed after [`END_TIMEOUT`].
-    /// `Ok` only when the guest ended the VM cleanly. An error means the VM was
+    /// `Ok` only when the guest ended the VM cleanly (the VMM exited with code 0
+    /// and no signal, or the guest reset it). After a [`Exit::TimedOut`] step
+    /// the VM is already dead, so this is `Err`. An error means the VM was
     /// already gone, `Finish` never reached it, the VMM ended some other way
     /// than the guest ending it (killed, or its reset backstop failed), the
     /// guest reported `InitFailed` after `Finish`, or it did not end in time.
@@ -388,12 +405,13 @@ impl BuildVm {
                             f.describe()
                         )));
                     }
-                    return match end.reason {
-                        EndReason::Exited | EndReason::ResetStopped => Ok(()),
-                        reason => Err(Error::refused(format!(
-                            "the build VM ended after Finish, but not by the guest ending it ({reason:?}, code {:?}, signal {:?})",
-                            end.code, end.signal
-                        ))),
+                    return if ended_by_the_guest(&end) {
+                        Ok(())
+                    } else {
+                        Err(Error::refused(format!(
+                            "the build VM ended after Finish, but not by the guest ending it ({:?}, code {:?}, signal {:?})",
+                            end.reason, end.code, end.signal
+                        )))
                     };
                 }
                 Ok(None) if Instant::now() < deadline => {}
@@ -793,7 +811,23 @@ fn read_stream(mut from: UnixStream, which: Stream, tx: &SyncSender<Event>) {
 
 #[cfg(test)]
 mod tests {
+    use vmkit::VmEnd;
+
     use super::*;
+
+    #[test]
+    fn only_a_clean_end_counts_as_the_guest_ending_the_vm() {
+        let end = |reason, code, signal| VmEnd { reason, code, signal };
+        assert!(ended_by_the_guest(&end(EndReason::Exited, Some(0), None)));
+        assert!(ended_by_the_guest(&end(EndReason::ResetStopped, None, None)));
+        // vmkit's `Exited` also covers a VMM that failed on its own.
+        assert!(!ended_by_the_guest(&end(EndReason::Exited, Some(1), None)));
+        assert!(!ended_by_the_guest(&end(EndReason::Exited, None, None)));
+        assert!(!ended_by_the_guest(&end(EndReason::Exited, None, Some(11))));
+        assert!(!ended_by_the_guest(&end(EndReason::Exited, Some(0), Some(9))));
+        assert!(!ended_by_the_guest(&end(EndReason::Killed, None, Some(9))));
+        assert!(!ended_by_the_guest(&end(EndReason::BackstopFailed, None, Some(9))));
+    }
 
     #[test]
     fn huge_durations_do_not_overflow_an_instant() {
