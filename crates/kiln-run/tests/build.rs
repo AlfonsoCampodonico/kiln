@@ -300,13 +300,18 @@ fn steps_cannot_reach_the_output_disk(backend: Backend) {
                   mknod $at/vdc b ${d%:*} ${d#*:} 2>/dev/null || echo no-mknod-$at; \
                   head -c 1 $at/vdc >/dev/null 2>&1 || echo no-open-$at; rm -f $at/vdc 2>/dev/null; done; \
                   head -c 1 /proc/1/root/dev/vdc >/dev/null 2>&1 || echo no-proc-root; \
-                  echo x > /sys/block/vdc/uevent 2>/dev/null || echo no-sys";
+                  echo x > /sys/block/vdc/uevent 2>/dev/null || echo no-sys; \
+                  { echo core > /proc/sys/kernel/core_pattern; } 2>/dev/null || echo no-core-pattern; \
+                  { echo /sbin/modprobe > /proc/sys/kernel/modprobe; } 2>/dev/null || echo no-modprobe; \
+                  { echo h > /proc/sysrq-trigger; } 2>/dev/null || echo no-sysrq; \
+                  echo kcore-$(head -c 16 /proc/kcore 2>/dev/null | wc -c)";
     let (o, out, err) = run(&mut vm, sh(1, script));
     assert_eq!(o.exit, Exit::Code(0), "{out}\n{err}");
     assert_eq!(
         out,
         "fd full null ptmx pts random shm stderr stdin stdout tty urandom zero \n0\n\
-         no-vdc\nno-mount\nno-mknod-/dev\nno-open-/dev\nno-mknod-/tmp\nno-open-/tmp\nno-proc-root\nno-sys\n",
+         no-vdc\nno-mount\nno-mknod-/dev\nno-open-/dev\nno-mknod-/tmp\nno-open-/tmp\nno-proc-root\nno-sys\n\
+         no-core-pattern\nno-modprobe\nno-sysrq\nkcore-0\n",
         "{err}"
     );
     vm.finish().expect("the guest ends the VM");
