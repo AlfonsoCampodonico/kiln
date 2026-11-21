@@ -264,7 +264,7 @@ fn build_steps_seal_stack_and_convert(backend: Backend) {
     assert_eq!(p4, ["/home", "/home/app", "/home/app/w"], "{p4:?}");
 
     // kiln converts the base and the sealed diffs into an image that runs.
-    let image = support::convert_tars("built", vec![support::base_tar(), d1, d2]);
+    let image = support::convert_tars(&format!("built-{backend:?}"), vec![support::base_tar(), d1, d2]);
     let config = c.config(
         &image,
         &[
