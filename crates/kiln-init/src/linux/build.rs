@@ -7,7 +7,11 @@
 //!
 //! Init never pivots: it keeps its own root, and each step gets a fresh overlay at
 //! `/kiln/root` (the lowers so far, a new upper and work directory on scratch;
-//! `nodev`), with `/proc`, a read-only `/sys`, a minimal `/dev` (read-only, no block
+//! `nodev`), with `/proc` (a clone of init's, but `/proc/sys`, `/proc/sysrq-trigger`,
+//! `/proc/irq` and `/proc/bus` are bound read-only, so a root step without
+//! `CAP_SYS_ADMIN` cannot set `kernel.core_pattern` or `kernel.modprobe`, whose
+//! helpers the kernel runs as root in init's namespace; `/proc/kcore`, `keys`,
+//! `timer_list` and `sched_debug` are masked when present), a read-only `/sys`, a minimal `/dev` (read-only, no block
 //! devices: `null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx` and the
 //! `fd`/`stdin`/`stdout`/`stderr` links), `/dev/pts`, `/dev/shm`, its cache
 //! disks, the `/etc` files and its secrets mounted in it. Every mount point that had to be
@@ -238,6 +242,7 @@ impl Builder<'_> {
     /// The API filesystems, the `/etc` files, the cache disks and the secrets.
     fn mount_all(&mut self, step: &RunStep, m: &mut Mounts) -> Result<()> {
         m.attach(clone_tree("/proc")?, "/proc", true)?;
+        m.protect_proc()?;
         m.attach(new_fs("sysfs", None, &[], &[], true)?, "/sys", true)?;
         m.attach(minimal_dev()?, "/dev", true)?;
         m.attach(
@@ -330,6 +335,12 @@ impl Builder<'_> {
         Ok(())
     }
 }
+
+/// `/proc` paths a step may read but not write (runc's `readonlyPaths`).
+const PROC_READONLY: [&str; 4] = ["/proc/sys", "/proc/sysrq-trigger", "/proc/irq", "/proc/bus"];
+
+/// `/proc` paths a step sees empty (runc's `maskedPaths`, those procfs has).
+const PROC_MASKED: [&str; 4] = ["/proc/kcore", "/proc/keys", "/proc/timer_list", "/proc/sched_debug"];
 
 /// A detached copy of init's mount at `path`.
 fn clone_tree(path: &str) -> Result<OwnedFd> {
@@ -538,6 +549,60 @@ impl Mounts {
         .context(format!("mount on {path}"))?;
         self.attached.push(mnt);
         Ok(())
+    }
+
+    /// Hardens the step's `/proc` as runc does: `PROC_READONLY` paths are bound
+    /// onto themselves read-only (a uid-0 step without `CAP_SYS_ADMIN` could
+    /// otherwise write `kernel.core_pattern` or `kernel.modprobe`, which the
+    /// kernel runs as root in init's mount namespace, where the output disk is
+    /// visible), and `PROC_MASKED` paths are covered by `/dev/null` (files) or an
+    /// empty read-only tmpfs (directories). Paths the kernel lacks are skipped;
+    /// any other failure fails the step's setup. Every mount is torn down with
+    /// the step's others. This runs in init before the fork, so the pre-exec
+    /// hook stays allocation-free.
+    fn protect_proc(&mut self) -> Result<()> {
+        let flags = MountFlags::BIND | MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC;
+        for path in PROC_READONLY {
+            let Some(is_dir) = self.proc_kind(path)? else { continue };
+            let tree = rustix::mount::open_tree(
+                rustix::fs::CWD,
+                path,
+                OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC | OpenTreeFlags::AT_RECURSIVE,
+            )
+            .context(format!("bind {path}"))?;
+            self.attach(tree, path, is_dir)?;
+            let mnt = self
+                .attached
+                .last()
+                .map(|m| m.as_raw_fd())
+                .ok_or_else(|| Failure::msg("no mount"))?;
+            rustix::mount::mount_remount(format!("/proc/self/fd/{mnt}").as_str(), flags, "")
+                .context(format!("make {path} read-only"))?;
+        }
+        for path in PROC_MASKED {
+            let Some(is_dir) = self.proc_kind(path)? else { continue };
+            let cover = if is_dir {
+                new_fs("tmpfs", None, &[("mode", "0555"), ("size", "4k")], &[], true)?
+            } else {
+                clone_tree("/dev/null")?
+            };
+            self.attach(cover, path, is_dir)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `path` exists in the step's root, and if so whether it is a directory.
+    fn proc_kind(&self, path: &str) -> Result<Option<bool>> {
+        match self.resolve(path.trim_start_matches('/'), ResolveFlags::NO_SYMLINKS) {
+            Ok(fd) => {
+                let ty = rustix::fs::fstat(&fd)
+                    .map(|st| FileType::from_raw_mode(st.st_mode))
+                    .context(format!("stat {path}"))?;
+                Ok(Some(ty == FileType::Directory))
+            }
+            Err(Errno::NOENT) => Ok(None),
+            Err(e) => Err(e).context(format!("look up {path}")),
+        }
     }
 
     /// Detaches the mounts (last first), then removes the stubs (last first);
