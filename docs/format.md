@@ -480,7 +480,7 @@ The host kills the VM, and reports 125, on any violation: a message out of that 
 | `env` | list of `KEY=value` | As `process.env`; the guest adds `PATH`, `HOSTNAME` and `HOME` (`/root` for uid 0, else `/`) when unset. |
 | `workdir` | string | Absolute; created as root when missing (that is part of the step's diff), then entered. |
 | `uid`, `gid` | integers | Not 4294967295. The step runs as `uid:gid` with `gid` as its only group. |
-| `lowersAdded` | list of disk indexes, optional | `erofs` entries of `Config.disks`, each at most once per VM: stacked on the root before the step, bottom first. |
+| `lowersAdded` | list of disk indexes, optional | `erofs` entries of `Config.disks`, each at most once per VM: stacked on the root before the step, bottom first. They stay stacked for every later step, even if this step fails. |
 | `mounts` | list of `{"disk", "target", "readOnly"}`, optional | `ext4` entries of `Config.disks` mounted at `target` for the step (read-only if the disk is). At most 64. |
 | `secrets` | list of `{"target", "data"}`, optional | `data` is standard base64 (padded, strict). The file appears at `target`, mode 0400, owned by `uid:gid`, on a tmpfs: never in the upper or the output. At most 64. |
 | `egress` | boolean | Whether the step may reach the network. The host enforces it in the VM's network namespace; the guest does not act on it. |
@@ -518,7 +518,7 @@ Targets are absolute, not `/`, without `.`, `..` or empty (`//`) components (one
 - with `sourceDateEpoch`, every entry's mtime is clamped to it;
 - paths are relative, never absolute or with `..`; names are walked in byte order.
 
-The diff is written to the output disk at `offset`, the end of the previous diff (0 for the first), and padded with zeros to a multiple of 4096: `len` includes the padding, so `[offset, offset + len)` holds the tar, its two end blocks, then only zeros. `sha256` is that range's digest and `entries` its tar entries (PAX headers not counted). The disk is flushed before `StepSealed` is sent. The upper then becomes the topmost lower. After any other exit there is no seal: the upper is discarded, and the next step starts from the state before the failed one. A diff that does not fit the output disk is a failure (`InitFailed`).
+The diff is written to the output disk at `offset`, the end of the previous diff (0 for the first), and padded with zeros to a multiple of 4096: `len` includes the padding, so `[offset, offset + len)` holds the tar, its two end blocks, then only zeros. `sha256` is that range's digest and `entries` its tar entries (PAX headers not counted). The disk is flushed before `StepSealed` is sent. The upper then becomes the topmost lower. After any other exit there is no seal: the upper is discarded, and the next step starts from the state before the failed one, except that layers the failed step stacked through `lowersAdded` stay stacked (and so cannot be stacked again). A diff that does not fit the output disk is a failure (`InitFailed`).
 
 `StepSealed` is guest-asserted, but kiln checks what it can know. `BuildProtocol::new(output_size)` (which replaced `Default`) takes the output disk's size, and the host refuses, as a violation that kills the VM and names the check that failed, a `StepSealed` that:
 - has `id` other than the step's, or comes after a step that did not exit 0;
