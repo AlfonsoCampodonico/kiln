@@ -49,7 +49,8 @@ static HOST_FAILED: OnceLock<String> = OnceLock::new();
 static FINISHED: AtomicBool = AtomicBool::new(false);
 /// After the final message: how long init waits for the host to close its side of the
 /// control connection before it ends the VM anyway (an older host never closes it).
-const HOST_CLOSE_WAIT: Duration = Duration::from_secs(1);
+/// Well under the host's 10 s end bound, and long enough for a loaded host to close inside it.
+const HOST_CLOSE_WAIT: Duration = Duration::from_secs(2);
 
 /// What the supervisor waits for (spec §9.6 stage 7).
 #[derive(Debug)]
@@ -158,6 +159,8 @@ fn send_final(msg: &GuestMessage) -> Result<()> {
         Some(why) => Failure::msg(why.clone()),
         None => Failure::msg(format!("send to the host: {e}")),
     })?;
+    // `CONTROL` stays locked across the wait: an exec sender blocks for up to the bound, which
+    // is harmless, since `FINISHED` is set and it would send nothing anyway.
     await_host_close(&stream);
     Ok(())
 }
@@ -166,8 +169,9 @@ fn send_final(msg: &GuestMessage) -> Result<()> {
 /// [`HOST_CLOSE_WAIT`]. A write to the vsock only queues the bytes in the guest's kernel:
 /// the VMM moves them to the host's socket later, and a VM that ends first can take the
 /// final message with it (the host then sees the connection close without it). A host
-/// closes its side once it has read the final message, which also means it has every byte
-/// the guest sent before it, on every port: the guest's sends reach the device in order.
+/// closes its side once it has read the final message. That guarantees delivery of the
+/// final message on port 1024 only: output-stream bytes sent before it may still sit in the
+/// VMM's per-connection buffers when the VM ends, as they could before this wait.
 /// A host that never closes (an older one) costs the bound; a failed `poll` ends the wait.
 fn await_host_close(stream: &Vsock) {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
