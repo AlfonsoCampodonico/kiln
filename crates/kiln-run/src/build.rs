@@ -167,7 +167,10 @@ impl BuildSpec {
 
     /// The guest's `Config`.
     pub fn config(&self, exit_method: ExitMethod) -> Config {
-        let disks = self.layers[self.root..]
+        let disks = self
+            .layers
+            .get(self.root..)
+            .unwrap_or_default()
             .iter()
             .map(|_| BuildDisk {
                 kind: DiskKind::Erofs,
@@ -486,6 +489,12 @@ mod tests {
         };
         assert!(s.proto_step(&unknown, &BTreeSet::new(), 0).is_err());
         assert!(!format!("{:?}", step()).contains("s3cret"));
+        let past = BuildSpec { root: 99, ..spec() };
+        assert_eq!(
+            past.config(ExitMethod::Reboot).disks.len(),
+            1,
+            "root past the layers must not panic"
+        );
     }
 
     /// Ruling 2: a step past the lowers cap is its own error, before anything is
