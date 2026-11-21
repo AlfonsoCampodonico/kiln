@@ -456,8 +456,13 @@ fn a_seal_outside_the_disk_is_passed_through(backend: Backend) {
 
 /// Egress is per step in a VM with a network: off, on, off again, through
 /// vmkit's `Vm::set_egress` (needs pasta, nft and the internet: KILN_TEST_NET=1).
-/// Closed means no DNS either, and no packet of a connection an earlier step
-/// opened.
+/// Each step probes a new TCP connection to 1.1.1.1:80 (printing `nc`'s own exit
+/// status and the first bytes of the reply) and a DNS query to the guest's resolver
+/// (the gateway). Open steps must connect (the open probe is retried up to 3
+/// times, as the internet may blink; the closed probes never are). Closed steps
+/// must neither connect nor resolve. Not checked: a connection an earlier step
+/// opened, since the guest kills every process when a step's command exits, so no
+/// straggler survives into the next step to be cut.
 fn egress_follows_each_step(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     if std::env::var_os("KILN_TEST_NET").is_none_or(|v| v != "1") {
@@ -467,16 +472,56 @@ fn egress_follows_each_step(backend: Backend) {
     let mut spec = spec(&c, backend, vec![fixtures().base[0].clone()], 1);
     spec.network = true;
     let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
-    let probe = "printf 'HEAD / HTTP/1.0\\r\\n\\r\\n' | nc -w 5 1.1.1.1 80 | head -c 8; echo";
-    let mut got = Vec::new();
-    for (id, network) in [(1, false), (2, true), (3, false)] {
-        let mut s = sh(id, probe);
-        s.network = network;
-        let (o, out, err) = run(&mut vm, s);
-        assert_eq!(o.exit, Exit::Code(0), "{out}\n{err}");
-        got.push(out);
+    let gateway = kiln_run::config::GATEWAY;
+    // No pipe, so `$?` is `nc`'s own exit status.
+    let probe = format!(
+        "printf 'HEAD / HTTP/1.0\\r\\n\\r\\n' > /dev/shm/req; \
+         nc -w 5 1.1.1.1 80 < /dev/shm/req > /dev/shm/rep 2>/dev/null; rc=$?; \
+         echo \"nc={{$rc}} head=[$(head -c 8 /dev/shm/rep)]\"; \
+         nslookup example.com {gateway} >/dev/null 2>&1; echo \"dns={{$?}}\""
+    );
+    let mut next_id = 1;
+    // (label, network) in order; the open step may take up to 3 attempts.
+    let mut report = Vec::new();
+    for (index, open) in [(1, false), (2, true), (3, false)] {
+        let attempts = if open { 3 } else { 1 };
+        for attempt in 1..=attempts {
+            let mut s = sh(next_id, &probe);
+            next_id += 1;
+            s.network = open;
+            let (o, out, err) = run(&mut vm, s);
+            assert_eq!(o.exit, Exit::Code(0), "step {index}: {out}\n{err}");
+            let field = |k: &str| {
+                out.split_once(&format!("{k}={{"))
+                    .and_then(|(_, r)| r.split_once('}'))
+                    .map(|(v, _)| v.to_string())
+                    .unwrap_or_default()
+            };
+            let (nc, dns) = (field("nc"), field("dns"));
+            let connected = nc == "0" && out.contains("head=[HTTP/1.");
+            let context = format!(
+                "step {index} (attempt {attempt}/{attempts}, id {}), network expected {}: nc rc {nc:?}, dns rc {dns:?}, \
+                 stdout {out:?}, stderr {err:?}",
+                next_id - 1,
+                if open { "open" } else { "closed" }
+            );
+            report.push(context.clone());
+            if open {
+                if connected {
+                    break;
+                }
+                assert!(attempt < attempts, "egress did not open: {context}");
+            } else {
+                assert!(!connected, "egress did not close: {context}");
+                assert!(nc != "0" && !nc.is_empty(), "a closed step's nc must fail: {context}");
+                assert!(
+                    dns != "0" && !dns.is_empty(),
+                    "a closed step's DNS must fail: {context}"
+                );
+            }
+        }
     }
-    assert_eq!(got, ["\n", "HTTP/1.1\n", "\n"], "egress off, on, off");
+    eprintln!("{backend:?}: egress per step:\n{}", report.join("\n"));
 }
 
 macro_rules! boot_tests {
