@@ -180,6 +180,9 @@ fn xattrs(fd: &OwnedFd, path: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         value.truncate(len);
         out.push((name.to_vec(), value));
     }
+    // `flistxattr` order is the filesystem's: sort, so the diff's bytes (and
+    // potter's cache keys, which hash them) do not depend on it.
+    out.sort();
     Ok(out)
 }
 
@@ -297,4 +300,34 @@ fn walk_dir<W: Write>(w: &mut Walk<'_, W>, dir: &OwnedFd, path: &[u8]) -> Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xattrs_come_out_sorted_by_name() {
+        let path = std::env::temp_dir().join(format!("kiln-seal-xattr-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let fd: OwnedFd = std::fs::File::open(&path).unwrap().into();
+        let mut set = 0;
+        for name in ["user.c", "user.a", "user.b"] {
+            match rustix::fs::fsetxattr(&fd, name, name.as_bytes(), rustix::fs::XattrFlags::empty()) {
+                Ok(()) => set += 1,
+                Err(Errno::NOTSUP) => {
+                    eprintln!("skipped: no user xattrs on {}", path.display());
+                    std::fs::remove_file(&path).unwrap();
+                    return;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let got = xattrs(&fd, b"/f").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(set, 3);
+        let names: Vec<&[u8]> = got.iter().map(|(n, _)| n.as_slice()).collect();
+        assert_eq!(names, [&b"user.a"[..], b"user.b", b"user.c"]);
+        assert_eq!(got[0].1, b"user.a");
+    }
 }
