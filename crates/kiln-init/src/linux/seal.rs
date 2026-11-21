@@ -221,90 +221,293 @@ impl<W: Write> Walk<'_, W> {
     }
 }
 
+/// A directory being walked: its descriptor, its path and the names still to visit.
+struct Frame {
+    fd: OwnedFd,
+    path: Vec<u8>,
+    names: std::vec::IntoIter<Vec<u8>>,
+}
+
+impl Frame {
+    fn new(fd: OwnedFd, path: Vec<u8>) -> Result<Self> {
+        let names = names(&fd, &path)?.into_iter();
+        Ok(Frame { fd, path, names })
+    }
+}
+
+/// Walks `dir` (at `path` in the diff), parents before their entries and names in
+/// byte order. The directories still open are an explicit stack, so a deep tree
+/// costs heap, not the thread's stack (and one descriptor per level).
 fn walk_dir<W: Write>(w: &mut Walk<'_, W>, dir: &OwnedFd, path: &[u8]) -> Result<()> {
-    for name in names(dir, path)? {
-        let child = join(path, &name);
-        let st =
-            rustix::fs::statat(dir, name.as_slice(), AtFlags::SYMLINK_NOFOLLOW).map_err(|e| fail(&child, "stat", e))?;
-        let ty = FileType::from_raw_mode(st.st_mode);
-        let rdev = (rustix::fs::major(st.st_rdev), rustix::fs::minor(st.st_rdev));
-        if ty == FileType::CharacterDevice && rdev == (0, 0) {
-            w.tar
-                .entry(&Node::marker(whiteout(path, &name)), Some(&mut io::empty()))
-                .map_err(io_failure)?;
+    let root = dir
+        .try_clone()
+        .map_err(|e| fail(path, "duplicate the descriptor of", e))?;
+    let mut stack = vec![Frame::new(root, path.to_vec())?];
+    while let Some(top) = stack.last_mut() {
+        let Some(name) = top.names.next() else {
+            stack.pop();
             continue;
-        }
-        if ty != FileType::Directory && st.st_nlink > 1 {
-            let key = (st.st_dev, st.st_ino);
-            if let Some(first) = w.links.get(&key) {
-                let node = base(child, &st, Kind::HardLink(first.clone()), w.epoch);
-                w.tar.entry(&node, None).map_err(io_failure)?;
-                continue;
-            }
-            w.links.insert(key, child.clone());
-        }
-        match ty {
-            FileType::Directory => {
-                let fd = rustix::fs::openat(
-                    dir,
-                    name.as_slice(),
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(|e| fail(&child, "open", e))?;
-                let mut node = base(child.clone(), &st, Kind::Dir, w.epoch);
-                node.xattrs = xattrs(&fd, &child)?;
-                w.tar.entry(&node, None).map_err(io_failure)?;
-                if is_opaque(&fd) && w.in_lowers(&child) {
-                    w.tar
-                        .entry(&Node::marker(opaque(&child)), Some(&mut io::empty()))
-                        .map_err(io_failure)?;
-                }
-                walk_dir(w, &fd, &child)?;
-            }
-            FileType::RegularFile => {
-                let fd = rustix::fs::openat(
-                    dir,
-                    name.as_slice(),
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(|e| fail(&child, "open", e))?;
-                let mut node = base(child.clone(), &st, Kind::File(st.st_size as u64), w.epoch);
-                node.xattrs = xattrs(&fd, &child)?;
-                let mut file = File::from(fd);
-                w.tar.entry(&node, Some(&mut file)).map_err(io_failure)?;
-            }
-            FileType::Symlink => {
-                let target = rustix::fs::readlinkat(dir, name.as_slice(), Vec::new())
-                    .map_err(|e| fail(&child, "read the link", e))?;
-                let node = base(child, &st, Kind::Symlink(target.into_bytes()), w.epoch);
-                w.tar.entry(&node, None).map_err(io_failure)?;
-            }
-            FileType::CharacterDevice => {
-                w.tar
-                    .entry(&base(child, &st, Kind::Char(rdev.0, rdev.1), w.epoch), None)
-                    .map_err(io_failure)?;
-            }
-            FileType::BlockDevice => {
-                w.tar
-                    .entry(&base(child, &st, Kind::Block(rdev.0, rdev.1), w.epoch), None)
-                    .map_err(io_failure)?;
-            }
-            FileType::Fifo => w
-                .tar
-                .entry(&base(child, &st, Kind::Fifo, w.epoch), None)
-                .map_err(io_failure)?,
-            // A layer cannot hold a socket.
-            FileType::Socket | FileType::Unknown => {}
+        };
+        if let Some(child) = visit(w, &top.fd, &top.path, &name)? {
+            stack.push(child);
         }
     }
     Ok(())
 }
 
+/// Seals the entry `name` of `dir`; for a directory, the frame to walk next.
+fn visit<W: Write>(w: &mut Walk<'_, W>, dir: &OwnedFd, path: &[u8], name: &[u8]) -> Result<Option<Frame>> {
+    let child = join(path, name);
+    let st = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| fail(&child, "stat", e))?;
+    let ty = FileType::from_raw_mode(st.st_mode);
+    let rdev = (rustix::fs::major(st.st_rdev), rustix::fs::minor(st.st_rdev));
+    if ty == FileType::CharacterDevice && rdev == (0, 0) {
+        w.tar
+            .entry(&Node::marker(whiteout(path, name)), Some(&mut io::empty()))
+            .map_err(io_failure)?;
+        return Ok(None);
+    }
+    if ty != FileType::Directory && st.st_nlink > 1 {
+        let key = (st.st_dev, st.st_ino);
+        if let Some(first) = w.links.get(&key) {
+            let node = base(child, &st, Kind::HardLink(first.clone()), w.epoch);
+            w.tar.entry(&node, None).map_err(io_failure)?;
+            return Ok(None);
+        }
+        w.links.insert(key, child.clone());
+    }
+    match ty {
+        FileType::Directory => {
+            let fd = rustix::fs::openat(
+                dir,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| fail(&child, "open", e))?;
+            let mut node = base(child.clone(), &st, Kind::Dir, w.epoch);
+            node.xattrs = xattrs(&fd, &child)?;
+            w.tar.entry(&node, None).map_err(io_failure)?;
+            if is_opaque(&fd) && w.in_lowers(&child) {
+                w.tar
+                    .entry(&Node::marker(opaque(&child)), Some(&mut io::empty()))
+                    .map_err(io_failure)?;
+            }
+            return Frame::new(fd, child).map(Some);
+        }
+        FileType::RegularFile => {
+            let fd = rustix::fs::openat(
+                dir,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| fail(&child, "open", e))?;
+            let mut node = base(child.clone(), &st, Kind::File(st.st_size as u64), w.epoch);
+            node.xattrs = xattrs(&fd, &child)?;
+            let mut file = File::from(fd);
+            w.tar.entry(&node, Some(&mut file)).map_err(io_failure)?;
+        }
+        FileType::Symlink => {
+            let target = rustix::fs::readlinkat(dir, name, Vec::new()).map_err(|e| fail(&child, "read the link", e))?;
+            let node = base(child, &st, Kind::Symlink(target.into_bytes()), w.epoch);
+            w.tar.entry(&node, None).map_err(io_failure)?;
+        }
+        FileType::CharacterDevice => {
+            w.tar
+                .entry(&base(child, &st, Kind::Char(rdev.0, rdev.1), w.epoch), None)
+                .map_err(io_failure)?;
+        }
+        FileType::BlockDevice => {
+            w.tar
+                .entry(&base(child, &st, Kind::Block(rdev.0, rdev.1), w.epoch), None)
+                .map_err(io_failure)?;
+        }
+        FileType::Fifo => w
+            .tar
+            .entry(&base(child, &st, Kind::Fifo, w.epoch), None)
+            .map_err(io_failure)?,
+        // A layer cannot hold a socket.
+        FileType::Socket | FileType::Unknown => {}
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+
+    fn open_dir(path: &Path) -> OwnedFd {
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap()
+    }
+
+    /// The tar `walk_dir` makes of the directory `root` (no lowers, no epoch).
+    fn walk_tar(root: &Path) -> Vec<u8> {
+        let fd = open_dir(root);
+        let mut tar = TarWriter::new(Vec::new());
+        let mut links = HashMap::new();
+        {
+            let mut w = Walk {
+                tar: &mut tar,
+                links: &mut links,
+                lowers: &[],
+                epoch: None,
+            };
+            walk_dir(&mut w, &fd, &[]).unwrap();
+        }
+        tar.finish(512).unwrap().0
+    }
+
+    /// Each entry's type flag, path and link target (PAX `path` and `linkpath`
+    /// apply to the next entry; PAX headers are not entries).
+    fn entries(tar: &[u8]) -> Vec<(u8, String, String)> {
+        let text =
+            |b: &[u8]| String::from_utf8_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]).into_owned();
+        let mut out = Vec::new();
+        let (mut at, mut path, mut link) = (0, None, None);
+        while at + 512 <= tar.len() && tar[at..at + 512].iter().any(|&b| b != 0) {
+            let h = &tar[at..at + 512];
+            let size = usize::from_str_radix(text(&h[124..136]).trim(), 8).unwrap();
+            if h[156] == b'x' {
+                for rec in String::from_utf8_lossy(&tar[at + 512..at + 512 + size]).lines() {
+                    let kv = rec.split_once(' ').unwrap().1;
+                    match kv.split_once('=') {
+                        Some(("path", v)) => path = Some(v.to_string()),
+                        Some(("linkpath", v)) => link = Some(v.to_string()),
+                        _ => {}
+                    }
+                }
+            } else {
+                out.push((
+                    h[156],
+                    path.take().unwrap_or_else(|| text(&h[..100])),
+                    link.take().unwrap_or_else(|| text(&h[157..257])),
+                ));
+            }
+            at += 512 + size.div_ceil(512) * 512;
+        }
+        out
+    }
+
+    fn paths(tar: &[u8]) -> Vec<String> {
+        entries(tar).into_iter().map(|(_, p, _)| p).collect()
+    }
+
+    #[test]
+    fn names_are_walked_in_byte_order_parents_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Created in an order that is not the sorted one.
+        for f in ["b", "\u{e9}", "a.b", "B", "a/z", "a/y", "c/d/e"] {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, f).unwrap();
+        }
+        let want = ["B", "a/", "a/y", "a/z", "a.b", "b", "c/", "c/d/", "c/d/e", "\u{e9}"];
+        assert_eq!(paths(&walk_tar(root)), want);
+        // The same tree again gives the same bytes.
+        assert_eq!(walk_tar(root), walk_tar(root));
+    }
+
+    #[test]
+    fn hard_links_share_the_first_path_in_walk_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::write(root.join("x1"), "data").unwrap();
+        std::fs::hard_link(root.join("x1"), root.join("d/x3")).unwrap();
+        std::fs::hard_link(root.join("x1"), root.join("x2")).unwrap();
+        std::fs::write(root.join("alone"), "z").unwrap();
+        let tar = walk_tar(root);
+        assert_eq!(
+            entries(&tar),
+            [
+                (b'0', "alone".into(), String::new()),
+                (b'5', "d/".into(), String::new()),
+                // `d/x3` sorts first: the file is stored there, the others link to it.
+                (b'0', "d/x3".into(), String::new()),
+                (b'1', "x1".into(), "d/x3".into()),
+                (b'1', "x2".into(), "d/x3".into()),
+            ]
+        );
+        // The data is in the archive once.
+        assert_eq!(tar.windows(4).filter(|w| *w == b"data").count(), 1);
+    }
+
+    #[test]
+    fn sockets_are_skipped_and_fifos_and_symlinks_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let _listener = std::os::unix::net::UnixListener::bind(root.join("sock")).unwrap();
+        let fd = open_dir(root);
+        rustix::fs::mknodat(&fd, "fifo", FileType::Fifo, Mode::from_raw_mode(0o644), 0).unwrap();
+        symlink("target/../x", root.join("ln")).unwrap();
+        std::fs::write(root.join("f"), "").unwrap();
+        assert_eq!(
+            entries(&walk_tar(root)),
+            [
+                (b'0', "f".into(), String::new()),
+                (b'6', "fifo".into(), String::new()),
+                (b'2', "ln".into(), "target/../x".into()),
+            ]
+        );
+    }
+
+    /// The walk keeps no recursion on the thread's stack: a tree far deeper than
+    /// a small stack could recurse through is sealed, with every level in order.
+    #[test]
+    fn a_deep_tree_does_not_use_the_stack() {
+        const DEPTH: usize = 1500;
+        if let Some(max) = rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum {
+            // One descriptor per level, as in `build::run`.
+            let _ = rustix::process::setrlimit(
+                rustix::process::Resource::Nofile,
+                rustix::process::Rlimit {
+                    current: Some(max),
+                    maximum: Some(max),
+                },
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut cur = open_dir(dir.path());
+        for _ in 0..DEPTH {
+            rustix::fs::mkdirat(&cur, "d", Mode::from_raw_mode(0o755)).unwrap();
+            cur = rustix::fs::openat(
+                &cur,
+                "d",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap();
+        }
+        rustix::fs::openat(
+            &cur,
+            "leaf",
+            OFlags::WRONLY | OFlags::CREATE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+        .unwrap();
+        drop(cur);
+        let root = dir.path().to_path_buf();
+        let tar = std::thread::Builder::new()
+            .stack_size(192 * 1024)
+            .spawn(move || walk_tar(&root))
+            .unwrap()
+            .join()
+            .unwrap();
+        let got = paths(&tar);
+        assert_eq!(got.len(), DEPTH + 1);
+        let deepest = format!("{}leaf", "d/".repeat(DEPTH));
+        assert_eq!(got.last(), Some(&deepest));
+        assert_eq!(got[DEPTH - 1], "d/".repeat(DEPTH));
+    }
 
     #[test]
     fn xattrs_come_out_sorted_by_name() {
