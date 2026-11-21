@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn versions_one_and_two_are_accepted_and_the_config_needs_its_own() {
-        for v in [1, 2] {
+        for v in [1, 2, 3] {
             let mut p = Protocol::default();
             assert_eq!(
                 p.accept(&GuestMessage::Hello(Hello { protocol: v })),
@@ -293,6 +293,18 @@ mod tests {
         assert_eq!(version_refusal(2, &config(&["php-fpm"])), None);
         let why = version_refusal(1, &config(&["php-fpm"])).unwrap();
         assert!(why.contains("version 2") && why.contains("speaks version 1"), "{why}");
+        let build = Config {
+            process: Process::default(),
+            mode: kiln_proto::Mode::Build,
+            ..config(&[])
+        };
+        build.validate().unwrap();
+        let why = version_refusal(2, &build).unwrap();
+        assert!(
+            why.contains("build mode needs guest protocol version 3") && why.contains("speaks version 2"),
+            "{why}"
+        );
+        assert_eq!(version_refusal(3, &build), None);
     }
 
     #[test]
