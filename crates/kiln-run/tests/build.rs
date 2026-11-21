@@ -293,27 +293,72 @@ fn steps_cannot_reach_the_output_disk(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     let spec = spec(&c, backend, vec![fixtures().base[0].clone()], 1);
     let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
-    let script = "ls /dev | tr '\\n' ' '; echo; id -u; \
+    // Each probe prints `name: <its own stderr, shell redirection errors included>`
+    // (or `name: ok` if it succeeded), so the host can tell EPERM or EROFS from
+    // ENOENT, a missing applet or a usage error.
+    let script = "t() { n=$1; r=$(eval \"$2\" 2>&1) && echo \"$n: ok\" || echo \"$n: $r\" | tr '\\n' ' '; echo; }; \
+                  ls /dev | tr '\\n' ' '; echo; id -u; \
                   test ! -e /dev/vdc && echo no-vdc; \
-                  mount -t devtmpfs d /tmp 2>/dev/null || echo no-mount; \
-                  d=$(cat /sys/block/vdc/dev); for at in /dev /tmp; do \
-                  mknod $at/vdc b ${d%:*} ${d#*:} 2>/dev/null || echo no-mknod-$at; \
-                  head -c 1 $at/vdc >/dev/null 2>&1 || echo no-open-$at; rm -f $at/vdc 2>/dev/null; done; \
-                  head -c 1 /proc/1/root/dev/vdc >/dev/null 2>&1 || echo no-proc-root; \
-                  echo x > /sys/block/vdc/uevent 2>/dev/null || echo no-sys; \
-                  { echo core > /proc/sys/kernel/core_pattern; } 2>/dev/null || echo no-core-pattern; \
-                  { echo /sbin/modprobe > /proc/sys/kernel/modprobe; } 2>/dev/null || echo no-modprobe; \
-                  { echo h > /proc/sysrq-trigger; } 2>/dev/null || echo no-sysrq; \
+                  d=$(cat /sys/block/vdc/dev); echo dev=$d; M=${d%:*}; m=${d#*:}; \
+                  t mount 'mount -t devtmpfs d /tmp'; \
+                  t mknod-/dev \"mknod /dev/vdc b $M $m\"; t open-/dev 'head -c 1 /dev/vdc'; \
+                  t mknod-/tmp \"mknod /tmp/vdc b $M $m\"; t open-/tmp 'head -c 1 /tmp/vdc'; rm -f /tmp/vdc; \
+                  t proc-root 'head -c 1 /proc/1/root/dev/vdc'; \
+                  t sys 'echo x > /sys/block/vdc/uevent'; \
+                  t core-pattern 'echo core > /proc/sys/kernel/core_pattern'; \
+                  t modprobe 'echo /sbin/modprobe > /proc/sys/kernel/modprobe'; \
+                  t sysrq 'echo h > /proc/sysrq-trigger'; \
                   echo kcore-$(head -c 16 /proc/kcore 2>/dev/null | wc -c)";
     let (o, out, err) = run(&mut vm, sh(1, script));
     assert_eq!(o.exit, Exit::Code(0), "{out}\n{err}");
+    let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(
-        out,
-        "fd full null ptmx pts random shm stderr stdin stdout tty urandom zero \n0\n\
-         no-vdc\nno-mount\nno-mknod-/dev\nno-open-/dev\nno-mknod-/tmp\nno-open-/tmp\nno-proc-root\nno-sys\n\
-         no-core-pattern\nno-modprobe\nno-sysrq\nkcore-0\n",
-        "{err}"
+        lines[..3],
+        [
+            "fd full null ptmx pts random shm stderr stdin stdout tty urandom zero ",
+            "0",
+            "no-vdc"
+        ],
+        "{out}"
     );
+    // The output disk's major:minor was really read.
+    let dev = lines[3].strip_prefix("dev=").unwrap_or_default();
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    assert!(
+        dev.split_once(':').is_some_and(|(a, b)| numeric(a) && numeric(b)),
+        "{out}"
+    );
+    // Every probe failed for the reason that keeps the step out, not for a
+    // missing path, applet or argument.
+    const EPERM: &str = "Operation not permitted";
+    const EROFS: &str = "Read-only file system";
+    let want = [
+        ("mount", "permission denied"),
+        ("mknod-/dev", EROFS),
+        ("mknod-/tmp", EPERM),
+        ("proc-root", "Permission denied"),
+        ("sys", EROFS),
+        ("core-pattern", EROFS),
+        ("modprobe", EROFS),
+        ("sysrq", EROFS),
+    ];
+    for (name, reason) in want {
+        let prefix = format!("{name}: ");
+        let line = lines
+            .iter()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("{name}: no line\n{out}"));
+        assert!(line.contains(reason), "{name}: wanted {reason:?}, got {line:?}\n{out}");
+    }
+    // Opening a node is refused too (in /dev and /tmp no node exists to open).
+    for name in ["open-/dev", "open-/tmp"] {
+        let prefix = format!("{name}: ");
+        let line = lines.iter().find_map(|l| l.strip_prefix(&prefix)).unwrap_or_default();
+        assert!(!line.is_empty() && line != "ok", "{name}: {line:?}\n{out}");
+    }
+    // Reading /proc/kcore yields nothing because the step lacks CAP_SYS_RAWIO
+    // (not because of the mask over it).
+    assert_eq!(lines.last(), Some(&"kcore-0"), "{out}");
     vm.finish().expect("the guest ends the VM");
 }
 
