@@ -186,7 +186,10 @@ const APPLETS: [&str; 35] = [
 ];
 
 /// Each entry's path and mtime in a ustar/PAX archive (PAX `path` and `mtime`
-/// records apply to the next entry; PAX headers are not entries).
+/// records apply to the next entry; PAX headers are not entries). It does not
+/// read GNU `L` long-name entries: the only writer of these archives is
+/// kiln-init's `TarWriter`, which puts a long name in a PAX `path` record and
+/// never writes a GNU one.
 pub fn tar_mtimes(tar: &[u8]) -> Vec<(String, u64)> {
     let field = |h: &[u8], a: usize, b: usize| {
         let s: String = h[a..b].iter().take_while(|&&c| c != 0).map(|&c| c as char).collect();

@@ -99,7 +99,7 @@ fn read_diff(output: &Path, s: &StepSealed, after: u64) -> Vec<u8> {
         s.offset.is_multiple_of(4096) && s.len.is_multiple_of(4096) && s.offset >= after,
         "{s:?}"
     );
-    assert!(s.offset + s.len <= OUTPUT, "{s:?}");
+    assert!(s.offset.checked_add(s.len).is_some_and(|end| end <= OUTPUT), "{s:?}");
     let mut f = std::fs::File::open(output).unwrap();
     f.seek(SeekFrom::Start(s.offset)).unwrap();
     let mut buf = vec![0u8; s.len as usize];
@@ -287,74 +287,92 @@ fn build_steps_seal_stack_and_convert(backend: Backend) {
 }
 
 /// Ruling 1: a root step has no block device in its `/dev`, cannot mount one,
-/// cannot make (or open) a node for the output disk in `/dev` or in `/tmp`, and
-/// cannot reach init's root (and its `/dev`) through `/proc/1/root`.
+/// cannot make (or open) a node for the output disk or a layer disk in `/dev` or
+/// in `/tmp`, and cannot reach init's root (and its `/dev`) through `/proc/1/root`.
 fn steps_cannot_reach_the_output_disk(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     let spec = spec(&c, backend, vec![fixtures().base[0].clone()], 1);
+    // The disks in order: init (vda), scratch (vdb), the output (vdc), then the layers.
+    let disks: Vec<&str> = ["vdc", "vdd"].into_iter().take(1 + spec.layers.len().min(1)).collect();
     let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
     // Each probe prints `name: <its own stderr, shell redirection errors included>`
     // (or `name: ok` if it succeeded), so the host can tell EPERM or EROFS from
     // ENOENT, a missing applet or a usage error.
-    let script = "t() { n=$1; r=$(eval \"$2\" 2>&1) && echo \"$n: ok\" || echo \"$n: $r\" | tr '\\n' ' '; echo; }; \
-                  ls /dev | tr '\\n' ' '; echo; id -u; \
-                  test ! -e /dev/vdc && echo no-vdc; \
-                  d=$(cat /sys/block/vdc/dev); echo dev=$d; M=${d%:*}; m=${d#*:}; \
-                  t mount 'mount -t devtmpfs d /tmp'; \
-                  t mknod-/dev \"mknod /dev/vdc b $M $m\"; t open-/dev 'head -c 1 /dev/vdc'; \
-                  t mknod-/tmp \"mknod /tmp/vdc b $M $m\"; t open-/tmp 'head -c 1 /tmp/vdc'; rm -f /tmp/vdc; \
-                  t proc-root 'head -c 1 /proc/1/root/dev/vdc'; \
-                  t sys 'echo x > /sys/block/vdc/uevent'; \
-                  t core-pattern 'echo core > /proc/sys/kernel/core_pattern'; \
-                  t modprobe 'echo /sbin/modprobe > /proc/sys/kernel/modprobe'; \
-                  t sysrq 'echo h > /proc/sysrq-trigger'; \
-                  echo kcore-$(head -c 16 /proc/kcore 2>/dev/null | wc -c)";
-    let (o, out, err) = run(&mut vm, sh(1, script));
+    let per_disk = "test ! -e /dev/@D@ && echo no-@D@; \
+                    d=$(cat /sys/block/@D@/dev); echo dev-@D@=$d; M=${d%:*}; m=${d#*:}; \
+                    t mknod-/dev:@D@ \"mknod /dev/@D@ b $M $m\"; t open-/dev:@D@ 'head -c 1 /dev/@D@'; \
+                    t mknod-/tmp:@D@ \"mknod /tmp/@D@ b $M $m\"; t open-/tmp:@D@ 'head -c 1 /tmp/@D@'; rm -f /tmp/@D@; \
+                    t proc-root:@D@ 'head -c 1 /proc/1/root/dev/@D@'; \
+                    t sys:@D@ 'echo x > /sys/block/@D@/uevent'; ";
+    let script = format!(
+        "t() {{ n=$1; r=$(eval \"$2\" 2>&1) && echo \"$n: ok\" || echo \"$n: $r\" | tr '\\n' ' '; echo; }}; \
+         ls /dev | tr '\\n' ' '; echo; id -u; {} \
+         t mount 'mount -t devtmpfs d /tmp'; \
+         t core-pattern 'echo core > /proc/sys/kernel/core_pattern'; \
+         t modprobe 'echo /sbin/modprobe > /proc/sys/kernel/modprobe'; \
+         t sysrq 'echo h > /proc/sysrq-trigger'; \
+         echo kcore-$(head -c 16 /proc/kcore 2>/dev/null | wc -c)",
+        disks.iter().map(|d| per_disk.replace("@D@", d)).collect::<String>()
+    );
+    let (o, out, err) = run(&mut vm, sh(1, &script));
     assert_eq!(o.exit, Exit::Code(0), "{out}\n{err}");
     let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+    let find = |prefix: &str| -> &str {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("no line starting {prefix:?} in the probe output:\n{out}"))
+    };
+    // `/dev` lists only the character devices; the script runs as root.
+    let [listing, uid] = [lines.first(), lines.get(1)];
     assert_eq!(
-        lines[..3],
-        [
-            "fd full null ptmx pts random shm stderr stdin stdout tty urandom zero ",
-            "0",
-            "no-vdc"
-        ],
+        listing,
+        Some(&"fd full null ptmx pts random shm stderr stdin stdout tty urandom zero "),
         "{out}"
     );
-    // The output disk's major:minor was really read.
-    let dev = lines[3].strip_prefix("dev=").unwrap_or_default();
-    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    assert!(
-        dev.split_once(':').is_some_and(|(a, b)| numeric(a) && numeric(b)),
-        "{out}"
-    );
+    assert_eq!(uid, Some(&"0"), "{out}");
     // Every probe failed for the reason that keeps the step out, not for a
     // missing path, applet or argument.
     const EPERM: &str = "Operation not permitted";
     const EROFS: &str = "Read-only file system";
-    let want = [
+    for d in &disks {
+        // No node in `/dev`, and the disk's major:minor was really read.
+        assert!(
+            lines.contains(&format!("no-{d}").as_str()),
+            "{d} is in the step's /dev:\n{out}"
+        );
+        let dev = find(&format!("dev-{d}="));
+        let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        assert!(
+            dev.split_once(':').is_some_and(|(a, b)| numeric(a) && numeric(b)),
+            "{d}: {out}"
+        );
+        for (name, reason) in [
+            ("mknod-/dev", EROFS),
+            ("mknod-/tmp", EPERM),
+            ("proc-root", "Permission denied"),
+            ("sys", EROFS),
+        ] {
+            let line = find(&format!("{name}:{d}: "));
+            assert!(
+                line.contains(reason),
+                "{name}:{d}: wanted {reason:?}, got {line:?}\n{out}"
+            );
+        }
+        // Opening a node is refused too (in /dev and /tmp no node exists to open).
+        for name in ["open-/dev", "open-/tmp"] {
+            let line = find(&format!("{name}:{d}: "));
+            assert!(!line.is_empty() && line != "ok", "{name}:{d}: {line:?}\n{out}");
+        }
+    }
+    for (name, reason) in [
         ("mount", "permission denied"),
-        ("mknod-/dev", EROFS),
-        ("mknod-/tmp", EPERM),
-        ("proc-root", "Permission denied"),
-        ("sys", EROFS),
         ("core-pattern", EROFS),
         ("modprobe", EROFS),
         ("sysrq", EROFS),
-    ];
-    for (name, reason) in want {
-        let prefix = format!("{name}: ");
-        let line = lines
-            .iter()
-            .find_map(|l| l.strip_prefix(&prefix))
-            .unwrap_or_else(|| panic!("{name}: no line\n{out}"));
+    ] {
+        let line = find(&format!("{name}: "));
         assert!(line.contains(reason), "{name}: wanted {reason:?}, got {line:?}\n{out}");
-    }
-    // Opening a node is refused too (in /dev and /tmp no node exists to open).
-    for name in ["open-/dev", "open-/tmp"] {
-        let prefix = format!("{name}: ");
-        let line = lines.iter().find_map(|l| l.strip_prefix(&prefix)).unwrap_or_default();
-        assert!(!line.is_empty() && line != "ok", "{name}: {line:?}\n{out}");
     }
     // Reading /proc/kcore yields nothing because the step lacks CAP_SYS_RAWIO
     // (not because of the mask over it).
@@ -364,10 +382,13 @@ fn steps_cannot_reach_the_output_disk(backend: Backend) {
 
 /// A step whose mounts cannot be set up (a secret whose parent is a regular
 /// file in the image) ends with 125 and the reason on its stderr; the VM goes on
-/// and the next step runs, on the state before the failed one.
+/// and the next step runs, on the state before the failed one: its diff holds no
+/// stub or copied-up entry of the failed step, and its `/proc` and `/dev` are one
+/// mount each.
 fn a_failed_mount_setup_fails_the_step_not_the_vm(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     let spec = spec(&c, backend, vec![fixtures().base[0].clone()], 1);
+    let output = spec.output.clone();
     let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
     let mut bad = sh(1, "echo must-not-run > /ran; echo must-not-run");
     bad.secrets = vec![("/bin/busybox/token".into(), Secret(SECRET.to_vec()))];
@@ -386,11 +407,25 @@ fn a_failed_mount_setup_fails_the_step_not_the_vm(backend: Backend) {
         "{err}"
     );
     assert!(!err.contains(&String::from_utf8_lossy(SECRET).to_string()), "{err}");
-    // The VM is still there, and the failed step left nothing behind.
-    let (o, out, err) = run(&mut vm, sh(2, "test ! -e /ran && echo ok"));
+    // The VM is still there, and the failed step left nothing behind. `/proc`
+    // and `/dev` are each mounted once (the failed step's mounts were torn down
+    // and not stacked under this one's).
+    let mounts = |dir: &str| format!("grep -c '^[0-9]* [0-9]* [0-9]*:[0-9]* [^ ]* {dir} ' /proc/self/mountinfo");
+    let script = format!(
+        "test ! -e /ran && echo ok; echo proc=$({}); echo dev=$({})",
+        mounts("/proc"),
+        mounts("/dev")
+    );
+    let (o, out, err) = run(&mut vm, sh(2, &script));
     assert_eq!(o.exit, Exit::Code(0), "{out}\n{err}");
-    assert_eq!(out, "ok\n");
-    assert!(o.sealed.is_some());
+    assert_eq!(out, "ok\nproc=1\ndev=1\n", "{err}");
+    let seal = o.sealed.expect("sealed");
+    let diff = read_diff(&output, &seal, 0);
+    assert_eq!(
+        diff_paths(&diff),
+        Vec::<String>::new(),
+        "the failed step's stubs or copied-up parents reached the next diff"
+    );
     vm.finish().expect("the guest ends the VM");
 }
 
@@ -462,10 +497,19 @@ fn a_version_2_guest_is_refused_build_mode(backend: Backend) {
     assert!(err.contains("build mode needs") && err.contains("version 3"), "{err}");
 }
 
+/// The VMM's identity, from the run directory's `run.json`.
+fn vmm_of(vm: &BuildVm) -> kiln_run::rundir::Identity {
+    let json = std::fs::read(vm.run_dir().expect("a run directory").join("run.json")).expect("read run.json");
+    let info: kiln_run::rundir::RunInfo = serde_json::from_slice(&json).expect("parse run.json");
+    info.vmm.expect("the VMM's identity is recorded once it runs")
+}
+
 fn a_step_past_its_timeout_is_killed(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     let spec = spec(&c, backend, vec![fixtures().base[0].clone()], 1);
     let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
+    let vmm = vmm_of(&vm);
+    assert!(kiln_run::rundir::alive(&vmm), "the VMM runs before the step: {vmm:?}");
     let mut s = sh(1, "echo started; sleep 600");
     s.timeout = Duration::from_secs(5);
     let t = Instant::now();
@@ -480,14 +524,22 @@ fn a_step_past_its_timeout_is_killed(backend: Backend) {
     );
     assert_eq!(out, "started\n");
     assert!(took < Duration::from_secs(5) + STEP_GRACE + KILL_WAIT, "{took:?}");
+    // kiln killed the VM: its VMM process is gone, not only refused more steps.
+    assert!(
+        !kiln_run::rundir::alive(&vmm),
+        "the VMM outlived the timed-out step: {vmm:?}"
+    );
     let err = vm.run_step(sh(2, "true"), &mut |_, _| {}).unwrap_err().to_string();
     assert!(err.contains("timed out"), "{err}");
+    // A timed-out step ends the VM, so Finish reports it too.
+    assert!(vm.finish().is_err());
     eprintln!("{backend:?}: a 5 s timeout returned after {} ms", took.as_millis());
 }
 
-/// A hostile guest seals its step far outside the output disk: kiln passes the
-/// claim through, and the caller's range check (here `read_diff`'s) refuses it.
-fn a_seal_outside_the_disk_is_passed_through(backend: Backend) {
+/// A hostile guest seals its step far outside the output disk: kiln refuses the
+/// claim itself (`BuildProtocol`), `run_step` fails naming the check, and the VM
+/// is ended.
+fn a_seal_outside_the_disk_is_refused_by_kiln(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     let Some(hostile) = support::env().unwrap().hostile.clone() else {
         assert!(
@@ -500,25 +552,39 @@ fn a_seal_outside_the_disk_is_passed_through(backend: Backend) {
     // The init layer is built from this binary: the hostile program is PID 1.
     spec.init = hostile;
     let mut vm = BuildVm::start(&store(), spec).expect("boot the hostile build VM");
-    let (o, _, _) = run(&mut vm, sh(1, "true"));
-    let s = o.sealed.expect("passed through");
-    assert_eq!((s.offset, s.len), (u64::MAX - 4095, 1 << 40));
+    let err = vm
+        .run_step(sh(1, "true"), &mut |_, _| {})
+        .expect_err("kiln refuses the seal")
+        .to_string();
     assert!(
-        s.offset.checked_add(s.len).is_none_or(|end| end > OUTPUT),
-        "the caller must refuse it"
+        err.contains("StepSealed for step 1") && err.contains("is refused") && err.contains("does not start where"),
+        "{err}"
     );
+    // The VM is gone: no more steps.
+    let err = vm.run_step(sh(2, "true"), &mut |_, _| {}).unwrap_err().to_string();
+    assert!(err.contains("ended") || err.contains("StepSealed"), "{err}");
+    assert!(vm.finish().is_err());
 }
 
 /// Egress is per step in a VM with a network: off, on, off again, through
 /// vmkit's `Vm::set_egress` (needs pasta, nft and the internet: KILN_TEST_NET=1).
 /// Each step probes a new TCP connection to 1.1.1.1:80 (printing `nc`'s own exit
-/// status and the first bytes of the reply) and two DNS queries (to the gateway, which is the
-/// guest's resolver, and to 1.1.1.1 directly), each under its own time limit. Open steps must connect (the open probe is retried up to 3
-/// times, as the internet may blink; the closed probes never are). Closed steps
-/// must neither connect nor resolve. (Whether an open step's DNS answers depends on the
-/// host's resolver and is only reported, not asserted.) Not checked: a connection an earlier step
-/// opened, since the guest kills every process when a step's command exits, so no
-/// straggler survives into the next step to be cut.
+/// status and the first bytes of the reply) and one `nslookup` through each of two
+/// resolvers (the gateway, which is the guest's resolver, and 1.1.1.1 directly),
+/// each under its own time limit. Open steps must connect (the open probe is
+/// retried up to 3 times, as the internet may blink; the closed probes never are).
+/// Closed steps must neither connect nor resolve. A closed probe fails by its own
+/// exit status, not because its applet is missing: `nc` and `nslookup` must not
+/// return 127. A closed `nslookup` is expected to return 143 (`timeout`'s SIGTERM,
+/// 128 + 15): the gate drops its queries, it keeps retrying and `timeout` ends it,
+/// so 143 counts as blocked.
+///
+/// Whether an open step's DNS answers depends on the host's resolver and is only
+/// reported, not asserted, so a closed step's DNS failure has no positive control
+/// where open-step DNS does not work (as in Lima): there it shows only that the
+/// lookup did not succeed, and TCP (`nc`) is what proves the gate. Not checked: a
+/// connection an earlier step opened, since the guest kills every process when a
+/// step's command exits, so no straggler survives into the next step to be cut.
 fn egress_follows_each_step(backend: Backend) {
     let Some(c) = Case::new(backend) else { return };
     if std::env::var_os("KILN_TEST_NET").is_none_or(|v| v != "1") {
@@ -576,11 +642,15 @@ fn egress_follows_each_step(backend: Backend) {
                 assert!(attempt < attempts, "egress did not open: {context}");
             } else {
                 assert!(!connected, "egress did not close: {context}");
-                assert!(nc != "0" && !nc.is_empty(), "a closed step's nc must fail: {context}");
+                // 127 is a missing applet, not a blocked network.
+                assert!(
+                    nc != "0" && nc != "127" && !nc.is_empty(),
+                    "a closed step's nc must fail by itself: {context}"
+                );
                 for (what, rc) in [("DNS", &dns), ("DNS to 1.1.1.1", &dnsx)] {
                     assert!(
-                        rc != "0" && !rc.is_empty(),
-                        "a closed step's {what} must fail: {context}"
+                        rc != "0" && rc != "127" && !rc.is_empty(),
+                        "a closed step's {what} must fail, and not by a missing applet: {context}"
                     );
                 }
             }
@@ -608,6 +678,6 @@ boot_tests!(
     source_date_epoch_clamps_the_diff,
     a_version_2_guest_is_refused_build_mode,
     a_step_past_its_timeout_is_killed,
-    a_seal_outside_the_disk_is_passed_through,
+    a_seal_outside_the_disk_is_refused_by_kiln,
     egress_follows_each_step,
 );
