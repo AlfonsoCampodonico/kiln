@@ -5,6 +5,10 @@
 //! `.wh.<name>` and opaque directories into `.wh..wh..opq` before they get here.
 //!
 //! Paths are relative (no leading `/`, never `..`); directories end in `/`.
+//! [`TarWriter::entry`] refuses a path that is not, a hard link target that is
+//! not, and an extended attribute name that holds `=` or NUL (a PAX key ends at
+//! the first `=`). A path, link target or attribute name that is not UTF-8 is
+//! written as it is, with a PAX `hdrcharset=BINARY` record, as POSIX asks.
 //! `entries` counts the logical entries, not the PAX headers. The archive ends
 //! with two zero blocks, then zeros up to the alignment the output disk asks for,
 //! so the range a reader is told about holds nothing after the tar's end.
@@ -109,6 +113,43 @@ fn pax_record(key: &[u8], value: &[u8]) -> Vec<u8> {
     r
 }
 
+/// `what` must be a relative path: not empty, no NUL, no leading `/`, no `..` component.
+fn check_path(what: &str, p: &[u8]) -> io::Result<()> {
+    let bad = |why: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} {:?} {why}", String::from_utf8_lossy(p)),
+        ))
+    };
+    if p.is_empty() {
+        return bad("is empty");
+    }
+    if p.contains(&0) {
+        return bad("holds a NUL");
+    }
+    if p[0] == b'/' {
+        return bad("is absolute");
+    }
+    if p.split(|&b| b == b'/').any(|c| c == b"..") {
+        return bad("holds a `..` component");
+    }
+    Ok(())
+}
+
+/// An attribute name is the tail of a PAX key `SCHILY.xattr.<name>=<value>`.
+fn check_xattr_name(name: &[u8]) -> io::Result<()> {
+    if name.is_empty() || name.contains(&b'=') || name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the attribute name {:?} is empty or holds `=` or NUL",
+                String::from_utf8_lossy(name)
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn octal(field: &mut [u8], v: u64) {
     let digits = field.len() - 1;
     let s = format!("{v:0digits$o}");
@@ -166,6 +207,13 @@ impl<W: Write> TarWriter<W> {
 
     /// Writes one entry; a regular file's data comes from `data` (exactly its size).
     pub fn entry(&mut self, node: &Node, data: Option<&mut dyn Read>) -> io::Result<()> {
+        check_path("the path", &node.path)?;
+        if let Kind::HardLink(t) = &node.kind {
+            check_path("the hard link target", t)?;
+        }
+        for (k, _) in &node.xattrs {
+            check_xattr_name(k)?;
+        }
         let mut name = node.path.clone();
         if node.kind == Kind::Dir {
             name.push(b'/');
@@ -180,6 +228,12 @@ impl<W: Write> TarWriter<W> {
             Kind::Fifo => (b'6', 0, b""),
         };
         let mut pax = Vec::new();
+        let binary = std::str::from_utf8(&name).is_err()
+            || std::str::from_utf8(link).is_err()
+            || node.xattrs.iter().any(|(k, _)| std::str::from_utf8(k).is_err());
+        if binary {
+            pax.extend(pax_record(b"hdrcharset", b"BINARY"));
+        }
         if name.len() > 100 {
             pax.extend(pax_record(b"path", &name));
         }
@@ -238,6 +292,9 @@ impl<W: Write> TarWriter<W> {
 
     /// Ends the archive (two zero blocks), then pads with zeros to a multiple of `align`.
     pub fn finish(mut self, align: u64) -> io::Result<(W, Written)> {
+        if align == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "an alignment of 0"));
+        }
         self.put(&[0u8; 2 * BLOCK])?;
         let rem = self.len % align;
         if rem != 0 {
@@ -344,6 +401,253 @@ mod tests {
         assert!(bytes[5 * 512..].iter().all(|&b| b == 0));
         assert_eq!(&bytes[3 * 512..3 * 512 + 5], &[0; 5], "the end blocks follow the data");
         assert_eq!(&bytes[2 * 512..2 * 512 + 5], b"hello");
+    }
+
+    /// Keeps the first `limit` bytes written, then fails: what an entry's headers
+    /// look like without writing its (possibly enormous) data.
+    struct Capture {
+        buf: Vec<u8>,
+        limit: usize,
+    }
+
+    impl Write for Capture {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            if self.buf.len() >= self.limit {
+                return Err(io::Error::other("enough"));
+            }
+            let n = b.len().min(self.limit - self.buf.len());
+            self.buf.extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn field(h: &[u8], a: usize, b: usize) -> u64 {
+        let s: String = h[a..b].iter().take_while(|&&c| c != 0).map(|&c| c as char).collect();
+        if s.trim().is_empty() {
+            0
+        } else {
+            u64::from_str_radix(s.trim(), 8).unwrap()
+        }
+    }
+
+    /// The records of the PAX header at the start of `tar`.
+    fn pax(tar: &[u8]) -> Vec<(String, Vec<u8>)> {
+        assert_eq!(tar[156], b'x', "a PAX header comes first");
+        let size = field(&tar[..512], 124, 136) as usize;
+        let mut data = &tar[512..512 + size];
+        let mut out = Vec::new();
+        while !data.is_empty() {
+            let sp = data.iter().position(|&b| b == b' ').unwrap();
+            let n: usize = std::str::from_utf8(&data[..sp]).unwrap().parse().unwrap();
+            let rec = &data[sp + 1..n - 1];
+            assert_eq!(data[n - 1], b'\n');
+            let eq = rec.iter().position(|&b| b == b'=').unwrap();
+            out.push((String::from_utf8_lossy(&rec[..eq]).into_owned(), rec[eq + 1..].to_vec()));
+            data = &data[n..];
+        }
+        out
+    }
+
+    fn first_headers(node: &Node) -> Vec<u8> {
+        let mut cap = Capture {
+            buf: Vec::new(),
+            limit: 4096,
+        };
+        let mut t = TarWriter::new(&mut cap);
+        let _ = t.entry(node, Some(&mut io::repeat(0)));
+        cap.buf
+    }
+
+    fn refused(node: &Node) -> String {
+        let mut out = Vec::new();
+        let e = TarWriter::new(&mut out)
+            .entry(node, Some(&mut io::empty()))
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        assert!(out.is_empty(), "nothing is written for a refused entry");
+        e.to_string()
+    }
+
+    #[test]
+    fn a_path_that_is_not_relative_is_refused() {
+        for bad in [&b"/etc/passwd"[..], b"a/../b", b"..", b"../x", b"a/..", b"", b"a\0b"] {
+            refused(&Node::marker(bad.to_vec()));
+        }
+        // A hard link names an entry of the archive: the same rule.
+        for bad in [&b"/etc/passwd"[..], b"../x", b""] {
+            let node = Node {
+                kind: Kind::HardLink(bad.to_vec()),
+                ..Node::marker(b"l".to_vec())
+            };
+            let why = refused(&node);
+            assert!(why.contains("hard link target"), "{why}");
+        }
+        // Dots in a name are not `..`; a symlink's target is the image's own business.
+        let mut t = TarWriter::new(Vec::new());
+        for ok in [&b"..a"[..], b"a..", b"a/..b/c", b".wh..wh..opq"] {
+            t.entry(&Node::marker(ok.to_vec()), Some(&mut io::empty())).unwrap();
+        }
+        let link = Node {
+            kind: Kind::Symlink(b"/abs/../x".to_vec()),
+            ..Node::marker(b"s".to_vec())
+        };
+        t.entry(&link, None).unwrap();
+    }
+
+    #[test]
+    fn an_attribute_name_with_equals_or_nul_is_refused() {
+        for bad in [&b"user.a=b"[..], b"user.a\0b", b"=", b""] {
+            let node = Node {
+                xattrs: vec![(bad.to_vec(), b"v".to_vec())],
+                ..Node::marker(b"f".to_vec())
+            };
+            let why = refused(&node);
+            assert!(why.contains("attribute name"), "{why}");
+        }
+        // The value may hold anything, `=` and NUL included.
+        let node = Node {
+            xattrs: vec![(b"user.k".to_vec(), b"a=b\0c\n".to_vec())],
+            ..Node::marker(b"f".to_vec())
+        };
+        let h = first_headers(&node);
+        assert!(pax(&h).contains(&("SCHILY.xattr.user.k".into(), b"a=b\0c\n".to_vec())));
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf8_gets_a_binary_charset_record() {
+        let short = Node::marker(b"d\xffir/f\xfe".to_vec());
+        let h = first_headers(&short);
+        assert_eq!(pax(&h), [("hdrcharset".into(), b"BINARY".to_vec())]);
+        // The ustar name holds the raw bytes.
+        let name = &h[1024..1024 + 8];
+        assert_eq!(name, b"d\xffir/f\xfe\0");
+
+        let mut long = b"x".repeat(150);
+        long[3] = 0xfe;
+        let h = first_headers(&Node::marker(long.clone()));
+        let records = pax(&h);
+        assert_eq!(records[0], ("hdrcharset".into(), b"BINARY".to_vec()));
+        assert_eq!(records[1], ("path".into(), long));
+
+        let link = Node {
+            kind: Kind::Symlink(b"t\xc0".to_vec()),
+            ..Node::marker(b"l".to_vec())
+        };
+        assert_eq!(pax(&first_headers(&link))[0].0, "hdrcharset");
+        let attr = Node {
+            xattrs: vec![(b"user.\xff".to_vec(), b"v".to_vec())],
+            ..Node::marker(b"f".to_vec())
+        };
+        let h = first_headers(&attr);
+        let records = pax(&h);
+        assert_eq!(records[0].0, "hdrcharset");
+        assert!(records[1].0.starts_with("SCHILY.xattr.user."));
+        assert!(h.windows(19).any(|w| w == b"SCHILY.xattr.user.\xff"), "the raw name");
+    }
+
+    #[test]
+    fn utf8_names_get_no_charset_record() {
+        let h = first_headers(&Node::marker("caf\u{e9}".as_bytes().to_vec()));
+        assert_eq!(h[156], b'0', "no PAX header");
+    }
+
+    #[test]
+    fn a_time_before_the_epoch_or_past_eleven_octal_digits_is_a_pax_record() {
+        for (mtime, record) in [(-5, "-5"), (MAX_11 as i64 + 1, "8589934592")] {
+            let node = Node {
+                mtime,
+                ..Node::marker(b"f".to_vec())
+            };
+            let h = first_headers(&node);
+            assert_eq!(pax(&h), [("mtime".into(), record.as_bytes().to_vec())], "{mtime}");
+            // The entry's own header holds 0 or the field's largest value.
+            let header = &h[1024..1536];
+            assert_eq!(field(header, 136, 148), if mtime < 0 { 0 } else { MAX_11 });
+        }
+        for mtime in [0, 1_700_000_000, MAX_11 as i64] {
+            let h = first_headers(&Node {
+                mtime,
+                ..Node::marker(b"f".to_vec())
+            });
+            assert_eq!(h[156], b'0', "{mtime} fits the header");
+            assert_eq!(field(&h[..512], 136, 148), mtime as u64);
+        }
+    }
+
+    #[test]
+    fn a_size_past_eight_gib_is_a_pax_record() {
+        let big = MAX_11 + 1;
+        let node = Node {
+            kind: Kind::File(big),
+            ..Node::marker(b"huge".to_vec())
+        };
+        let h = first_headers(&node);
+        assert_eq!(pax(&h), [("size".into(), b"8589934592".to_vec())]);
+        let header = &h[1024..1536];
+        assert_eq!((header[156], field(header, 124, 136)), (b'0', MAX_11));
+        // The largest size the header holds needs no record.
+        let node = Node {
+            kind: Kind::File(MAX_11),
+            ..Node::marker(b"huge".to_vec())
+        };
+        let h = first_headers(&node);
+        assert_eq!((h[156], field(&h[..512], 124, 136)), (b'0', MAX_11));
+    }
+
+    #[test]
+    fn devices_and_fifos_are_typed_entries_without_data() {
+        let mut t = TarWriter::new(Vec::new());
+        let nodes = [
+            (Kind::Char(1, 3), b'3'),
+            (Kind::Block(8, 16), b'4'),
+            (Kind::Block(259, 1_048_575), b'4'),
+            (Kind::Fifo, b'6'),
+        ];
+        for (i, (kind, _)) in nodes.iter().enumerate() {
+            let node = Node {
+                kind: kind.clone(),
+                mode: 0o640,
+                ..Node::marker(format!("n{i}").into_bytes())
+            };
+            t.entry(&node, None).unwrap();
+        }
+        let (tar, w) = t.finish(512).unwrap();
+        assert_eq!(w.entries, 4);
+        assert_eq!(tar.len(), 6 * 512, "four headers, two end blocks");
+        for (i, (kind, flag)) in nodes.iter().enumerate() {
+            let h = &tar[i * 512..(i + 1) * 512];
+            assert_eq!(h[156], *flag, "{kind:?}");
+            assert_eq!(field(h, 124, 136), 0, "{kind:?}: no data");
+            assert_eq!(field(h, 100, 108), 0o640);
+            let (ma, mi) = match kind {
+                Kind::Char(a, b) | Kind::Block(a, b) => (u64::from(*a), u64::from(*b)),
+                _ => (0, 0),
+            };
+            assert_eq!((field(h, 329, 337), field(h, 337, 345)), (ma, mi), "{kind:?}");
+            assert_eq!(&h[257..263], b"ustar\0");
+        }
+    }
+
+    #[test]
+    fn the_padding_follows_the_alignment_asked_for() {
+        // Not a multiple of the tar block: the range still ends on `align`.
+        let mut t = TarWriter::new(Vec::new());
+        t.entry(&Node::marker(b"a".to_vec()), Some(&mut io::empty())).unwrap();
+        let (tar, w) = t.finish(1000).unwrap();
+        assert_eq!(w.len, 2000);
+        assert_eq!(tar.len(), 2000);
+        assert!(tar[3 * 512..].iter().all(|&b| b == 0));
+        // Already a multiple: no padding.
+        let (tar, w) = TarWriter::new(Vec::new()).finish(512).unwrap();
+        assert_eq!((w.len, tar.len()), (1024, 1024));
+        // No alignment to speak of.
+        let (_, w) = TarWriter::new(Vec::new()).finish(1).unwrap();
+        assert_eq!(w.len, 1024);
+        assert!(TarWriter::new(Vec::new()).finish(0).is_err());
     }
 
     #[test]
