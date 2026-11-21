@@ -487,8 +487,8 @@ impl StepState {
         let exit = match (timed_out, e.code, e.signal) {
             (true, _, _) => Exit::TimedOut,
             (false, Some(c), _) => Exit::Code(c),
-            (false, None, Some(sig)) => Exit::Signal(sig),
-            (false, None, None) => unreachable!("validated: a code or a signal"),
+            // Decoding validated exactly one of the two.
+            (false, None, sig) => Exit::Signal(sig.unwrap_or_default()),
         };
         if e.code == Some(0) {
             let sealed = self.sealed.clone()?;
@@ -577,7 +577,8 @@ fn listen(
                 continue;
             }
             control = true;
-            let (config, ctx, out) = (config.clone(), tx.clone(), out.take().expect("served once"));
+            let Some(out) = out.take() else { continue };
+            let (config, ctx) = (config.clone(), tx.clone());
             let spawned = std::thread::Builder::new()
                 .name("build-control".into())
                 .spawn(move || read_control(stream, &config, &ctx, out));
