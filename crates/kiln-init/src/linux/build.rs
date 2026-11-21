@@ -8,10 +8,11 @@
 //! Init never pivots: it keeps its own root, and each step gets a fresh overlay at
 //! `/kiln/root` (the lowers so far, a new upper and work directory on scratch;
 //! `nodev`), with `/proc` (a clone of init's, but `/proc/sys`, `/proc/sysrq-trigger`,
-//! `/proc/irq` and `/proc/bus` are bound read-only, so a root step without
+//! `/proc/irq`, `/proc/bus` and `/proc/fs` are bound read-only, so a root step without
 //! `CAP_SYS_ADMIN` cannot set `kernel.core_pattern` or `kernel.modprobe`, whose
 //! helpers the kernel runs as root in init's namespace; `/proc/kcore`, `keys`,
-//! `timer_list` and `sched_debug` are masked when present), a read-only `/sys`, a minimal `/dev` (read-only, no block
+//! `timer_list`, `sched_debug`, `acpi`, `scsi`, `latency_stats` and `timer_stats`
+//! are masked when present), a read-only `/sys`, a minimal `/dev` (read-only, no block
 //! devices: `null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx` and the
 //! `fd`/`stdin`/`stdout`/`stderr` links), `/dev/pts`, `/dev/shm`, its cache
 //! disks, the `/etc` files and its secrets mounted in it. Every mount point that had to be
@@ -342,10 +343,19 @@ impl Builder<'_> {
 }
 
 /// `/proc` paths a step may read but not write (runc's `readonlyPaths`).
-const PROC_READONLY: [&str; 4] = ["/proc/sys", "/proc/sysrq-trigger", "/proc/irq", "/proc/bus"];
+const PROC_READONLY: [&str; 5] = ["/proc/sys", "/proc/sysrq-trigger", "/proc/irq", "/proc/bus", "/proc/fs"];
 
 /// `/proc` paths a step sees empty (runc's `maskedPaths`, those procfs has).
-const PROC_MASKED: [&str; 4] = ["/proc/kcore", "/proc/keys", "/proc/timer_list", "/proc/sched_debug"];
+const PROC_MASKED: [&str; 8] = [
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/timer_list",
+    "/proc/sched_debug",
+    "/proc/acpi",
+    "/proc/scsi",
+    "/proc/latency_stats",
+    "/proc/timer_stats",
+];
 
 /// A detached copy of init's mount at `path`.
 fn clone_tree(path: &str) -> Result<OwnedFd> {
