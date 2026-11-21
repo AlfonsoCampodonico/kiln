@@ -418,6 +418,11 @@ mod tests {
 
     /// `RunStep` and `Finish` are build-mode messages: in run mode the supervisor
     /// fails (ending the VM) instead of ignoring them.
+    ///
+    /// Safe to run only because `run` returns the error before it reaches
+    /// `sys::kill_all()` (`kill(-1, SIGKILL)`); `kill_all` panics under
+    /// `cfg(test)`, so a change that made the refusal fall through to it fails
+    /// this test instead of killing the developer's processes.
     #[test]
     fn build_messages_in_run_mode_are_protocol_violations() {
         let step = kiln_proto::RunStep {
