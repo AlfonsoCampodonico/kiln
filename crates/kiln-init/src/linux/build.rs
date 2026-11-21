@@ -35,10 +35,13 @@
 //! `Running`, init also sets `/proc/sys/user/max_user_namespaces` to 0, so no step
 //! can create a user namespace (and get `CAP_SYS_ADMIN` inside it).
 //!
-//! A step that cannot be started (its mounts, its working directory, its ids or
-//! its command) ends with `StepExited` code 125, 126 or 127 and kiln-init's
-//! reason on its stderr stream; the VM goes on. Only a message that breaks the
-//! protocol, or a failure outside the step's own setup, ends the VM.
+//! A step that cannot be started because of itself (a cache or secret target, or
+//! an `/etc` file's, that cannot be resolved or created in its root; its working
+//! directory, its ids or its command) ends with `StepExited` code 125, 126 or 127
+//! and kiln-init's reason on its stderr stream; the VM goes on. A message that
+//! breaks the protocol, or a failure of init's own work (cloning `/proc`,
+//! hardening it, creating sysfs, devpts or a tmpfs, mounting or growing a cache
+//! disk, moving a mount), ends the VM.
 //!
 //! When the step's process exits, every process but init is killed (stragglers,
 //! and anything that left the group), its output is drained, and `StepExited`
@@ -198,9 +201,14 @@ impl Builder<'_> {
             .context("mount the step's overlay")?;
 
         let mut mounts = Mounts::new()?;
-        // A mount that cannot be set up fails the step (125, the reason on its
-        // stderr), not the VM, as a working directory that cannot be made does.
-        let setup = self.mount_all(step, &mut mounts);
+        // A mount target the step's own spec or image makes impossible fails the
+        // step (125, the reason on its stderr), not the VM, as a working directory
+        // that cannot be made does. A failure of init's own mounts ends the VM.
+        let setup = match self.mount_all(step, &mut mounts) {
+            Ok(()) => Ok(()),
+            Err(SetupError::Step(f)) => Err(f),
+            Err(SetupError::Init(f)) => return Err(f),
+        };
         let ran = run_command(self.config, step, rx, setup);
         mounts.teardown();
         match rustix::mount::unmount(ROOT, UnmountFlags::empty()) {
@@ -267,7 +275,9 @@ impl Builder<'_> {
     }
 
     /// The API filesystems, the `/etc` files, the cache disks and the secrets.
-    fn mount_all(&mut self, step: &RunStep, m: &mut Mounts) -> Result<()> {
+    /// Only resolving or creating a cache or secret target (or an `/etc` file's)
+    /// in the step's root is the step's own doing; every other failure is init's.
+    fn mount_all(&mut self, step: &RunStep, m: &mut Mounts) -> std::result::Result<(), SetupError> {
         m.attach(clone_tree("/proc")?, "/proc", true)?;
         m.protect_proc()?;
         m.attach(new_fs("sysfs", None, &[], &[], true)?, "/sys", true)?;
@@ -290,6 +300,7 @@ impl Builder<'_> {
         )?;
 
         for mount in &step.mounts {
+            let target = m.target(&mount.target, true).map_err(SetupError::Step)?;
             let dev = device(mount.disk as usize);
             let fs = new_fs("ext4", Some(&dev), &[], &[], mount.read_only)?;
             if !mount.read_only && !self.grown.contains(&mount.disk) {
@@ -303,7 +314,7 @@ impl Builder<'_> {
                 storage::grow_to_device(&root, &dev)?;
                 self.grown.insert(mount.disk);
             }
-            m.attach(fs, &mount.target, true)?;
+            m.attach_at(fs, &target, &mount.target)?;
         }
 
         // The `/etc` files and the secrets: one tmpfs, never part of the upper.
@@ -339,7 +350,7 @@ impl Builder<'_> {
         let tmp = new_fs("tmpfs", None, &[("mode", "0700"), ("size", "4m")], &[], false)?;
         for (i, (target, data, uid, gid, mode)) in files.iter().enumerate() {
             // The image's own /etc file stays when it is a symlink (or under one).
-            if i < etc && !m.plain(target)? {
+            if i < etc && !m.plain(target).map_err(SetupError::Step)? {
                 continue;
             }
             let name = format!("f{i}");
@@ -358,9 +369,25 @@ impl Builder<'_> {
                 OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC,
             )
             .context("bind a file of the step's tmpfs")?;
-            m.attach(tree, target, false)?;
+            let at = m.target(target, false).map_err(SetupError::Step)?;
+            m.attach_at(tree, &at, target)?;
         }
         Ok(())
+    }
+}
+
+/// Why a step's mounts could not be set up.
+enum SetupError {
+    /// The step's own spec or image: a target that cannot be resolved or created.
+    /// The step ends with 125; the VM goes on.
+    Step(Failure),
+    /// Init's own work (a filesystem, a clone, a mount, a grow): ends the VM.
+    Init(Failure),
+}
+
+impl From<Failure> for SetupError {
+    fn from(f: Failure) -> Self {
+        Self::Init(f)
     }
 }
 
@@ -576,10 +603,15 @@ impl Mounts {
 
     fn attach(&mut self, mnt: OwnedFd, path: &str, dir: bool) -> Result<()> {
         let target = self.target(path, dir)?;
+        self.attach_at(mnt, &target, path)
+    }
+
+    /// Moves `mnt` onto `target` (what [`Self::target`] returned for `path`).
+    fn attach_at(&mut self, mnt: OwnedFd, target: &OwnedFd, path: &str) -> Result<()> {
         rustix::mount::move_mount(
             &mnt,
             "",
-            &target,
+            target,
             "",
             MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH | MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
         )
@@ -1023,6 +1055,13 @@ mod tests {
         // The same disk twice in one step: the second is already stacked.
         s.lowers_added = vec![4, 4];
         refused(&c, 1, &[], &s, "disk 4 is not an erofs disk left to stack");
+    }
+
+    #[test]
+    fn a_plain_failure_is_init_s_own_and_ends_the_vm() {
+        // The `?` on init's own work (a mount, a clone, a grow) converts to the
+        // variant that ends the VM; only a target of the step's own is `Step`.
+        assert!(matches!(SetupError::from(Failure::msg("x")), SetupError::Init(_)));
     }
 
     #[test]
