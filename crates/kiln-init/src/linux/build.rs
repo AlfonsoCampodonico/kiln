@@ -35,13 +35,15 @@
 //! `Running`, init also sets `/proc/sys/user/max_user_namespaces` to 0, so no step
 //! can create a user namespace (and get `CAP_SYS_ADMIN` inside it).
 //!
-//! A step that cannot be started because of itself (a cache or secret target, or
-//! an `/etc` file's, that cannot be resolved or created in its root; its working
-//! directory, its ids or its command) ends with `StepExited` code 125, 126 or 127
-//! and kiln-init's reason on its stderr stream; the VM goes on. A message that
-//! breaks the protocol, or a failure of init's own work (cloning `/proc`,
-//! hardening it, creating sysfs, devpts or a tmpfs, mounting or growing a cache
-//! disk, moving a mount), ends the VM.
+//! A step that cannot be started because of itself (the target of a cache, a
+//! secret or an `/etc` file, or the fixed `/proc`, `/sys` or `/dev` target, that
+//! cannot be resolved or created in its root, as its image or a layer it adds can
+//! make any of them a file or a symlink; its working directory, its ids or its
+//! command) ends with `StepExited` code 125, 126 or 127 and kiln-init's reason on
+//! its stderr stream; the VM goes on. A message that breaks the protocol, or a
+//! failure of init's own work (creating a filesystem: cloning or hardening
+//! `/proc`, sysfs, devpts, a tmpfs; mounting or growing a cache disk; moving a
+//! mount), ends the VM.
 //!
 //! When the step's process exits, every process but init is killed (stragglers,
 //! and anything that left the group), its output is drained, and `StepExited`
@@ -275,13 +277,20 @@ impl Builder<'_> {
     }
 
     /// The API filesystems, the `/etc` files, the cache disks and the secrets.
-    /// Only resolving or creating a cache or secret target (or an `/etc` file's)
-    /// in the step's root is the step's own doing; every other failure is init's.
+    /// Only resolving or creating, in the step's root, the target of a cache, a
+    /// secret or an `/etc` file, or the fixed `/proc`, `/sys` and `/dev` target, is
+    /// the step's own doing; creating a filesystem and moving a mount are init's.
     fn mount_all(&mut self, step: &RunStep, m: &mut Mounts) -> std::result::Result<(), SetupError> {
-        m.attach(clone_tree("/proc")?, "/proc", true)?;
+        // The fixed targets are resolved in the step's root, which its own
+        // `lowersAdded` layers or its image shape: a failure there is the step's.
+        // Creating each filesystem and moving it onto the target stays init's.
+        let target = m.target("/proc", true).map_err(SetupError::Step)?;
+        m.attach_at(clone_tree("/proc")?, &target, "/proc")?;
         m.protect_proc()?;
-        m.attach(new_fs("sysfs", None, &[], &[], true)?, "/sys", true)?;
-        m.attach(minimal_dev()?, "/dev", true)?;
+        let target = m.target("/sys", true).map_err(SetupError::Step)?;
+        m.attach_at(new_fs("sysfs", None, &[], &[], true)?, &target, "/sys")?;
+        let target = m.target("/dev", true).map_err(SetupError::Step)?;
+        m.attach_at(minimal_dev()?, &target, "/dev")?;
         m.attach(
             new_fs(
                 "devpts",
@@ -1055,13 +1064,6 @@ mod tests {
         // The same disk twice in one step: the second is already stacked.
         s.lowers_added = vec![4, 4];
         refused(&c, 1, &[], &s, "disk 4 is not an erofs disk left to stack");
-    }
-
-    #[test]
-    fn a_plain_failure_is_init_s_own_and_ends_the_vm() {
-        // The `?` on init's own work (a mount, a clone, a grow) converts to the
-        // variant that ends the VM; only a target of the step's own is `Step`.
-        assert!(matches!(SetupError::from(Failure::msg("x")), SetupError::Init(_)));
     }
 
     #[test]

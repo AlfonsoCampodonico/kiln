@@ -10,6 +10,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use kiln_erofs::testtar::{Opts, TarBuilder};
 use kiln_erofs::{Image, LayerWriter, Limits};
 use kiln_proto::{Command, StepSealed};
 use kiln_run::build::{BuildSpec, Exit, KILL_WAIT, RunStep, STEP_GRACE, Secret, StepOutcome, Stream};
@@ -429,6 +430,73 @@ fn a_failed_mount_setup_fails_the_step_not_the_vm(backend: Backend) {
     vm.finish().expect("the guest ends the VM");
 }
 
+/// A layer a step adds can make a fixed mount target unresolvable: here `/dev`
+/// is a regular file in it. The step ends with 125 and the reason on its stderr
+/// (the target is the step's doing, though init mounts `/dev` itself); the VM
+/// goes on. A stacked layer stays stacked, so the next step runs once it stacks a
+/// layer that puts a directory back at `/dev`.
+fn a_layer_that_breaks_a_fixed_target_fails_the_step_not_the_vm(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let dev_file = TarBuilder::new()
+        .file("dev", b"not a directory", &Opts::default())
+        .finish();
+    let dev_dir = TarBuilder::new().dir("dev", &Opts::default().mode(0o755)).finish();
+    let layers = support::convert_tars("dev-file", vec![support::base_tar(), dev_file, dev_dir]);
+    let spec = spec(&c, backend, layers, 1);
+    let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
+    let mut bad = sh(1, "echo must-not-run");
+    bad.lowers_added = vec![1];
+    let (o, out, err) = run(&mut vm, bad);
+    assert_eq!(
+        o,
+        StepOutcome {
+            exit: Exit::Code(125),
+            sealed: None
+        },
+        "{out}\n{err}"
+    );
+    assert_eq!(out, "");
+    assert!(
+        err.contains("set up the step's mounts") && err.contains("/dev"),
+        "the reason is on stderr: {err}"
+    );
+    let mut next = sh(2, "test -d /dev && echo ok");
+    next.lowers_added = vec![2];
+    let (o, out, err) = run(&mut vm, next);
+    assert_eq!(o.exit, Exit::Code(0), "{out}\n{err}");
+    assert_eq!(out, "ok\n");
+    assert!(o.sealed.is_some());
+    vm.finish().expect("the guest ends the VM");
+}
+
+/// A cache target that is a regular file in the image (`/etc/passwd` here, the
+/// spec's cache target) fails the step with 125, not the VM.
+fn a_cache_target_that_is_a_file_fails_the_step_not_the_vm(backend: Backend) {
+    let Some(c) = Case::new(backend) else { return };
+    let mut spec = spec(&c, backend, vec![fixtures().base[0].clone()], 1);
+    spec.cache_disks[0].1 = "/etc/passwd".into();
+    let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
+    let mut bad = sh(1, "echo must-not-run");
+    bad.mounts = vec!["/etc/passwd".into()];
+    let (o, out, err) = run(&mut vm, bad);
+    assert_eq!(
+        o,
+        StepOutcome {
+            exit: Exit::Code(125),
+            sealed: None
+        },
+        "{out}\n{err}"
+    );
+    assert!(
+        err.contains("set up the step's mounts") && err.contains("/etc/passwd"),
+        "{err}"
+    );
+    let (o, out, err) = run(&mut vm, sh(2, "echo still-works"));
+    assert_eq!(o.exit, Exit::Code(0), "{out}\n{err}");
+    assert_eq!(out, "still-works\n");
+    vm.finish().expect("the guest ends the VM");
+}
+
 /// Before `Running` kiln-init sets `max_user_namespaces` to 0: a step cannot
 /// create a user namespace, and the steps after the attempt still run.
 fn a_step_cannot_create_user_namespaces(backend: Backend) {
@@ -674,6 +742,8 @@ boot_tests!(
     build_steps_seal_stack_and_convert,
     steps_cannot_reach_the_output_disk,
     a_failed_mount_setup_fails_the_step_not_the_vm,
+    a_layer_that_breaks_a_fixed_target_fails_the_step_not_the_vm,
+    a_cache_target_that_is_a_file_fails_the_step_not_the_vm,
     a_step_cannot_create_user_namespaces,
     source_date_epoch_clamps_the_diff,
     a_version_2_guest_is_refused_build_mode,
