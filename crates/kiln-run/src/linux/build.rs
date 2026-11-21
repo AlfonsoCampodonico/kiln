@@ -509,7 +509,7 @@ impl Drop for BuildVm {
         }
         let _ = rustix::io::write(&self.wake, b"x");
         if let Some(l) = self.listener.take() {
-            let _ = l.join();
+            join_draining(l, &self.events);
         }
         // Unblocks readers waiting on a full channel.
         while self.events.try_recv().is_ok() {}
@@ -519,6 +519,16 @@ impl Drop for BuildVm {
         drop(self.scratch_dir.take());
         drop(self.run_dir.take());
     }
+}
+
+/// Joins `handle`, draining `events` meanwhile: a thread blocked sending into
+/// the full channel cannot see its wake-up until someone makes room.
+fn join_draining<T>(handle: JoinHandle<()>, events: &Receiver<T>) {
+    while !handle.is_finished() {
+        while events.try_recv().is_ok() {}
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let _ = handle.join();
 }
 
 /// Accepts on the control, stdout and stderr ports until woken. The control
@@ -551,8 +561,8 @@ fn listen(
         if ready.last().copied().unwrap_or(true) {
             return;
         }
-        for (i, (p, l)) in listeners.iter().enumerate() {
-            if !ready[i] {
+        for ((p, l), is_ready) in listeners.iter().zip(ready) {
+            if !is_ready {
                 continue;
             }
             let stream = match l.accept() {
@@ -659,7 +669,8 @@ fn read_stream(mut from: UnixStream, which: Stream, tx: &SyncSender<Event>) {
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if tx.send(Event::Output(which, buf[..n].to_vec())).is_err() {
+                let Some(chunk) = buf.get(..n) else { break };
+                if tx.send(Event::Output(which, chunk.to_vec())).is_err() {
                     return;
                 }
             }
@@ -668,4 +679,22 @@ fn read_stream(mut from: UnixStream, which: Stream, tx: &SyncSender<Event>) {
         }
     }
     let _ = tx.send(Event::Eof(which));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_draining_frees_a_thread_blocked_on_a_full_channel() {
+        let (tx, rx) = sync_channel::<u32>(2);
+        let h = std::thread::spawn(move || {
+            for i in 0..1000 {
+                if tx.send(i).is_err() {
+                    return;
+                }
+            }
+        });
+        join_draining(h, &rx);
+    }
 }
