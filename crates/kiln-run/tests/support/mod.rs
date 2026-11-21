@@ -179,10 +179,10 @@ fn fixtures_dir() -> PathBuf {
 
 const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000:App:/home/app:/bin/sh\n";
 const GROUP: &str = "root:x:0:\ntty:x:5:\napp:x:1000:\nextra:x:2000:app\nmore:x:3000:app\n";
-const APPLETS: [&str; 33] = [
+const APPLETS: [&str; 34] = [
     "[", "cat", "date", "dd", "df", "echo", "env", "false", "grep", "head", "hostname", "id", "ip", "kill", "ls",
     "mknod", "mount", "nc", "nslookup", "printf", "pwd", "readlink", "rm", "seq", "sh", "sleep", "stat", "stty",
-    "test", "tr", "true", "tty", "wc",
+    "test", "timeout", "tr", "true", "tty", "wc",
 ];
 
 /// Each entry's path and mtime in a ustar/PAX archive (PAX `path` and `mtime`

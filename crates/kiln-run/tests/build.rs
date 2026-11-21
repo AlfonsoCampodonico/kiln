@@ -457,8 +457,8 @@ fn a_seal_outside_the_disk_is_passed_through(backend: Backend) {
 /// Egress is per step in a VM with a network: off, on, off again, through
 /// vmkit's `Vm::set_egress` (needs pasta, nft and the internet: KILN_TEST_NET=1).
 /// Each step probes a new TCP connection to 1.1.1.1:80 (printing `nc`'s own exit
-/// status and the first bytes of the reply) and two DNS queries (the guest's resolver, the gateway,
-/// and 1.1.1.1 directly). Open steps must connect (the open probe is retried up to 3
+/// status and the first bytes of the reply) and two DNS queries (to the gateway, which is the
+/// guest's resolver, and to 1.1.1.1 directly), each under its own time limit. Open steps must connect (the open probe is retried up to 3
 /// times, as the internet may blink; the closed probes never are). Closed steps
 /// must neither connect nor resolve. (Whether an open step's DNS answers depends on the
 /// host's resolver and is only reported, not asserted.) Not checked: a connection an earlier step
@@ -474,13 +474,19 @@ fn egress_follows_each_step(backend: Backend) {
     spec.network = true;
     let mut vm = BuildVm::start(&store(), spec).expect("boot the build VM");
     let gateway = kiln_run::config::GATEWAY;
-    // `nc` ends the pipeline, so `$?` is its own exit status. DNS goes to the
-    // guest's resolver (the gateway) and straight to 1.1.1.1.
+    // `nc` ends the pipeline, so `$?` is its own exit status (or `timeout`'s 143
+    // if it hangs). DNS goes to the guest's resolver (the gateway) and straight to
+    // 1.1.1.1. Every probe is bounded (10 + 8 + 8 s, well under the step's 60 s), so
+    // a probe that hangs fails that probe instead of timing out the step, which
+    // would kill the VM before the open probe could be retried. `t=` is each
+    // probe's time in seconds, for diagnosis.
     let probe = format!(
-        "printf 'HEAD / HTTP/1.0\\r\\n\\r\\n' | nc -w 5 1.1.1.1 80 > /dev/shm/rep 2>/dev/null; rc=$?; \
-         echo \"nc={{$rc}} head=[$(head -c 8 /dev/shm/rep)]\"; \
-         nslookup example.com {gateway} >/dev/null 2>&1; echo \"dns={{$?}}\"; \
-         nslookup example.com 1.1.1.1 >/dev/null 2>&1; echo \"dnsx={{$?}}\""
+        "s=$(date +%s); printf 'HEAD / HTTP/1.0\\r\\n\\r\\n' | timeout 10 nc -w 5 1.1.1.1 80 > /dev/shm/rep 2>/dev/null; rc=$?; \
+         echo \"nc={{$rc}} head=[$(head -c 8 /dev/shm/rep)] t=$(($(date +%s) - s))\"; \
+         s=$(date +%s); timeout 8 nslookup example.com {gateway} >/dev/null 2>&1; \
+         echo \"dns={{$?}} t=$(($(date +%s) - s))\"; \
+         s=$(date +%s); timeout 8 nslookup example.com 1.1.1.1 >/dev/null 2>&1; \
+         echo \"dnsx={{$?}} t=$(($(date +%s) - s))\""
     );
     let mut next_id = 1;
     // (label, network) in order; the open step may take up to 3 attempts.
