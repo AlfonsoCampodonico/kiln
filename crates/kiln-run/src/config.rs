@@ -115,6 +115,9 @@ pub fn build(image: &ImageProcess, services: &[ImageService], opts: &RunOptions,
         // The session sets what remains of the boot timeout when it sends
         // `Config`; the largest value is what the size check must allow for.
         ready_timeout_ms: (!services.is_empty()).then_some(u32::MAX),
+        mode: kiln_proto::Mode::Run,
+        disks: Vec::new(),
+        source_date_epoch: None,
         services,
     };
     check_size(&config)?;

@@ -15,6 +15,9 @@ kiln-proto = { path = "../kiln-proto" }
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.5", features = ["fs", "mount", "net", "pipe", "process", "pty", "stdio", "system", "termios", "thread"] }
 signal-hook = { version = "0.4.4", default-features = false, features = ["iterator"] }
+# The seal hashes each diff (linux::seal).
+sha2 = "0.11.0"
 
 [dev-dependencies]
+kiln-erofs = { path = "../kiln-erofs" }
 tempfile = "3.27.0"

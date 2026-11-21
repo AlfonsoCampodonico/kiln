@@ -380,7 +380,7 @@ fn read_optional(path: &str) -> Result<String> {
 }
 
 /// SIGCHLD, and SIGINT (Ctrl-Alt-Del) or SIGTERM as `Shutdown`, go to the supervisor.
-fn watch_signals(events: Sender<Event>) -> Result<()> {
+pub(super) fn watch_signals(events: Sender<Event>) -> Result<()> {
     let mut signals = Signals::new([SIGCHLD, SIGINT, SIGTERM]).context("install signal handlers")?;
     std::thread::Builder::new()
         .name("signals".into())
@@ -395,18 +395,18 @@ fn watch_signals(events: Sender<Event>) -> Result<()> {
     Ok(())
 }
 
-fn connect(port: u32) -> Result<Vsock> {
+pub(super) fn connect(port: u32) -> Result<Vsock> {
     Vsock::connect(HOST_CID, port).context(format!("connect to the host on vsock port {port}"))
 }
 
-fn pipe() -> Result<(File, File)> {
+pub(super) fn pipe() -> Result<(File, File)> {
     let (r, w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).context("pipe")?;
     Ok((File::from(r), File::from(w)))
 }
 
 /// Gives the workload's user its stdio, as runc does: a non-root user could
 /// otherwise not reopen `/dev/stdout` or `/proc/self/fd/N`.
-fn give(fd: impl AsFd, id: &Identity) -> Result<()> {
+pub(super) fn give(fd: impl AsFd, id: &Identity) -> Result<()> {
     rustix::fs::fchown(fd, Some(Uid::from_raw(id.uid)), Some(Gid::from_raw(id.gid))).context("chown the stdio")
 }
 

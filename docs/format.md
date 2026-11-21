@@ -1,6 +1,6 @@
 # kiln formats
 
-This document is normative. It defines the **kiln image** (schema versions 1 and 2, provisional until M3 adds kernel and init layers), the **kiln snapshot** (schema version 1) and its lazy index, the **erofs profile** (format version 1), the **guest** that `kiln-init` sets up (devices, init layer, scratch disk, boot sequence) and the **control protocol** (versions 1 and 2) between `kiln-init` and the host.
+This document is normative. It defines the **kiln image** (schema versions 1 and 2, provisional until M3 adds kernel and init layers), the **kiln snapshot** (schema version 1) and its lazy index, the **erofs profile** (format version 1), the **guest** that `kiln-init` sets up (devices, init layer, scratch disk, boot sequence) and the **control protocol** (versions 1 to 3) between `kiln-init` and the host.
 
 ## kiln image, schema versions 1 and 2
 
@@ -373,7 +373,7 @@ Growing online to 64 GiB works on Firecracker. On Cloud Hypervisor 53 the resize
 
 ## Control protocol
 
-This section defines versions 1 and 2. Version 2 adds `Config.services`, `Config.readyTimeoutMs` and `Exited.service`, and widens `Config.shutdownGraceSecs` to the stop that follows a process's exit, and nothing else; a version adds message types, optional fields and values, and never changes what an earlier version defines (spec §9.8).
+This section defines versions 1 to 3. Version 2 adds `Config.services`, `Config.readyTimeoutMs` and `Exited.service`, and widens `Config.shutdownGraceSecs` to the stop that follows a process's exit, and nothing else; version 3 adds build mode (`Config.mode`, `Config.disks`, `Config.sourceDateEpoch`, `RunStep`, `Finish`, `StepExited`, `StepSealed`, below) and nothing else; a version adds message types, optional fields and values, and never changes what an earlier version defines (spec §9.8).
 
 Version 1 was frozen at the first `kiln-init` release. It includes what the kiln-shim exec and volumes work added before any release (spec §9.8): the exec message types 10 to 16, vsock port 1029, `Config.volumes` and `Config.podDisk`, and `Config.network.search`, `options` and `ipv6`. Those are specified for now by `docs/superpowers/specs/2026-10-30-kiln-shim-exec-volumes-design.md` (and the IPv6 design, `docs/superpowers/specs/2026-10-21-guest-ipv6.md`), not in the tables below.
 
@@ -399,7 +399,7 @@ A frame is a `u32` little-endian length, then a `u8` message type, then the payl
 
 | Type | Name | Direction | Payload |
 |---|---|---|---|
-| 1 | `Hello` | guest → host | `{"protocol": 2}`: the highest protocol version the guest implements, at least 1. |
+| 1 | `Hello` | guest → host | `{"protocol": 3}`: the highest protocol version the guest implements, at least 1. |
 | 2 | `Config` | host → guest | The run's configuration (below). |
 | 3 | `Stage` | guest → host | `{"n": 3}`: init entered stage `n` (1–7). Sent for stages 3 to 7; stages 1 and 2 precede it. |
 | 4 | `Running` | guest → host | `{}`: the main process started (after every service was ready). |
@@ -408,6 +408,12 @@ A frame is a `u32` little-endian length, then a `u8` message type, then the payl
 | 7 | `Shutdown` | host → guest | `{"graceSecs": 10}`. |
 | 8 | `Signal` | host → guest | `{"sig": 1}`: a signal number from 1 to 31. |
 | 9 | `WindowSize` | host → guest | `{"rows": 24, "cols": 80}` (each 0–65535). |
+| 17 | `RunStep` | host → guest | Version 3, build mode: run one step (below). |
+| 18 | `Finish` | host → guest | Version 3, build mode: `{}`; the build is over, sync and end the VM. |
+| 19 | `StepExited` | guest → host | Version 3, build mode: `{"id": 1, "code": 0}` or `{"id": 1, "signal": 9}`: the step's command ended (exactly one of `code` 0–255 and `signal` 1–64) and its output reached EOF. |
+| 20 | `StepSealed` | guest → host | Version 3, build mode: `{"id": 1, "offset": 0, "len": 8192, "sha256": "<64 lowercase hex>", "entries": 5}` (below). |
+
+Types 10 to 16 are version 1's exec and file messages (above). Build mode's types follow them.
 
 `Config` (camelCase keys; optional fields are omitted when unset, and a reader also accepts `null` for them):
 
@@ -437,13 +443,69 @@ The whole `Config` is one frame, and a frame is at most 65536 bytes including th
 ### Session
 
 1. The guest connects port 1024 and sends `Hello`. The host answers the first `Hello` with `Config`, once per VM.
-   - **Versions.** A host supports every version from 1 to its own (2). A `Hello` naming a higher version is a violation, so a version 1 host refuses a version 2 `kiln-init`; that is by design, since `kiln run` is to boot the `kiln-init` pinned to it (spec §8.1), the two shipping together. Until kiln pins a released `kiln-init`, every run names one with `--init`, so mixed versions are expected, and this gate handles them. The host sends only what the guest's version defines for services: when the run has services (they need version 2) and the guest speaks version 1, the host sends no `Config`, kills the VM and reports 125 with an error naming the version required. The exec and volume additions of version 1 are not gated on the guest's version. A guest may use only what its version defines: `Exited.service` from a version 1 guest, or naming a service the run does not have, is a violation. The guest decodes strictly, so a version 1 `kiln-init` refuses a version 2 field (`InitFailed` at stage 2).
+   - **Versions.** A host supports every version from 1 to its own (3). A `Hello` naming a higher version is a violation, so a version 1 host refuses a version 2 `kiln-init`; that is by design, since `kiln run` is to boot the `kiln-init` pinned to it (spec §8.1), the two shipping together. Until kiln pins a released `kiln-init`, every run names one with `--init`, so mixed versions are expected, and this gate handles them. The host sends only what the guest's version defines for services: when the run has services (they need version 2) and the guest speaks version 1, or the VM is a build VM (version 3) and the guest speaks an earlier version, the host sends no `Config`, kills the VM and reports 125 with an error naming the version required. The exec and volume additions of version 1 are not gated on the guest's version. A guest may use only what its version defines: `Exited.service` from a version 1 guest, or naming a service the run does not have, is a violation. The guest decodes strictly, so a version 1 `kiln-init` refuses a version 2 field (`InitFailed` at stage 2).
    - **kiln-shim** sends no services in M3d: it cannot see the image's `dev.kiln.services` label (it never reaches the OCI runtime spec), so under it an image with services runs without them. This is a known gap; the M4 follow-up has the shim read the image config through containerd's image service and either pass the services or refuse.
 2. The guest sends `Stage` for stages 3 to 7, `Running` once the main process has started, then `Exited`, or `InitFailed` at any point. The host sends `Shutdown`, `Signal` and `WindowSize` at any time after `Config`.
 
 The host checks the order of the guest's messages: `Stage` numbers strictly increase (gaps allowed) and only stages 3 to 6 come before `Running`; `Running` comes once, at stage 6; `Stage 7` comes only after `Running`; `Exited` only at stage 7; `InitFailed` once, anywhere after `Hello`, naming a stage no earlier than the last one reported (`Running` counts as stage 7). Nothing may follow `Exited`; anything after `InitFailed` is ignored, so the failure is what is reported.
 
 The host kills the VM, and reports 125, on any violation: a message out of that order, a second connection to port 1024 (or to any port it serves), a second `Hello` (a reset guest starting over), any message before `Hello`, a protocol version it does not support, or any framing or payload error. The guest treats a framing or payload error, a second `Config`, or the host closing port 1024 as a failure (InitFailed, then the VM ends).
+
+### Build mode (version 3)
+
+`Config.mode` is `"run"` (the default, omitted) or `"build"`. In build mode `process` is empty, `tty`, `interactive`, `services`, `readyTimeoutMs`, `volumes` and `podDisk` are unset (a build VM has no services and no kiln-shim pod fields), and the guest runs the host's steps instead of a main process. A host sends a build-mode `Config` only to a guest whose `Hello` names version 3 or later: against an older guest it sends no `Config`, kills the VM, and the build VM fails to start with an error naming the version required. A version 1 or 2 guest would refuse the fields anyway (strict decoding). kiln-shim never sends a build-mode `Config`; a build-mode guest treats `ExecStart`, `ExecSignal`, `ExecWindowSize` and `FileUpdate` as violations.
+
+**Disks**, in order, nothing hot-plugged: `vda` init layer, `vdb` scratch, `vdc` the **output disk** (raw, created and sized by the host's caller, a multiple of 4096 bytes), then `Config.layers` base layers (erofs, bottom first: the boot root), then `Config.disks`, a list of `{"kind": "erofs"|"ext4", "readOnly": bool}`, one per further disk in order. `erofs` disks are layers a step stacks (`lowersAdded`), `ext4` disks are cache disks a step mounts. `layers` plus the entries of `disks` are at most 128. Disk indexes count from `vda` = 0. The host's caller budgets disks against the VMM's devices: the fixed ones are the init layer, scratch, the output disk and vsock, plus a NIC when the VM has a network.
+
+**`Config` fields** (version 3, build mode only; refused in run mode):
+
+| Field | Type | Rules |
+|---|---|---|
+| `mode` | `"run"` or `"build"`, optional | Omitted when `"run"`. |
+| `disks` | list, optional | As above. Omitted when empty. |
+| `sourceDateEpoch` | integer, optional | Seconds since the epoch. When present, every entry of every sealed diff has an mtime of at most this value, copied-up parent directories included; when absent the guest's times are kept. |
+
+**`RunStep`** (camelCase):
+
+| Field | Type | Rules |
+|---|---|---|
+| `id` | integer | The step's id (u32); the guest's answers carry it. |
+| `command` | `{"argv": [..]}` or `{"shell": ".."}` | A non-empty argv with a non-empty argv[0], or a script run as `/bin/sh -c <script>`. |
+| `env` | list of `KEY=value` | As `process.env`; the guest adds `PATH`, `HOSTNAME` and `HOME` (`/root` for uid 0, else `/`) when unset. |
+| `workdir` | string | Absolute; created as root when missing (that is part of the step's diff), then entered. |
+| `uid`, `gid` | integers | Not 4294967295. The step runs as `uid:gid` with `gid` as its only group. |
+| `lowersAdded` | list of disk indexes, optional | `erofs` entries of `Config.disks`, each at most once per VM: stacked on the root before the step, bottom first. |
+| `mounts` | list of `{"disk", "target", "readOnly"}`, optional | `ext4` entries of `Config.disks` mounted at `target` for the step (read-only if the disk is). At most 64. |
+| `secrets` | list of `{"target", "data"}`, optional | `data` is standard base64 (padded, strict). The file appears at `target`, mode 0400, owned by `uid:gid`, on a tmpfs: never in the upper or the output. At most 64. |
+| `egress` | boolean | Whether the step may reach the network. The host enforces it in the VM's network namespace; the guest does not act on it. |
+| `timeoutMs` | integer | At least 1. The host's deadline for the step and its seal; the guest does not act on it. |
+
+Targets are absolute, not `/`, without `.`, `..` or empty (`//`) components (one trailing `/` is allowed and ignored), and unique across `mounts` and `secrets`. Secrets travel inline: the whole `RunStep` is one frame, so a step's secrets are at most about 44 KiB together, and the host refuses a larger step before sending it.
+
+**Lower layers.** A step's overlay has as lower directories the base layers, the layers stacked so far and one sealed upper per successful step, at most 230 (`MAX_BUILD_LOWERS`): the guest names them all in one mount(2) data page. The host refuses a `RunStep` that would mount more with its own error, before sending anything, so the VM stays usable; its caller squashes layers or boots a new VM. The guest treats such a step as a violation.
+
+**A step**, in the guest:
+- A fresh overlay (`nodev`) is mounted with every lower so far, the newest on top, and a new upper and work directory on scratch.
+- Mounted in it, with every path resolved inside the root (`RESOLVE_IN_ROOT`, so the image's symlinks cannot lead a mount out of it): `/proc` (a clone of init's, with `/proc/sys`, `/proc/sysrq-trigger`, `/proc/irq` and `/proc/bus` bound read-only, and `/proc/kcore`, `/proc/keys`, `/proc/timer_list` and `/proc/sched_debug` masked where present: `/dev/null` over a file, an empty read-only tmpfs over a directory); a read-only `sysfs` on `/sys`; a minimal **`/dev`** (a read-only tmpfs holding only the character devices `null`, `zero`, `full`, `random`, `urandom` and `tty`, the links `ptmx` → `pts/ptmx`, `fd`, `stdin`, `stdout` and `stderr`, a `devpts` on `/dev/pts` and a tmpfs on `/dev/shm`): no block device, so neither the output disk nor a layer disk; the cache disks (`nodev`); `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf`, each only where the image has a regular file or nothing, never through a symlink; and the secrets (`nodev`).
+- Mount points that had to be created are removed after the step, so none reaches the diff. A parent directory that overlayfs copied up to create one stays in the diff (`/root` for a cache disk at `/root/.cache`), as BuildKit's do.
+- The guest connects ports 1026 and 1027 anew for each step: they carry the step's stdout and stderr, and their EOF ends its output. A connection while no step runs, or a second one in a step, is a violation.
+- The command runs in a mount namespace of its own, pivoted into the overlay with init's root detached, in its own session and process group, with a capability bounding set of Docker's defaults less `CAP_MKNOD` (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `SETGID`, `SETUID`, `SETPCAP`, `NET_BIND_SERVICE`, `NET_RAW`, `SYS_CHROOT`, `AUDIT_WRITE`, `SETFCAP`). So a step, root or not, cannot mount, cannot make a device node, and cannot reach init's root through `/proc/1/root`. The `/proc` paths are read-only or masked because a root step could otherwise set `kernel.core_pattern` or `kernel.modprobe`, and the kernel would run the helper with full capabilities in init's mount namespace, where the output disk is visible. `Signal` goes to the step's process group.
+- When the command's process exits, every other process in the guest is killed, the output is drained, and `StepExited` is sent. Then the step's mounts are detached and the overlay unmounted.
+
+**Sealing**, after `code` 0: the upper becomes an OCI tar diff (ustar, with PAX records for long paths and link targets, large ids, sizes and times, and `SCHILY.xattr.*`):
+- an overlay whiteout (character device 0:0) becomes `.wh.<name>`; an opaque directory (`trusted.overlay.opaque`) gets `.wh..wh..opq`, kept only where a lower layer has that path;
+- inodes with several links become hard links to their first path; sockets are skipped;
+- extended attributes: `user.*` (except `user.overlay.*`) and `security.capability` are kept; everything else (`trusted.*`, other `security.*`, `system.*`) is dropped;
+- with `sourceDateEpoch`, every entry's mtime is clamped to it;
+- paths are relative, never absolute or with `..`; names are walked in byte order.
+
+The diff is written to the output disk at `offset`, the end of the previous diff (0 for the first), and padded with zeros to a multiple of 4096: `len` includes the padding, so `[offset, offset + len)` holds the tar, its two end blocks, then only zeros. `sha256` is that range's digest and `entries` its tar entries (PAX headers not counted). The disk is flushed before `StepSealed` is sent. The upper then becomes the topmost lower. After any other exit there is no seal: the upper is discarded, and the next step starts from the state before the failed one. A diff that does not fit the output disk is a failure (`InitFailed`).
+
+`StepSealed` is guest-asserted. The host passes it through after checking only its shape and that `id` is the step's; its caller must check that the range lies within the output disk, is aligned, starts after the previous diff, holds only zeros after the tar's end, and must hash what it reads itself. Steps cannot open the output disk, but the caller should still read each diff before the next step runs.
+
+**Order**: the guest sends `Hello`, `Stage` 3 to 6, `Running` (ready for steps), then for each `RunStep`: `StepExited` with its id and, after `code` 0, `StepSealed` with its id. The host sends one `RunStep` at a time, after the previous step's last answer; `Signal` at any time; `Finish` between steps. `InitFailed` may come at any point and ends the VM. Anything else is a violation, and the host kills the VM. A `RunStep`, `Finish` or `Shutdown` while a step runs is a violation on the guest's side.
+
+**Deadlines**: at `timeoutMs` the host sends `Signal` 9 (the step's process group); if the step has not ended 10 seconds later it kills the VM. Either way the step is reported as timed out and the VM is not used again: the caller boots a new one.
 
 ### Exit codes
 

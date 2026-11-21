@@ -1500,8 +1500,10 @@ dependencies = [
 name = "kiln-init"
 version = "0.1.0"
 dependencies = [
+ "kiln-erofs",
  "kiln-proto",
  "rustix 1.1.5",
+ "sha2 0.11.0",
  "signal-hook 0.4.5",
  "tempfile",
 ]
@@ -1559,6 +1561,7 @@ dependencies = [
  "rustix 1.1.5",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "signal-hook 0.4.5",
  "tempfile",
  "thiserror 2.0.21",
@@ -3181,7 +3184,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vmkit"
 version = "0.1.0"
-source = "git+https://github.com/AlfonsoCampodonico/vmkit?rev=b1baf3a0712209dbe7c7659186ad02b702524d3e#b1baf3a0712209dbe7c7659186ad02b702524d3e"
+source = "git+https://github.com/AlfonsoCampodonico/vmkit?rev=924ae248ee09d7969bb865085d4b6a19e1736eee#924ae248ee09d7969bb865085d4b6a19e1736eee"
 dependencies = [
  "libc",
  "rustix 1.1.5",

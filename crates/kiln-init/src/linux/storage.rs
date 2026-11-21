@@ -9,13 +9,13 @@ use rustix::io::Errno;
 use rustix::mount::{FsPickFlags, MountFlags, mount};
 
 use super::{open_dir, sys};
-use crate::disks::{SCRATCH, layer_device};
+use crate::disks::{SCRATCH, disk_name};
 use crate::error::{Context, Failure, Result};
 use crate::overlay::{EMPTY_LOWER, UPPER, WORK, layer_dir, mount_data};
 
 const BLOCK: u64 = 4096;
 
-fn mkdir(path: &str) -> Result<()> {
+pub(super) fn mkdir(path: &str) -> Result<()> {
     match rustix::fs::mkdir(path, Mode::from_raw_mode(0o755)) {
         Ok(()) | Err(Errno::EXIST) => Ok(()),
         Err(e) => Err(e).context(format!("mkdir {path}")),
@@ -25,6 +25,18 @@ fn mkdir(path: &str) -> Result<()> {
 /// Mounts everything under `/kiln` and returns a descriptor of the scratch
 /// filesystem's root, which outlives the pivot (see [`finish`]).
 pub fn mount_all(config: &Config) -> Result<OwnedFd> {
+    let rw = mount_base(config, 2)?;
+    mkdir(UPPER)?;
+    mkdir(WORK)?;
+    let data = std::ffi::CString::new(mount_data(config.layers as usize)?).expect("no NUL in paths");
+    mount("overlay", "/kiln/root", "overlay", MountFlags::empty(), data.as_c_str())
+        .context("mount the root overlay")?;
+    Ok(rw)
+}
+
+/// `/kiln`, the base layers (from disk index `first`) and the grown scratch
+/// disk, without the overlay: run mode adds it, build mode mounts one per step.
+pub fn mount_base(config: &Config, first: usize) -> Result<OwnedFd> {
     mount(
         "tmpfs",
         "/kiln",
@@ -38,22 +50,23 @@ pub fn mount_all(config: &Config) -> Result<OwnedFd> {
     }
     let layers = config.layers as usize;
     for n in 0..layers {
-        let (dev, dir) = (layer_device(n), layer_dir(n));
+        let (dev, dir) = (format!("/dev/{}", disk_name(first + n)), layer_dir(n));
         mkdir(&dir)?;
         mount(dev.as_str(), dir.as_str(), "erofs", MountFlags::RDONLY, None).context(format!("mount layer {dev}"))?;
     }
     mount(SCRATCH, "/kiln/rw", "ext4", MountFlags::empty(), c"noinit_itable").context(format!("mount {SCRATCH}"))?;
     let rw = open_dir("/kiln/rw")?;
     grow(&rw, config.scratch.size_bytes)?;
-    mkdir(UPPER)?;
-    mkdir(WORK)?;
-    let data = std::ffi::CString::new(mount_data(layers)?).expect("no NUL in paths");
-    mount("overlay", "/kiln/root", "overlay", MountFlags::empty(), data.as_c_str())
-        .context("mount the root overlay")?;
     Ok(rw)
 }
 
 /// Grows the scratch filesystem online to `size` bytes (spec §9.4).
+pub(super) fn grow_to_device(rw: &OwnedFd, dev: &str) -> Result<()> {
+    let d = rustix::fs::open(dev, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).context(format!("open {dev}"))?;
+    let size = rustix::fs::seek(&d, SeekFrom::End(0)).context(format!("size of {dev}"))?;
+    sys::ext4_resize(rw, size / BLOCK).context(format!("grow {dev} to {size} bytes"))
+}
+
 fn grow(rw: &OwnedFd, size: u64) -> Result<()> {
     let dev = rustix::fs::open(SCRATCH, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
         .context(format!("open {SCRATCH}"))?;

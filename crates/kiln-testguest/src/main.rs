@@ -5,7 +5,8 @@
 //!   port a second time and sends `Hello`, as a reset guest would.
 //! - As PID 1 (the init layer built around it instead of kiln-init), it speaks the
 //!   protocol itself and misbehaves as `Config.process.cmd[0]` says:
-//!   `stage-flood`, `exited-then-hang`, `second-stdout`, `no-read`, `hang-before-running`.
+//!   `stage-flood`, `exited-then-hang`, `second-stdout`, `no-read`, `hang-before-running`;
+//!   with a build-mode `Config`, it seals its first step far outside the output disk.
 //!
 //! The host must end the VM in every case.
 //!
@@ -44,6 +45,7 @@ fn main() {
         return;
     }
     let mode = match read_message::<_, HostMessage>(&mut control) {
+        Ok(Some(HostMessage::Config(c))) if c.mode == kiln_proto::Mode::Build => "build-seal-outside".to_string(),
         Ok(Some(HostMessage::Config(c))) => c.process.cmd.first().cloned().unwrap_or_default(),
         _ => String::new(),
     };
@@ -68,6 +70,38 @@ fn main() {
             std::thread::sleep(Duration::from_secs(3600));
         }
         "no-read" => boot(&mut send),
+        // Build mode: answers the first step with a seal far outside the output
+        // disk; the host passes it through (its caller checks the range).
+        "build-seal-outside" => {
+            for n in 3..=6 {
+                let _ = send(GuestMessage::Stage(Stage { n }));
+            }
+            let _ = send(GuestMessage::Running);
+            let mut reader = control.try_clone().expect("dup the control socket");
+            if let Ok(Some(HostMessage::RunStep(step))) = read_message::<_, HostMessage>(&mut reader) {
+                // Empty output: connect and close both streams.
+                drop(Vsock::connect(HOST_CID, port::STDOUT));
+                drop(Vsock::connect(HOST_CID, port::STDERR));
+                let _ = write_message(
+                    &mut control,
+                    &GuestMessage::StepExited(kiln_proto::StepExited {
+                        id: step.id,
+                        code: Some(0),
+                        signal: None,
+                    }),
+                );
+                let _ = write_message(
+                    &mut control,
+                    &GuestMessage::StepSealed(kiln_proto::StepSealed {
+                        id: step.id,
+                        offset: u64::MAX - 4095,
+                        len: 1 << 40,
+                        sha256: "ab".repeat(32),
+                        entries: 0,
+                    }),
+                );
+            }
+        }
         _ => {
             let _ = send(GuestMessage::Stage(Stage { n: 3 }));
         }

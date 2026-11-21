@@ -129,6 +129,9 @@ fn config() -> impl Strategy<Value = Config> {
                     volumes: Vec::new(),
                     pod_disk: None,
                     ready_timeout_ms: (!services.is_empty()).then_some(ready_ms),
+                    mode: kiln_proto::Mode::Run,
+                    disks: Vec::new(),
+                    source_date_epoch: None,
                     services,
                 }
             },

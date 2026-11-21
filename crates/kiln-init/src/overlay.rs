@@ -34,6 +34,26 @@ pub fn mount_data(layers: usize) -> Result<String> {
     Ok(data)
 }
 
+/// A build step's overlay (spec §9.8 build mode): `lowers` bottom first (base
+/// layers, stacked layers, sealed uppers), named top first, over `upper`.
+pub fn step_mount_data(lowers: &[String], upper: &str, work: &str) -> Result<String> {
+    let lower = if lowers.is_empty() {
+        EMPTY_LOWER.to_string()
+    } else {
+        lowers.iter().rev().cloned().collect::<Vec<_>>().join(":")
+    };
+    let data =
+        format!("lowerdir={lower},upperdir={upper},workdir={work},xino=on,redirect_dir=off,index=off,metacopy=off");
+    if data.len() > MAX_DATA {
+        return Err(Failure::msg(format!(
+            "{} lower layers exceed what one overlay mount can name ({} bytes)",
+            lowers.len(),
+            data.len()
+        )));
+    }
+    Ok(data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,6 +66,25 @@ mod tests {
              workdir=/kiln/rw/work,xino=on,redirect_dir=off,index=off,metacopy=off"
         );
         assert!(mount_data(0).unwrap().starts_with("lowerdir=/kiln/empty,"));
+    }
+
+    /// Ruling 2: a build step's overlay names up to `MAX_BUILD_LOWERS` lowers,
+    /// with the longest names kiln-init gives them (three-digit indexes, the
+    /// longest prefix), in one page.
+    #[test]
+    fn the_most_build_lowers_fit_in_a_page() {
+        let max = kiln_proto::MAX_BUILD_LOWERS;
+        let lowers: Vec<String> = (0..max).map(|i| layer_dir(100 + i % 900)).collect();
+        let (upper, work) = (format!("/kiln/rw/u/{max}"), format!("/kiln/rw/w/{max}"));
+        let data = step_mount_data(&lowers, &upper, &work).unwrap();
+        assert!(data.len() <= MAX_DATA, "{}", data.len());
+        let more: Vec<String> = (0..max + 10).map(|i| layer_dir(100 + i)).collect();
+        assert!(step_mount_data(&more, &upper, &work).is_err());
+        assert!(
+            step_mount_data(&[], &upper, &work)
+                .unwrap()
+                .starts_with("lowerdir=/kiln/empty,")
+        );
     }
 
     #[test]

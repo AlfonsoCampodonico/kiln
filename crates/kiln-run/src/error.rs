@@ -19,6 +19,15 @@ pub enum Error {
     Refused(String),
     #[error("invalid {what}: {reason}")]
     Invalid { what: &'static str, reason: String },
+    /// A build step would mount more lower layers than a build VM's overlay can
+    /// name (`kiln_proto::MAX_BUILD_LOWERS`): base layers, stacked layers and
+    /// one sealed upper per successful step. Refused before anything is sent, so
+    /// the VM is still usable: finish it, then squash layers or boot a new one.
+    #[error(
+        "step {step} would mount {lowers} lower layers, more than a build VM's {max}: squash layers or boot a new \
+         build VM"
+    )]
+    TooManyLowers { step: u32, lowers: usize, max: usize },
     /// SIGINT or SIGTERM arrived during setup: the run was abandoned (exit 137).
     #[error("interrupted before the guest started")]
     Interrupted,
