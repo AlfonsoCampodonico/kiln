@@ -436,20 +436,28 @@ impl BuildProtocol {
             GuestMessage::StepSealed(s)
                 if self.step == Some(s.id) && self.exited.is_some_and(|e| e.code == Some(0)) =>
             {
-                let end = s.offset.checked_add(s.len);
-                if s.len == 0
-                    || !s.offset.is_multiple_of(DIFF_ALIGN)
-                    || !s.len.is_multiple_of(DIFF_ALIGN)
-                    || s.offset != self.next_offset
-                    || end.is_none_or(|e| e > self.output_size)
-                {
-                    return Err(format!(
-                        "StepSealed for step {}: range {}+{} is not an aligned diff of the output disk \
-                         ({} bytes) starting at {}",
+                let refused = |why: &str| {
+                    format!(
+                        "StepSealed for step {}: range {}+{} is refused: {why} (output disk {} bytes, next diff at {})",
                         s.id, s.offset, s.len, self.output_size, self.next_offset
-                    ));
+                    )
+                };
+                if s.len == 0 {
+                    return Err(refused("the range is empty"));
                 }
-                self.next_offset = end.unwrap_or(self.next_offset);
+                if !s.offset.is_multiple_of(DIFF_ALIGN) || !s.len.is_multiple_of(DIFF_ALIGN) {
+                    return Err(refused("the range is not aligned"));
+                }
+                if s.offset != self.next_offset {
+                    return Err(refused("it does not start where the previous diff ended"));
+                }
+                let Some(end) = s.offset.checked_add(s.len) else {
+                    return Err(refused("offset + len overflows"));
+                };
+                if end > self.output_size {
+                    return Err(refused("it ends past the output disk"));
+                }
+                self.next_offset = end;
                 let sealed = s.clone();
                 self.step = None;
                 return Ok(BuildEvent::Sealed(sealed));
@@ -802,22 +810,33 @@ mod tests {
             p.start_step(id).unwrap();
             assert!(matches!(p.accept(&exited(id, 0)), Ok(BuildEvent::Exited(_))));
         };
+        // Each row is refused by the check that names it, not by an earlier one.
         let bad = [
-            ("unaligned offset", 100, 4096),
-            ("unaligned length", 0, 100),
-            ("empty", 0, 0),
-            ("not at the previous end (a gap)", 4096, 4096),
-            ("past the disk", 0, DISK + 4096),
-            ("offset + len overflows", 4096 * 3, u64::MAX - 4095),
-            ("far outside", u64::MAX - 4095, 1 << 40),
+            ("unaligned offset", 100, 4096, "not aligned"),
+            ("unaligned length", 0, 100, "not aligned"),
+            ("empty", 0, 0, "empty"),
+            ("not at the previous end (a gap)", 4096, 4096, "does not start where"),
+            ("past the disk", 0, DISK + 4096, "past the output disk"),
+            ("far outside", u64::MAX - 4095, 1 << 40, "does not start where"),
         ];
-        for (what, offset, len) in bad {
+        for (what, offset, len, check) in bad {
             let mut p = BuildProtocol::new(DISK);
             boot(&mut p);
             start(&mut p, 1);
             let why = p.accept(&seal_at(1, offset, len)).unwrap_err();
-            assert!(why.contains("StepSealed for step 1"), "{what}: {why}");
+            assert!(
+                why.contains("StepSealed for step 1") && why.contains(check),
+                "{what}: {why}"
+            );
         }
+        // The overflow check is reached only by a seal that starts where the previous one ended.
+        let mut p = BuildProtocol::new(DISK);
+        boot(&mut p);
+        start(&mut p, 1);
+        assert!(matches!(p.accept(&seal_at(1, 0, 8192)), Ok(BuildEvent::Sealed(_))));
+        start(&mut p, 2);
+        let why = p.accept(&seal_at(2, 8192, u64::MAX - 4095)).unwrap_err();
+        assert!(why.contains("overflows"), "{why}");
         // Contiguous seals fill the disk exactly; one byte-aligned block past it is refused.
         let mut p = BuildProtocol::new(DISK);
         boot(&mut p);
