@@ -15,8 +15,12 @@
 //! devices: `null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx` and the
 //! `fd`/`stdin`/`stdout`/`stderr` links), `/dev/pts`, `/dev/shm`, its cache
 //! disks, the `/etc` files and its secrets mounted in it. Every mount point that had to be
-//! created is a "stub", removed again after the step, so none reaches its diff;
-//! secrets and the `/etc` files live on a detached tmpfs and are bind-mounted
+//! created is a "stub", removed again after the step, so no stub is in its diff.
+//! The directories overlayfs copied up to make a stub (the `etc/` of an image
+//! with no `/etc/resolv.conf`, the `root/` of a cache mount at `/root/.cache`)
+//! stay, as plain directory entries, in the diff of every step that needed them:
+//! a bind mount needs an existing target, so a stub is made, never skipped.
+//! Secrets and the `/etc` files live on a detached tmpfs and are bind-mounted
 //! onto their targets, so they are never written to the upper. Paths inside the
 //! root are resolved with `RESOLVE_IN_ROOT`, so the image's symlinks cannot lead
 //! a mount out of it. The step runs in its own mount namespace, pivoted into the
