@@ -7,8 +7,10 @@
 //! Paths are relative (no leading `/`, never `..`); directories end in `/`.
 //! [`TarWriter::entry`] refuses a path that is not, a hard link target that is
 //! not, and an extended attribute name that holds `=` or NUL (a PAX key ends at
-//! the first `=`). A path, link target or attribute name that is not UTF-8 is
-//! written as it is, with a PAX `hdrcharset=BINARY` record, as POSIX asks.
+//! the first `=`). A path or link target that is not UTF-8 is written as it is
+//! (its raw bytes in the ustar field, or in a PAX `path` or `linkpath` record),
+//! and a PAX `hdrcharset=BINARY` record, as POSIX asks, goes only with a `path`
+//! or `linkpath` record that holds such bytes: it has no effect anywhere else.
 //! `entries` counts the logical entries, not the PAX headers. The archive ends
 //! with two zero blocks, then zeros up to the alignment the output disk asks for,
 //! so the range a reader is told about holds nothing after the tar's end.
@@ -228,9 +230,9 @@ impl<W: Write> TarWriter<W> {
             Kind::Fifo => (b'6', 0, b""),
         };
         let mut pax = Vec::new();
-        let binary = std::str::from_utf8(&name).is_err()
-            || std::str::from_utf8(link).is_err()
-            || node.xattrs.iter().any(|(k, _)| std::str::from_utf8(k).is_err());
+        // `hdrcharset` governs the values of the `path` and `linkpath` records only.
+        let binary = (name.len() > 100 && std::str::from_utf8(&name).is_err())
+            || (link.len() > 100 && std::str::from_utf8(link).is_err());
         if binary {
             pax.extend(pax_record(b"hdrcharset", b"BINARY"));
         }
@@ -518,14 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_that_is_not_utf8_gets_a_binary_charset_record() {
-        let short = Node::marker(b"d\xffir/f\xfe".to_vec());
-        let h = first_headers(&short);
-        assert_eq!(pax(&h), [("hdrcharset".into(), b"BINARY".to_vec())]);
-        // The ustar name holds the raw bytes.
-        let name = &h[1024..1024 + 8];
-        assert_eq!(name, b"d\xffir/f\xfe\0");
-
+    fn a_long_path_or_link_that_is_not_utf8_gets_a_binary_charset_record() {
         let mut long = b"x".repeat(150);
         long[3] = 0xfe;
         let h = first_headers(&Node::marker(long.clone()));
@@ -533,19 +528,38 @@ mod tests {
         assert_eq!(records[0], ("hdrcharset".into(), b"BINARY".to_vec()));
         assert_eq!(records[1], ("path".into(), long));
 
+        let mut target = b"t".repeat(150);
+        target[0] = 0xc0;
+        let link = Node {
+            kind: Kind::Symlink(target.clone()),
+            ..Node::marker(b"l".to_vec())
+        };
+        let records = pax(&first_headers(&link));
+        assert_eq!(records[0], ("hdrcharset".into(), b"BINARY".to_vec()));
+        assert_eq!(records[1], ("linkpath".into(), target));
+    }
+
+    #[test]
+    fn short_binary_names_and_attribute_names_get_no_charset_record() {
+        // Raw bytes in the ustar name: no PAX header at all.
+        let short = Node::marker(b"d\xffir/f\xfe".to_vec());
+        let h = first_headers(&short);
+        assert_eq!(h[156], b'0', "no PAX header");
+        assert_eq!(&h[..7], b"d\xffir/f\xfe");
         let link = Node {
             kind: Kind::Symlink(b"t\xc0".to_vec()),
             ..Node::marker(b"l".to_vec())
         };
-        assert_eq!(pax(&first_headers(&link))[0].0, "hdrcharset");
+        assert_eq!(first_headers(&link)[156], b'2', "no PAX header");
+        // A binary attribute name: the key is raw bytes, with no charset record.
         let attr = Node {
             xattrs: vec![(b"user.\xff".to_vec(), b"v".to_vec())],
             ..Node::marker(b"f".to_vec())
         };
         let h = first_headers(&attr);
         let records = pax(&h);
-        assert_eq!(records[0].0, "hdrcharset");
-        assert!(records[1].0.starts_with("SCHILY.xattr.user."));
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(records[0].0.starts_with("SCHILY.xattr.user."));
         assert!(h.windows(19).any(|w| w == b"SCHILY.xattr.user.\xff"), "the raw name");
     }
 
