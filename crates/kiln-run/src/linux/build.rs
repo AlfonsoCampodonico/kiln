@@ -17,10 +17,11 @@
 //! `finish` gives the guest [`END_TIMEOUT`] to end the VM. A protocol violation
 //! kills the VM, and the `BuildVm` refuses further steps.
 //!
-//! kiln never reads the output disk, and passes `StepSealed` through after
-//! checking only its shape and id: the caller checks the range (within the
-//! disk, aligned, after the previous diff, zeros after the tar's end) and hashes
-//! what it reads.
+//! kiln never reads the output disk. [`BuildProtocol`] checks a `StepSealed`'s
+//! shape, its id and that its range is a possible diff (aligned, starting where
+//! the previous one ended, within the disk); a guest whose seal is not is a
+//! protocol violation. The caller still checks the zeros after the tar's end
+//! and hashes what it reads.
 
 use std::collections::BTreeSet;
 use std::io::{ErrorKind, Read};
@@ -198,6 +199,7 @@ impl BuildVm {
         let mut vm = vmm.create(&vm_spec)?;
         // Boot closed: no step has asked for the network yet.
         let spec_network = spec.network;
+        let output_size = spec.output_size;
         if spec_network {
             vm.set_egress(EgressGate::Closed)?;
         }
@@ -233,7 +235,7 @@ impl BuildVm {
             events,
             tx,
             out,
-            proto: BuildProtocol::default(),
+            proto: BuildProtocol::new(output_size),
             stacked: BTreeSet::new(),
             sealed: 0,
             gate: if spec_network {
