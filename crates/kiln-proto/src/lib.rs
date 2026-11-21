@@ -23,7 +23,7 @@ mod volume;
 
 pub use build::{
     BuildDisk, Command, DIFF_ALIGN, DiskKind, MAX_BUILD_LOWERS, MAX_STEP_MOUNTS, MAX_STEP_SECRETS, Mode, RunStep,
-    Secret, StepExited, StepMount, StepSealed, base64,
+    Secret, StepExited, StepMount, StepSealed, base64, check_target,
 };
 pub use config::{
     Config, ExitMethod, Ipv6Network, MAX_LAYERS, MAX_SERVICE_NAME, MAX_SERVICES, MAX_SOCKET_PATH, MIN_SCRATCH_BYTES,

@@ -167,10 +167,18 @@ fn invalid(name: &'static str, reason: impl Into<String>) -> ProtoError {
     ProtoError::invalid(name, reason)
 }
 
-/// An absolute path that is not `/` and holds no NUL.
-fn check_target(what: &str, t: &str) -> std::result::Result<(), String> {
-    if !t.starts_with('/') || t.contains('\0') || t.split('/').all(str::is_empty) {
-        return Err(format!("{what} {t:?} is not an absolute path below /"));
+/// A step's mount or secret target: an absolute path below `/`, with no NUL, no
+/// `.` or `..` component and no empty one (`//`). One trailing `/` is allowed and
+/// ignored. Shared by the host (before boot and before sending a step) and the
+/// guest, so a target one side accepts the other does too.
+pub fn check_target(what: &str, t: &str) -> std::result::Result<(), String> {
+    let below_root = t.strip_prefix('/').map(|r| r.strip_suffix('/').unwrap_or(r));
+    let ok = !t.contains('\0')
+        && below_root.is_some_and(|r| !r.is_empty() && r.split('/').all(|c| !matches!(c, "" | "." | "..")));
+    if !ok {
+        return Err(format!(
+            "{what} {t:?} is not an absolute path below / without empty, . or .. components"
+        ));
     }
     Ok(())
 }
@@ -322,6 +330,33 @@ pub mod base64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targets_have_no_dot_dotdot_or_empty_components() {
+        for bad in [
+            "/a/../b", "/a/./b", "//a", "/a//b", "/a/..", "/./a", "/", "//", "a/b", "", "/a//", "/a\0b",
+        ] {
+            assert!(check_target("t", bad).is_err(), "{bad:?} must be refused");
+        }
+        for good in ["/a/b", "/a", "/a/", "/root/.cache", "/a/.b/..c"] {
+            assert!(check_target("t", good).is_ok(), "{good:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn a_step_refuses_non_canonical_targets_and_duplicates() {
+        for bad in ["/a/../b", "/a/./b", "//a", "/a//b"] {
+            let mut s = step();
+            s.mounts[0].target = bad.into();
+            assert!(s.validate().is_err(), "mount {bad:?}");
+            let mut s = step();
+            s.secrets[0].target = bad.into();
+            assert!(s.validate().is_err(), "secret {bad:?}");
+        }
+        let mut s = step();
+        s.secrets[0].target = "/root/.cache/".into();
+        assert!(s.validate().is_err(), "a trailing slash names the same target");
+    }
 
     pub(crate) fn step() -> RunStep {
         RunStep {

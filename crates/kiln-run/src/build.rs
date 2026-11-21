@@ -156,8 +156,11 @@ impl BuildSpec {
         }
         let mut targets = BTreeSet::new();
         for (_, t) in &self.cache_disks {
-            if !t.starts_with('/') || !targets.insert(t) {
-                return refuse(format!("cache disk target {t:?}: absolute and unique"));
+            if let Err(e) = kiln_proto::check_target("cache disk target", t) {
+                return refuse(e);
+            }
+            if !targets.insert(t.strip_suffix('/').unwrap_or(t)) {
+                return refuse(format!("cache disk target {t:?}: unique"));
             }
         }
         Ok(())
@@ -533,6 +536,18 @@ mod tests {
         c.validate().unwrap();
         assert_eq!(c.source_date_epoch, Some(1_700_000_000));
         assert_eq!(spec().config(ExitMethod::Reboot).source_date_epoch, None);
+    }
+
+    #[test]
+    fn cache_targets_are_checked_before_boot() {
+        for bad in ["/a/../b", "/a/./b", "//a", "/a//b", "rel", "/"] {
+            let mut s = spec();
+            s.cache_disks = vec![("/c0".into(), bad.into())];
+            assert!(s.check(32).is_err(), "{bad:?}");
+        }
+        let mut s = spec();
+        s.cache_disks = vec![("/c0".into(), "/x".into()), ("/c1".into(), "/x/".into())];
+        assert!(s.check(32).is_err(), "same target with a trailing slash");
     }
 
     #[test]

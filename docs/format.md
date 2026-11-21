@@ -480,7 +480,7 @@ The host kills the VM, and reports 125, on any violation: a message out of that 
 | `egress` | boolean | Whether the step may reach the network. The host enforces it in the VM's network namespace; the guest does not act on it. |
 | `timeoutMs` | integer | At least 1. The host's deadline for the step and its seal; the guest does not act on it. |
 
-Targets are absolute, not `/`, without `.` or `..` components, and unique across `mounts` and `secrets`. Secrets travel inline: the whole `RunStep` is one frame, so a step's secrets are at most about 44 KiB together, and the host refuses a larger step before sending it.
+Targets are absolute, not `/`, without `.`, `..` or empty (`//`) components (one trailing `/` is allowed and ignored), and unique across `mounts` and `secrets`. Secrets travel inline: the whole `RunStep` is one frame, so a step's secrets are at most about 44 KiB together, and the host refuses a larger step before sending it.
 
 **Lower layers.** A step's overlay has as lower directories the base layers, the layers stacked so far and one sealed upper per successful step, at most 230 (`MAX_BUILD_LOWERS`): the guest names them all in one mount(2) data page. The host refuses a `RunStep` that would mount more with its own error, before sending anything, so the VM stays usable; its caller squashes layers or boots a new VM. The guest treats such a step as a violation.
 

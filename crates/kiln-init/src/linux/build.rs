@@ -232,8 +232,9 @@ impl Builder<'_> {
             .map(|m| &m.target)
             .chain(step.secrets.iter().map(|s| &s.target))
         {
-            if t.split('/').any(|c| c == "." || c == "..") {
-                return bad(format!("target {t:?} has . or .. in it"));
+            // Defence in depth: the host already ran the same check.
+            if let Err(e) = kiln_proto::check_target("target", t) {
+                return bad(e);
             }
         }
         Ok(())
