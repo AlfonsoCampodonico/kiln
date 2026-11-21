@@ -553,7 +553,8 @@ impl Mounts {
     }
 
     /// Hardens the step's `/proc` as runc does: `PROC_READONLY` paths are bound
-    /// onto themselves read-only (a uid-0 step without `CAP_SYS_ADMIN` could
+    /// onto themselves read-only, as non-recursive clones so a submount cannot
+    /// come through writable (a uid-0 step without `CAP_SYS_ADMIN` could
     /// otherwise write `kernel.core_pattern` or `kernel.modprobe`, which the
     /// kernel runs as root in init's mount namespace, where the output disk is
     /// visible), and `PROC_MASKED` paths are covered by `/dev/null` (files) or an
@@ -568,7 +569,7 @@ impl Mounts {
             let tree = rustix::mount::open_tree(
                 rustix::fs::CWD,
                 path,
-                OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC | OpenTreeFlags::AT_RECURSIVE,
+                OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC,
             )
             .context(format!("bind {path}"))?;
             self.attach(tree, path, is_dir)?;
