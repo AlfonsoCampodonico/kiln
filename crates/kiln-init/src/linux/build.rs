@@ -213,9 +213,10 @@ impl Builder<'_> {
                 step.lowers_added.len()
             ));
         }
+        let mut added = BTreeSet::new();
         for &d in &step.lowers_added {
             match self.config.build_disk(d) {
-                Some(disk) if disk.kind == DiskKind::Erofs && !self.stacked.contains(&d) => {}
+                Some(disk) if disk.kind == DiskKind::Erofs && !self.stacked.contains(&d) && added.insert(d) => {}
                 _ => return bad(format!("disk {d} is not an erofs disk left to stack")),
             }
         }
@@ -852,5 +853,187 @@ fn failed_hook_step(pipe: &OwnedFd) -> Option<&'static str> {
     match rustix::io::read(pipe, &mut b) {
         Ok(1) => STEP_HOOK.get(usize::from(b[0])).copied(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kiln_proto::{
+        BuildDisk, Command as StepCommand, ExitMethod, Mode as ConfigMode, Process, Scratch, Secret, StepMount,
+    };
+
+    /// One base layer (disk 3), so `Config.disks` start at disk 4: two erofs
+    /// layers (4, 5), a writable cache (6) and a read-only one (7).
+    fn config() -> Config {
+        let disk = |kind, read_only| BuildDisk { kind, read_only };
+        Config {
+            process: Process::default(),
+            stop_signal: 15,
+            tty: None,
+            interactive: false,
+            hostname: "build".into(),
+            network: None,
+            layers: 1,
+            scratch: Scratch { size_bytes: 1 << 30 },
+            exit_method: ExitMethod::Poweroff,
+            shutdown_grace_secs: 1,
+            volumes: Vec::new(),
+            pod_disk: None,
+            services: Vec::new(),
+            ready_timeout_ms: None,
+            mode: ConfigMode::Build,
+            disks: vec![
+                disk(DiskKind::Erofs, true),
+                disk(DiskKind::Erofs, true),
+                disk(DiskKind::Ext4, false),
+                disk(DiskKind::Ext4, true),
+            ],
+            source_date_epoch: None,
+        }
+    }
+
+    fn step() -> RunStep {
+        RunStep {
+            id: 7,
+            command: StepCommand::Shell("true".into()),
+            env: Vec::new(),
+            workdir: "/".into(),
+            uid: 0,
+            gid: 0,
+            lowers_added: Vec::new(),
+            mounts: Vec::new(),
+            secrets: Vec::new(),
+            egress: false,
+            timeout_ms: 1000,
+        }
+    }
+
+    fn mount(disk: u32, target: &str, read_only: bool) -> StepMount {
+        StepMount {
+            disk,
+            target: target.into(),
+            read_only,
+        }
+    }
+
+    fn secret(target: &str) -> Secret {
+        Secret {
+            target: target.into(),
+            data: b"s".to_vec(),
+        }
+    }
+
+    /// `check` on a builder over `config`, with `lowers` lower directories and
+    /// `stacked` disks already stacked.
+    fn check(config: &Config, lowers: usize, stacked: &[u32], step: &RunStep) -> std::result::Result<(), String> {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("output.img");
+        std::fs::File::create(&img).unwrap();
+        let b = Builder {
+            config,
+            lowers: (0..lowers).map(|n| format!("/kiln/layers/{n}")).collect(),
+            stacked: stacked.iter().copied().collect(),
+            grown: BTreeSet::new(),
+            output: Output::open(img.to_str().unwrap()).unwrap(),
+            epoch: None,
+        };
+        b.check(step).map_err(|f| f.to_string())
+    }
+
+    fn refused(config: &Config, lowers: usize, stacked: &[u32], step: &RunStep, why: &str) {
+        let e = check(config, lowers, stacked, step).expect_err(why);
+        assert!(e.starts_with("protocol violation: RunStep 7: "), "{e}");
+        assert!(e.contains(why), "wanted {why:?} in {e:?}");
+    }
+
+    #[test]
+    fn a_step_that_matches_the_disks_is_accepted() {
+        let c = config();
+        let mut s = step();
+        s.lowers_added = vec![4, 5];
+        s.mounts = vec![
+            mount(6, "/root/.cache", false),
+            mount(7, "/ro", true),
+            mount(6, "/again/", true),
+        ];
+        s.secrets = vec![secret("/run/secrets/token")];
+        check(&c, 1, &[], &s).unwrap();
+        // A layer stacked by an earlier step is not offered again, but the others are.
+        s.lowers_added = vec![5];
+        check(&c, 3, &[4], &s).unwrap();
+    }
+
+    #[test]
+    fn layers_must_be_erofs_disks_not_stacked_yet() {
+        let c = config();
+        let mut s = step();
+        for (disk, why) in [
+            (6, "disk 6 is not an erofs disk left to stack"),
+            (7, "disk 7 is not an erofs disk left to stack"),
+            (3, "disk 3 is not an erofs disk left to stack"),
+            (8, "disk 8 is not an erofs disk left to stack"),
+            (0, "disk 0 is not an erofs disk left to stack"),
+        ] {
+            s.lowers_added = vec![disk];
+            refused(&c, 1, &[], &s, why);
+        }
+        s.lowers_added = vec![4];
+        refused(&c, 2, &[4], &s, "disk 4 is not an erofs disk left to stack");
+        // The same disk twice in one step: the second is already stacked.
+        s.lowers_added = vec![4, 4];
+        refused(&c, 1, &[], &s, "disk 4 is not an erofs disk left to stack");
+    }
+
+    #[test]
+    fn mounts_must_be_cache_disks_and_never_writable_when_the_disk_is_read_only() {
+        let c = config();
+        let mut s = step();
+        s.mounts = vec![mount(4, "/x", true)];
+        refused(&c, 1, &[], &s, "disk 4 is not a cache disk it may mount so");
+        s.mounts = vec![mount(7, "/x", false)];
+        refused(&c, 1, &[], &s, "disk 7 is not a cache disk it may mount so");
+        s.mounts = vec![mount(9, "/x", false)];
+        refused(&c, 1, &[], &s, "disk 9 is not a cache disk it may mount so");
+        s.mounts = vec![mount(7, "/x", true)];
+        check(&c, 1, &[], &s).unwrap();
+    }
+
+    #[test]
+    fn the_overlay_has_at_most_max_build_lowers_lower_directories() {
+        let c = config();
+        let mut s = step();
+        s.lowers_added = vec![4, 5];
+        check(&c, MAX_BUILD_LOWERS - 2, &[], &s).unwrap();
+        refused(
+            &c,
+            MAX_BUILD_LOWERS - 1,
+            &[],
+            &s,
+            &format!(
+                "{} lower layers and 2 more (at most {MAX_BUILD_LOWERS})",
+                MAX_BUILD_LOWERS - 1
+            ),
+        );
+        s.lowers_added.clear();
+        check(&c, MAX_BUILD_LOWERS, &[], &s).unwrap();
+        refused(&c, MAX_BUILD_LOWERS + 1, &[], &s, "at most");
+    }
+
+    #[test]
+    fn targets_follow_the_shared_rule() {
+        let c = config();
+        for bad in ["relative", "/", "", "/a/../b", "/a//b", "/a/./b", "/a\0b"] {
+            let mut s = step();
+            s.mounts = vec![mount(6, bad, false)];
+            refused(&c, 1, &[], &s, "target");
+            let mut s = step();
+            s.secrets = vec![secret(bad)];
+            refused(&c, 1, &[], &s, "target");
+        }
+        // One trailing slash is ignored by the rule.
+        let mut s = step();
+        s.mounts = vec![mount(6, "/ok/", false)];
+        check(&c, 1, &[], &s).unwrap();
     }
 }

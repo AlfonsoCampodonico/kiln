@@ -509,6 +509,76 @@ mod tests {
         assert_eq!(got[DEPTH - 1], "d/".repeat(DEPTH));
     }
 
+    /// A regular file standing in for the output disk.
+    fn disk(dir: &Path, size: u64) -> (std::path::PathBuf, OwnedFd) {
+        let path = dir.join("output.img");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(size).unwrap();
+        (path.clone(), f.into())
+    }
+
+    #[test]
+    fn a_write_past_the_end_of_the_disk_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, fd) = disk(dir.path(), 8192);
+        let mut w = DiskWriter {
+            dev: &fd,
+            pos: 4096,
+            end: 8192,
+            hash: Sha256::new(),
+        };
+        // Up to the last byte is fine.
+        w.write_all(&[7u8; 4096]).unwrap();
+        assert_eq!(w.pos, 8192);
+        let e = w.write(b"x").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::StorageFull, "{e}");
+        assert!(e.to_string().contains("8192"), "{e}");
+        // Nothing past the end was written, and the hash covers what was.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+        let data = std::fs::read(&path).unwrap();
+        assert!(data[..4096].iter().all(|&b| b == 0) && data[4096..].iter().all(|&b| b == 7));
+        assert_eq!(hex(&w.hash.finalize()), hex(&Sha256::digest([7u8; 4096])));
+        // A single write that would cross the end is refused whole.
+        let mut w = DiskWriter {
+            dev: &fd,
+            pos: 8000,
+            end: 8192,
+            hash: Sha256::new(),
+        };
+        assert_eq!(w.write(&[1u8; 300]).unwrap_err().kind(), io::ErrorKind::StorageFull);
+        assert_eq!(w.pos, 8000);
+    }
+
+    #[test]
+    fn diffs_are_packed_aligned_and_hashed_and_a_full_disk_fails_the_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _fd) = disk(dir.path(), 12288);
+        let mut out = Output::open(path.to_str().unwrap()).unwrap();
+        let upper = dir.path().join("upper");
+        std::fs::create_dir(&upper).unwrap();
+        std::fs::write(upper.join("f"), b"hello").unwrap();
+        let first = out.seal(upper.to_str().unwrap(), &[], None).unwrap();
+        assert_eq!((first.offset, first.written.len, first.written.entries), (0, 4096, 1));
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(first.sha256, hex(&Sha256::digest(&on_disk[..4096])));
+        assert_eq!(&on_disk[512..517], b"hello");
+        // The next diff starts where the last one ended.
+        let second = out.seal(upper.to_str().unwrap(), &[], None).unwrap();
+        assert_eq!((second.offset, second.written.len), (4096, 4096));
+        assert_eq!(second.sha256, first.sha256, "the same upper gives the same bytes");
+        // 4096 bytes are left; a diff of 8 KiB of data does not fit.
+        std::fs::write(upper.join("big"), vec![1u8; 8192]).unwrap();
+        let e = match out.seal(upper.to_str().unwrap(), &[], None) {
+            Ok(_) => panic!("it fits"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("write the step's diff") && e.contains("is full"), "{e}");
+        // The failed seal did not move the next offset: the disk still takes a small diff.
+        std::fs::remove_file(upper.join("big")).unwrap();
+        let third = out.seal(upper.to_str().unwrap(), &[], None).unwrap();
+        assert_eq!(third.offset, 8192);
+    }
+
     #[test]
     fn xattrs_come_out_sorted_by_name() {
         let path = std::env::temp_dir().join(format!("kiln-seal-xattr-{}", std::process::id()));
