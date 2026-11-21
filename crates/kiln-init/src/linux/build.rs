@@ -8,15 +8,20 @@
 //! Init never pivots: it keeps its own root, and each step gets a fresh overlay at
 //! `/kiln/root` (the lowers so far, a new upper and work directory on scratch;
 //! `nodev`), with `/proc` (a clone of init's, but `/proc/sys`, `/proc/sysrq-trigger`,
-//! `/proc/irq` and `/proc/bus` are bound read-only, so a root step without
+//! `/proc/irq`, `/proc/bus` and `/proc/fs` are bound read-only, so a root step without
 //! `CAP_SYS_ADMIN` cannot set `kernel.core_pattern` or `kernel.modprobe`, whose
 //! helpers the kernel runs as root in init's namespace; `/proc/kcore`, `keys`,
-//! `timer_list` and `sched_debug` are masked when present), a read-only `/sys`, a minimal `/dev` (read-only, no block
+//! `timer_list`, `sched_debug`, `acpi`, `scsi`, `latency_stats` and `timer_stats`
+//! are masked when present), a read-only `/sys`, a minimal `/dev` (read-only, no block
 //! devices: `null`, `zero`, `full`, `random`, `urandom`, `tty`, `ptmx` and the
 //! `fd`/`stdin`/`stdout`/`stderr` links), `/dev/pts`, `/dev/shm`, its cache
 //! disks, the `/etc` files and its secrets mounted in it. Every mount point that had to be
-//! created is a "stub", removed again after the step, so none reaches its diff;
-//! secrets and the `/etc` files live on a detached tmpfs and are bind-mounted
+//! created is a "stub", removed again after the step, so no stub is in its diff.
+//! The directories overlayfs copied up to make a stub (the `etc/` of an image
+//! with no `/etc/resolv.conf`, the `root/` of a cache mount at `/root/.cache`)
+//! stay, as plain directory entries, in the diff of every step that needed them:
+//! a bind mount needs an existing target, so a stub is made, never skipped.
+//! Secrets and the `/etc` files live on a detached tmpfs and are bind-mounted
 //! onto their targets, so they are never written to the upper. Paths inside the
 //! root are resolved with `RESOLVE_IN_ROOT`, so the image's symlinks cannot lead
 //! a mount out of it. The step runs in its own mount namespace, pivoted into the
@@ -26,7 +31,19 @@
 //! reach init's root through `/proc/1/root`), as its uid and gid, in its own
 //! session and process group, in its working directory (created as root when
 //! missing; that is part of the step's diff, as Docker's WORKDIR). So a step,
-//! root or not, cannot open the output disk or a layer disk (ruling 1).
+//! root or not, cannot open the output disk or a layer disk (ruling 1). Before
+//! `Running`, init also sets `/proc/sys/user/max_user_namespaces` to 0, so no step
+//! can create a user namespace (and get `CAP_SYS_ADMIN` inside it).
+//!
+//! A step that cannot be started because of itself (the target of a cache, a
+//! secret or an `/etc` file, or the fixed `/proc`, `/sys` or `/dev` target, that
+//! cannot be resolved or created in its root, as its image or a layer it adds can
+//! make any of them a file or a symlink; its working directory, its ids or its
+//! command) ends with `StepExited` code 125, 126 or 127 and kiln-init's reason on
+//! its stderr stream; the VM goes on. A message that breaks the protocol, or a
+//! failure of init's own work (creating a filesystem: cloning or hardening
+//! `/proc`, sysfs, devpts, a tmpfs; mounting or growing a cache disk; moving a
+//! mount), ends the VM.
 //!
 //! When the step's process exits, every process but init is killed (stragglers,
 //! and anything that left the group), its output is drained, and `StepExited`
@@ -62,7 +79,7 @@ use super::process::{connect, give, pipe, watch_signals};
 use super::seal::Output;
 use super::storage::{self, mkdir};
 use super::{Event, enter, host_ok, identity, relay, send, sys};
-use crate::disks::disk_name;
+use crate::disks::device;
 use crate::error::{Context, Failure, Result};
 use crate::passwd::Identity;
 
@@ -72,15 +89,16 @@ const ROOT: &str = "/kiln/root";
 pub fn run(config: &Config, events: Sender<Event>, rx: &Receiver<Event>) -> Result<()> {
     enter(3)?;
     let rw = storage::mount_base(config, Config::OUTPUT_DISK as usize + 1)?;
-    for dir in ["/kiln/rw/u", "/kiln/rw/w", "/kiln/disks", ROOT] {
+    for dir in ["/kiln/rw/u", "/kiln/rw/w", "/kiln/disks"] {
         mkdir(dir)?;
     }
     enter(4)?;
     // Init's own descriptor: no step ever sees a block device.
-    let output = Output::open(&format!("/dev/{}", disk_name(Config::OUTPUT_DISK as usize)))?;
+    let output = Output::open(&device(Config::OUTPUT_DISK as usize))?;
     enter(5)?;
     identity::network(config)?;
     enter(6)?;
+    disable_user_namespaces()?;
     watch_signals(events)?;
     // One descriptor per directory level while sealing.
     if let Some(max) = rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum {
@@ -133,6 +151,18 @@ pub fn run(config: &Config, events: Sender<Event>, rx: &Receiver<Event>) -> Resu
     Ok(())
 }
 
+/// No process may create a user namespace from now on, so a step cannot get
+/// `CAP_SYS_ADMIN` inside one (to mount, or to reach what its bounding set and
+/// its read-only `/proc` keep from it). Docker's default seccomp profile blocks
+/// them too. A kernel with no user namespaces has no limit to set.
+fn disable_user_namespaces() -> Result<()> {
+    match std::fs::write("/proc/sys/user/max_user_namespaces", "0") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Failure::os("disable user namespaces", &e)),
+    }
+}
+
 struct Builder<'a> {
     config: &'a Config,
     /// The root's lower directories, bottom first: base layers, stacked layers
@@ -153,7 +183,7 @@ impl Builder<'_> {
         for &disk in &step.lowers_added {
             let dir = format!("/kiln/disks/{disk}");
             mkdir(&dir)?;
-            let dev = format!("/dev/{}", disk_name(disk as usize));
+            let dev = device(disk as usize);
             rustix::mount::mount(dev.as_str(), dir.as_str(), "erofs", MountFlags::RDONLY, None)
                 .context(format!("mount layer {dev}"))?;
             self.stacked.insert(disk);
@@ -165,7 +195,6 @@ impl Builder<'_> {
         let (upper, work) = (format!("/kiln/rw/u/{k}"), format!("/kiln/rw/w/{k}"));
         mkdir(&upper)?;
         mkdir(&work)?;
-        mkdir(crate::overlay::EMPTY_LOWER)?;
         let data = crate::overlay::step_mount_data(&self.lowers, &upper, &work)?;
         let data = CString::new(data).expect("no NUL in paths");
         // `nodev`, defence in depth: a step has no CAP_MKNOD, and a device node a
@@ -174,9 +203,15 @@ impl Builder<'_> {
             .context("mount the step's overlay")?;
 
         let mut mounts = Mounts::new()?;
-        let ran = self
-            .mount_all(step, &mut mounts)
-            .and_then(|()| run_command(self.config, step, rx));
+        // A mount target the step's own spec or image makes impossible fails the
+        // step (125, the reason on its stderr), not the VM, as a working directory
+        // that cannot be made does. A failure of init's own mounts ends the VM.
+        let setup = match self.mount_all(step, &mut mounts) {
+            Ok(()) => Ok(()),
+            Err(SetupError::Step(f)) => Err(f),
+            Err(SetupError::Init(f)) => return Err(f),
+        };
+        let ran = run_command(self.config, step, rx, setup);
         mounts.teardown();
         match rustix::mount::unmount(ROOT, UnmountFlags::empty()) {
             Ok(()) => {}
@@ -214,9 +249,10 @@ impl Builder<'_> {
                 step.lowers_added.len()
             ));
         }
+        let mut added = BTreeSet::new();
         for &d in &step.lowers_added {
             match self.config.build_disk(d) {
-                Some(disk) if disk.kind == DiskKind::Erofs && !self.stacked.contains(&d) => {}
+                Some(disk) if disk.kind == DiskKind::Erofs && !self.stacked.contains(&d) && added.insert(d) => {}
                 _ => return bad(format!("disk {d} is not an erofs disk left to stack")),
             }
         }
@@ -241,11 +277,20 @@ impl Builder<'_> {
     }
 
     /// The API filesystems, the `/etc` files, the cache disks and the secrets.
-    fn mount_all(&mut self, step: &RunStep, m: &mut Mounts) -> Result<()> {
-        m.attach(clone_tree("/proc")?, "/proc", true)?;
+    /// Only resolving or creating, in the step's root, the target of a cache, a
+    /// secret or an `/etc` file, or the fixed `/proc`, `/sys` and `/dev` target, is
+    /// the step's own doing; creating a filesystem and moving a mount are init's.
+    fn mount_all(&mut self, step: &RunStep, m: &mut Mounts) -> std::result::Result<(), SetupError> {
+        // The fixed targets are resolved in the step's root, which its own
+        // `lowersAdded` layers or its image shape: a failure there is the step's.
+        // Creating each filesystem and moving it onto the target stays init's.
+        let target = m.target("/proc", true).map_err(SetupError::Step)?;
+        m.attach_at(clone_tree("/proc")?, &target, "/proc")?;
         m.protect_proc()?;
-        m.attach(new_fs("sysfs", None, &[], &[], true)?, "/sys", true)?;
-        m.attach(minimal_dev()?, "/dev", true)?;
+        let target = m.target("/sys", true).map_err(SetupError::Step)?;
+        m.attach_at(new_fs("sysfs", None, &[], &[], true)?, &target, "/sys")?;
+        let target = m.target("/dev", true).map_err(SetupError::Step)?;
+        m.attach_at(minimal_dev()?, &target, "/dev")?;
         m.attach(
             new_fs(
                 "devpts",
@@ -264,9 +309,10 @@ impl Builder<'_> {
         )?;
 
         for mount in &step.mounts {
-            let dev = format!("/dev/{}", disk_name(mount.disk as usize));
+            let target = m.target(&mount.target, true).map_err(SetupError::Step)?;
+            let dev = device(mount.disk as usize);
             let fs = new_fs("ext4", Some(&dev), &[], &[], mount.read_only)?;
-            if !mount.read_only && self.grown.insert(mount.disk) {
+            if !mount.read_only && !self.grown.contains(&mount.disk) {
                 let root = rustix::fs::openat(
                     &fs,
                     c".",
@@ -275,8 +321,9 @@ impl Builder<'_> {
                 )
                 .context(format!("open the cache disk {dev}"))?;
                 storage::grow_to_device(&root, &dev)?;
+                self.grown.insert(mount.disk);
             }
-            m.attach(fs, &mount.target, true)?;
+            m.attach_at(fs, &target, &mount.target)?;
         }
 
         // The `/etc` files and the secrets: one tmpfs, never part of the upper.
@@ -312,7 +359,7 @@ impl Builder<'_> {
         let tmp = new_fs("tmpfs", None, &[("mode", "0700"), ("size", "4m")], &[], false)?;
         for (i, (target, data, uid, gid, mode)) in files.iter().enumerate() {
             // The image's own /etc file stays when it is a symlink (or under one).
-            if i < etc && !m.plain(target)? {
+            if i < etc && !m.plain(target).map_err(SetupError::Step)? {
                 continue;
             }
             let name = format!("f{i}");
@@ -331,17 +378,42 @@ impl Builder<'_> {
                 OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC,
             )
             .context("bind a file of the step's tmpfs")?;
-            m.attach(tree, target, false)?;
+            let at = m.target(target, false).map_err(SetupError::Step)?;
+            m.attach_at(tree, &at, target)?;
         }
         Ok(())
     }
 }
 
+/// Why a step's mounts could not be set up.
+enum SetupError {
+    /// The step's own spec or image: a target that cannot be resolved or created.
+    /// The step ends with 125; the VM goes on.
+    Step(Failure),
+    /// Init's own work (a filesystem, a clone, a mount, a grow): ends the VM.
+    Init(Failure),
+}
+
+impl From<Failure> for SetupError {
+    fn from(f: Failure) -> Self {
+        Self::Init(f)
+    }
+}
+
 /// `/proc` paths a step may read but not write (runc's `readonlyPaths`).
-const PROC_READONLY: [&str; 4] = ["/proc/sys", "/proc/sysrq-trigger", "/proc/irq", "/proc/bus"];
+const PROC_READONLY: [&str; 5] = ["/proc/sys", "/proc/sysrq-trigger", "/proc/irq", "/proc/bus", "/proc/fs"];
 
 /// `/proc` paths a step sees empty (runc's `maskedPaths`, those procfs has).
-const PROC_MASKED: [&str; 4] = ["/proc/kcore", "/proc/keys", "/proc/timer_list", "/proc/sched_debug"];
+const PROC_MASKED: [&str; 8] = [
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/timer_list",
+    "/proc/sched_debug",
+    "/proc/acpi",
+    "/proc/scsi",
+    "/proc/latency_stats",
+    "/proc/timer_stats",
+];
 
 /// A detached copy of init's mount at `path`.
 fn clone_tree(path: &str) -> Result<OwnedFd> {
@@ -540,10 +612,15 @@ impl Mounts {
 
     fn attach(&mut self, mnt: OwnedFd, path: &str, dir: bool) -> Result<()> {
         let target = self.target(path, dir)?;
+        self.attach_at(mnt, &target, path)
+    }
+
+    /// Moves `mnt` onto `target` (what [`Self::target`] returned for `path`).
+    fn attach_at(&mut self, mnt: OwnedFd, target: &OwnedFd, path: &str) -> Result<()> {
         rustix::mount::move_mount(
             &mnt,
             "",
-            &target,
+            target,
             "",
             MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH | MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
         )
@@ -655,8 +732,10 @@ const STEP_CAPS: u64 = (1 << 0)
     | (1 << 31);
 
 /// Runs the command; returns its exit code (`None` when a signal killed it),
-/// once `StepExited` is sent.
-fn run_command(config: &Config, step: &RunStep, rx: &Receiver<Event>) -> Result<Option<i32>> {
+/// once `StepExited` is sent. When `setup` (the step's mounts) failed, nothing
+/// runs: the step ends with 125 and the reason on its stderr, like any other
+/// setup failure.
+fn run_command(config: &Config, step: &RunStep, rx: &Receiver<Event>, setup: Result<()>) -> Result<Option<i32>> {
     let id = Identity {
         uid: step.uid,
         gid: step.gid,
@@ -687,17 +766,19 @@ fn run_command(config: &Config, step: &RunStep, rx: &Receiver<Event>) -> Result<
     drop(out);
     let (hook_failed, report) = rustix::pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).context("pipe")?;
     step_hook(&mut cmd, &id, &step.workdir, report);
-    let spawned = cmd.spawn();
+    let spawned = match setup {
+        Ok(()) => cmd.spawn().map_err(|e| match failed_hook_step(&hook_failed) {
+            Some(step) => (125, format!("kiln-init: {step}: {e}\n")),
+            None => (
+                if e.raw_os_error() == Some(2) { 127 } else { 126 },
+                format!("kiln-init: exec {}: {e}\n", argv[0]),
+            ),
+        }),
+        Err(f) => Err((125, format!("kiln-init: set up the step's mounts: {f}\n"))),
+    };
     drop(cmd);
     let code = match spawned {
-        Err(e) => {
-            let (code, msg) = match failed_hook_step(&hook_failed) {
-                Some(step) => (125, format!("kiln-init: {step}: {e}\n")),
-                None => (
-                    if e.raw_os_error() == Some(2) { 127 } else { 126 },
-                    format!("kiln-init: exec {}: {e}\n", argv[0]),
-                ),
-            };
+        Err((code, msg)) => {
             let _ = err.write_all(msg.as_bytes());
             drop(err);
             for r in outputs {
@@ -853,5 +934,187 @@ fn failed_hook_step(pipe: &OwnedFd) -> Option<&'static str> {
     match rustix::io::read(pipe, &mut b) {
         Ok(1) => STEP_HOOK.get(usize::from(b[0])).copied(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kiln_proto::{
+        BuildDisk, Command as StepCommand, ExitMethod, Mode as ConfigMode, Process, Scratch, Secret, StepMount,
+    };
+
+    /// One base layer (disk 3), so `Config.disks` start at disk 4: two erofs
+    /// layers (4, 5), a writable cache (6) and a read-only one (7).
+    fn config() -> Config {
+        let disk = |kind, read_only| BuildDisk { kind, read_only };
+        Config {
+            process: Process::default(),
+            stop_signal: 15,
+            tty: None,
+            interactive: false,
+            hostname: "build".into(),
+            network: None,
+            layers: 1,
+            scratch: Scratch { size_bytes: 1 << 30 },
+            exit_method: ExitMethod::Poweroff,
+            shutdown_grace_secs: 1,
+            volumes: Vec::new(),
+            pod_disk: None,
+            services: Vec::new(),
+            ready_timeout_ms: None,
+            mode: ConfigMode::Build,
+            disks: vec![
+                disk(DiskKind::Erofs, true),
+                disk(DiskKind::Erofs, true),
+                disk(DiskKind::Ext4, false),
+                disk(DiskKind::Ext4, true),
+            ],
+            source_date_epoch: None,
+        }
+    }
+
+    fn step() -> RunStep {
+        RunStep {
+            id: 7,
+            command: StepCommand::Shell("true".into()),
+            env: Vec::new(),
+            workdir: "/".into(),
+            uid: 0,
+            gid: 0,
+            lowers_added: Vec::new(),
+            mounts: Vec::new(),
+            secrets: Vec::new(),
+            egress: false,
+            timeout_ms: 1000,
+        }
+    }
+
+    fn mount(disk: u32, target: &str, read_only: bool) -> StepMount {
+        StepMount {
+            disk,
+            target: target.into(),
+            read_only,
+        }
+    }
+
+    fn secret(target: &str) -> Secret {
+        Secret {
+            target: target.into(),
+            data: b"s".to_vec(),
+        }
+    }
+
+    /// `check` on a builder over `config`, with `lowers` lower directories and
+    /// `stacked` disks already stacked.
+    fn check(config: &Config, lowers: usize, stacked: &[u32], step: &RunStep) -> std::result::Result<(), String> {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("output.img");
+        std::fs::File::create(&img).unwrap();
+        let b = Builder {
+            config,
+            lowers: (0..lowers).map(|n| format!("/kiln/layers/{n}")).collect(),
+            stacked: stacked.iter().copied().collect(),
+            grown: BTreeSet::new(),
+            output: Output::open(img.to_str().unwrap()).unwrap(),
+            epoch: None,
+        };
+        b.check(step).map_err(|f| f.to_string())
+    }
+
+    fn refused(config: &Config, lowers: usize, stacked: &[u32], step: &RunStep, why: &str) {
+        let e = check(config, lowers, stacked, step).expect_err(why);
+        assert!(e.starts_with("protocol violation: RunStep 7: "), "{e}");
+        assert!(e.contains(why), "wanted {why:?} in {e:?}");
+    }
+
+    #[test]
+    fn a_step_that_matches_the_disks_is_accepted() {
+        let c = config();
+        let mut s = step();
+        s.lowers_added = vec![4, 5];
+        s.mounts = vec![
+            mount(6, "/root/.cache", false),
+            mount(7, "/ro", true),
+            mount(6, "/again/", true),
+        ];
+        s.secrets = vec![secret("/run/secrets/token")];
+        check(&c, 1, &[], &s).unwrap();
+        // A layer stacked by an earlier step is not offered again, but the others are.
+        s.lowers_added = vec![5];
+        check(&c, 3, &[4], &s).unwrap();
+    }
+
+    #[test]
+    fn layers_must_be_erofs_disks_not_stacked_yet() {
+        let c = config();
+        let mut s = step();
+        for (disk, why) in [
+            (6, "disk 6 is not an erofs disk left to stack"),
+            (7, "disk 7 is not an erofs disk left to stack"),
+            (3, "disk 3 is not an erofs disk left to stack"),
+            (8, "disk 8 is not an erofs disk left to stack"),
+            (0, "disk 0 is not an erofs disk left to stack"),
+        ] {
+            s.lowers_added = vec![disk];
+            refused(&c, 1, &[], &s, why);
+        }
+        s.lowers_added = vec![4];
+        refused(&c, 2, &[4], &s, "disk 4 is not an erofs disk left to stack");
+        // The same disk twice in one step: the second is already stacked.
+        s.lowers_added = vec![4, 4];
+        refused(&c, 1, &[], &s, "disk 4 is not an erofs disk left to stack");
+    }
+
+    #[test]
+    fn mounts_must_be_cache_disks_and_never_writable_when_the_disk_is_read_only() {
+        let c = config();
+        let mut s = step();
+        s.mounts = vec![mount(4, "/x", true)];
+        refused(&c, 1, &[], &s, "disk 4 is not a cache disk it may mount so");
+        s.mounts = vec![mount(7, "/x", false)];
+        refused(&c, 1, &[], &s, "disk 7 is not a cache disk it may mount so");
+        s.mounts = vec![mount(9, "/x", false)];
+        refused(&c, 1, &[], &s, "disk 9 is not a cache disk it may mount so");
+        s.mounts = vec![mount(7, "/x", true)];
+        check(&c, 1, &[], &s).unwrap();
+    }
+
+    #[test]
+    fn the_overlay_has_at_most_max_build_lowers_lower_directories() {
+        let c = config();
+        let mut s = step();
+        s.lowers_added = vec![4, 5];
+        check(&c, MAX_BUILD_LOWERS - 2, &[], &s).unwrap();
+        refused(
+            &c,
+            MAX_BUILD_LOWERS - 1,
+            &[],
+            &s,
+            &format!(
+                "{} lower layers and 2 more (at most {MAX_BUILD_LOWERS})",
+                MAX_BUILD_LOWERS - 1
+            ),
+        );
+        s.lowers_added.clear();
+        check(&c, MAX_BUILD_LOWERS, &[], &s).unwrap();
+        refused(&c, MAX_BUILD_LOWERS + 1, &[], &s, "at most");
+    }
+
+    #[test]
+    fn targets_follow_the_shared_rule() {
+        let c = config();
+        for bad in ["relative", "/", "", "/a/../b", "/a//b", "/a/./b", "/a\0b"] {
+            let mut s = step();
+            s.mounts = vec![mount(6, bad, false)];
+            refused(&c, 1, &[], &s, "target");
+            let mut s = step();
+            s.secrets = vec![secret(bad)];
+            refused(&c, 1, &[], &s, "target");
+        }
+        // One trailing slash is ignored by the rule.
+        let mut s = step();
+        s.mounts = vec![mount(6, "/ok/", false)];
+        check(&c, 1, &[], &s).unwrap();
     }
 }

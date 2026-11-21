@@ -37,4 +37,5 @@ export KILN_TEST_KERNEL=$kernel
 export KILN_TEST_INIT=$target/$musl/release/kiln-init
 export KILN_TEST_HOSTILE=$target/$musl/release/hostile
 export KILN_REQUIRE_KVM_TESTS=1
-cargo test -p kiln-run --test boot --test build -p kiln --test run "$@"
+# --no-fail-fast: a failing (or flaky) test binary must not hide the ones after it.
+cargo test --no-fail-fast -p kiln-run --test boot --test build -p kiln --test run "$@"

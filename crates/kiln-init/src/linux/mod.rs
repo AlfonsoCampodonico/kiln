@@ -2,6 +2,9 @@
 //! control channel is up. A failure (or a panic, in any thread) prints
 //! `kiln-init: <stage>: <error>` on the console, sends `InitFailed` when the
 //! channel is up, and ends the VM with `exitMethod`, or `reboot()` before `Config`.
+//! After the final message (`Exited` or `InitFailed`) init waits, bounded, for the
+//! host to close its side of the control connection, so the message is not lost
+//! with the VM.
 
 mod build;
 mod control;
@@ -20,6 +23,7 @@ use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use kiln_proto::{ExitMethod, GuestMessage, HostMessage, InitFailed, ProtoError, Stage, stage_name, write_message};
 use rustix::system::RebootCommand;
@@ -43,6 +47,10 @@ static HOST_FAILED: OnceLock<String> = OnceLock::new();
 /// The final message (`Exited` or `InitFailed`) has gone out: no exec message may follow
 /// it. Set and checked under the `CONTROL` lock.
 static FINISHED: AtomicBool = AtomicBool::new(false);
+/// After the final message: how long init waits for the host to close its side of the
+/// control connection before it ends the VM anyway (an older host never closes it).
+/// Well under the host's 10 s end bound, and long enough for a loaded host to close inside it.
+const HOST_CLOSE_WAIT: Duration = Duration::from_secs(2);
 
 /// What the supervisor waits for (spec §9.6 stage 7).
 #[derive(Debug)]
@@ -141,7 +149,8 @@ fn send_exec(msg: &GuestMessage) {
     }
 }
 
-/// Sends the final message: nothing from an exec follows it.
+/// Sends the final message: nothing from an exec follows it. Then waits, bounded, for
+/// the host to have read it ([`await_host_close`]).
 fn send_final(msg: &GuestMessage) -> Result<()> {
     let control = CONTROL.get().expect("the control channel is up");
     let mut stream = control.lock().unwrap_or_else(|e| e.into_inner());
@@ -149,7 +158,37 @@ fn send_final(msg: &GuestMessage) -> Result<()> {
     write_message(&mut *stream, msg).map_err(|e| match HOST_FAILED.get() {
         Some(why) => Failure::msg(why.clone()),
         None => Failure::msg(format!("send to the host: {e}")),
-    })
+    })?;
+    // `CONTROL` stays locked across the wait: an exec sender blocks for up to the bound, which
+    // is harmless, since `FINISHED` is set and it would send nothing anyway.
+    await_host_close(&stream);
+    Ok(())
+}
+
+/// Waits until the host has closed its side of the control connection, for at most
+/// [`HOST_CLOSE_WAIT`]. A write to the vsock only queues the bytes in the guest's kernel:
+/// the VMM moves them to the host's socket later, and a VM that ends first can take the
+/// final message with it (the host then sees the connection close without it). A host
+/// closes its side once it has read the final message. That guarantees delivery of the
+/// final message on port 1024 only: output-stream bytes sent before it may still sit in the
+/// VMM's per-connection buffers when the VM ends, as they could before this wait.
+/// A host that never closes (an older one) costs the bound; a failed `poll` ends the wait.
+fn await_host_close(stream: &Vsock) {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let deadline = Instant::now() + HOST_CLOSE_WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        let Ok(timeout) = Timespec::try_from(left) else { return };
+        // RDHUP, or HUP and ERR, which poll always reports; data from the host is not awaited.
+        let mut fds = [PollFd::new(stream, PollFlags::RDHUP)];
+        match poll(&mut fds, Some(&timeout)) {
+            Err(rustix::io::Errno::INTR) => {}
+            _ => return,
+        }
+    }
 }
 
 fn send(msg: &GuestMessage) -> Result<()> {
@@ -166,14 +205,19 @@ fn send(msg: &GuestMessage) -> Result<()> {
 fn fail(f: Failure) -> ! {
     let stage = STAGE.load(Ordering::SeqCst);
     let _ = writeln!(std::io::stderr(), "kiln-init: {}: {f}", stage_name(stage));
-    if let Some(control) = CONTROL.get()
-        && let Ok(mut stream) = control.try_lock()
-    {
-        FINISHED.store(true, Ordering::SeqCst);
-        let msg = InitFailed::new(stage, f.reported_errno(stage), &f.message);
-        let _ = write_message(&mut *stream, &GuestMessage::InitFailed(msg));
-    }
+    let sent = CONTROL
+        .get()
+        .and_then(|control| control.try_lock().ok())
+        .map(|mut stream| {
+            FINISHED.store(true, Ordering::SeqCst);
+            let msg = InitFailed::new(stage, f.reported_errno(stage), &f.message);
+            let ok = write_message(&mut *stream, &GuestMessage::InitFailed(msg)).is_ok();
+            (stream, ok)
+        });
     sys::kill_all();
+    if let Some((stream, true)) = sent {
+        await_host_close(&stream);
+    }
     end_vm()
 }
 

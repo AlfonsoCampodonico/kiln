@@ -106,9 +106,16 @@ pub fn ext4_resize(dir: &OwnedFd, blocks: u64) -> rustix::io::Result<()> {
     unsafe { ioctl(dir, Setter::<EXT4_IOC_RESIZE_FS, u64>::new(blocks)) }
 }
 
-/// `kill(-1, SIGKILL)`: every process but init.
+/// `kill(-1, SIGKILL)`: every process but init. A unit test that got here would
+/// kill every process the test's user may signal, so under `cfg(test)` it
+/// panics instead; a test of `supervise::run` must fail before this point.
 pub fn kill_all() {
-    let _ = rustix::process::kill_process_group(Pid::INIT, Signal::KILL);
+    #[cfg(test)]
+    panic!("kill_all in a unit test would kill every process of the user running it");
+    #[cfg(not(test))]
+    {
+        let _ = rustix::process::kill_process_group(Pid::INIT, Signal::KILL);
+    }
 }
 
 /// Sends `sig` (1..=31) to `pid`; a process that is gone is not an error.

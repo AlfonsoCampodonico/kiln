@@ -76,6 +76,20 @@ jobs:
         run: |
           cargo build --locked --manifest-path "${{ steps.vmkit.outputs.dir }}/Cargo.toml" --bin vmkit-sandbox --target-dir target
           "${{ steps.vmkit.outputs.dir }}/scripts/install-apparmor.sh" "$PWD/target/debug/vmkit-sandbox"
+      # The mixed-install test (a version 2 kiln-init must be refused build mode) needs a
+      # kiln-init that speaks protocol version 2: kiln at 4ab0388, the last commit before
+      # version 3 (build mode). It builds in a separate worktree and target directory
+      # (about a minute cold), so the version 3 build above is untouched.
+      - name: Build kiln-init at protocol version 2 (4ab0388)
+        run: |
+          v2=4ab03882bdecad2c9b24b08a67ea4a5aa307e5dc
+          git fetch --depth=1 origin "$v2"
+          git worktree add --detach "$RUNNER_TEMP/kiln-v2" "$v2"
+          target=x86_64-unknown-linux-musl
+          (cd "$RUNNER_TEMP/kiln-v2" && cargo build --locked --release --target "$target" -p kiln-init --target-dir "$RUNNER_TEMP/kiln-v2-target")
+          init="$RUNNER_TEMP/kiln-v2-target/$target/release/kiln-init"
+          file "$init" | tee /dev/stderr | grep -q 'static'
+          echo "KILN_TEST_INIT_V2=$init" >> "$GITHUB_ENV"
       - name: Host addresses the egress case contrasts (link-local and private, on lo)
         run: sudo ip addr add 169.254.77.1/32 dev lo && sudo ip addr add 10.250.0.1/32 dev lo
       - name: Boot suite on Firecracker and Cloud Hypervisor, kiln run end to end on Firecracker

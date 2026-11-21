@@ -2,7 +2,7 @@
 //! build VM and a step are ([`BuildSpec`], [`RunStep`]), the device budget, the
 //! `Config` and `RunStep` messages they become, and the order the guest's build
 //! messages must come in ([`BuildProtocol`]). The VM itself is
-//! [`BuildVm`](crate::BuildVm) (Linux).
+//! `BuildVm` (Linux only).
 //!
 //! Disks, in order (nothing is hot-plugged, so a layer a step stacks later is
 //! attached at boot): `vda` the init layer, `vdb` scratch, `vdc` the output disk
@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use kiln_proto::{
-    BuildDisk, Command, Config, DiskKind, ExitMethod, GuestMessage, MAX_BUILD_LOWERS, MAX_FRAME, Mode, Network,
-    Process, Scratch, StepExited, StepMount, StepSealed,
+    BuildDisk, Command, Config, DIFF_ALIGN, DiskKind, ExitMethod, GuestMessage, MAX_BUILD_LOWERS, MAX_FRAME, Mode,
+    Network, Process, Scratch, StepExited, StepMount, StepSealed,
 };
 
 use crate::error::{Error, Result};
@@ -125,7 +125,8 @@ pub enum Exit {
 pub struct StepOutcome {
     pub exit: Exit,
     /// After `Exit::Code(0)`: where the guest says the diff is. Guest-asserted:
-    /// passed through unchecked but for its shape and id.
+    /// kiln checks its shape, id and that the range is a possible next diff
+    /// ([`BuildProtocol`]), not what the disk holds there.
     pub sealed: Option<StepSealed>,
 }
 
@@ -241,20 +242,31 @@ impl BuildSpec {
                 max: MAX_BUILD_LOWERS,
             });
         }
-        let mounts =
-            step.mounts
-                .iter()
-                .map(|t| {
-                    let j = self.cache_disks.iter().position(|(_, ct)| ct == t).ok_or_else(|| {
-                        Error::refused(format!("step {}: no cache disk has the target {t:?}", step.id))
-                    })?;
-                    Ok(StepMount {
-                        disk: Self::layer_disk(self.layers.len() + j),
-                        target: t.clone(),
-                        read_only: false,
-                    })
+        // A trailing `/` on a target is ignored (`check_target`), so the cache disk
+        // and the step may spell it differently.
+        let norm = |t: &str| t.strip_suffix('/').unwrap_or(t).to_owned();
+        let mounts = step
+            .mounts
+            .iter()
+            .map(|t| {
+                let j = self
+                    .cache_disks
+                    .iter()
+                    .position(|(_, ct)| norm(ct) == norm(t))
+                    .ok_or_else(|| Error::refused(format!("step {}: no cache disk has the target {t:?}", step.id)))?;
+                Ok(StepMount {
+                    disk: Self::layer_disk(self.layers.len() + j),
+                    target: t.clone(),
+                    read_only: false,
                 })
-                .collect::<Result<Vec<_>>>()?;
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(k) = step.env.keys().find(|k| k.is_empty() || k.contains(['=', '\0'])) {
+            return Err(Error::refused(format!(
+                "step {}: environment name {k:?} is empty or contains '=' or NUL",
+                step.id
+            )));
+        }
         let msg = kiln_proto::RunStep {
             id: step.id,
             command: step.command.clone(),
@@ -311,7 +323,13 @@ fn guest_network() -> Network {
 /// `StepSealed` with its id. `InitFailed` may come at any point after `Hello`
 /// and ends the VM. Nothing else is accepted, so the guest has at most one
 /// message to queue per state.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// A `StepSealed` must also be possible on the output disk: a non-empty range
+/// aligned to [`DIFF_ALIGN`], starting exactly where the previous diff ended (0
+/// for the first) and ending within the disk. That is kiln's own check; the
+/// caller still has to read each diff, check that only zeros follow the tar's
+/// end and hash what it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildProtocol {
     hello: bool,
     stage: u8,
@@ -320,6 +338,10 @@ pub struct BuildProtocol {
     step: Option<u32>,
     exited: Option<StepExited>,
     failed: bool,
+    /// The output disk's size.
+    output_size: u64,
+    /// Where the previous diff ended: where the next one must start.
+    next_offset: u64,
 }
 
 /// What a guest message did to a step.
@@ -333,6 +355,20 @@ pub enum BuildEvent {
 }
 
 impl BuildProtocol {
+    /// A guest that has said nothing yet, for an output disk of `output_size` bytes.
+    pub fn new(output_size: u64) -> Self {
+        Self {
+            hello: false,
+            stage: 0,
+            running: false,
+            step: None,
+            exited: None,
+            failed: false,
+            output_size,
+            next_offset: 0,
+        }
+    }
+
     pub fn running(&self) -> bool {
         self.running
     }
@@ -363,7 +399,17 @@ impl BuildProtocol {
         }
         match msg {
             GuestMessage::Hello(h) => {
-                if self.hello || h.protocol < 3 || h.protocol > kiln_proto::PROTOCOL_VERSION {
+                if self.hello {
+                    return Err("a second Hello".into());
+                }
+                if h.protocol > kiln_proto::PROTOCOL_VERSION {
+                    return Err(format!(
+                        "Hello {}: a guest newer than this kiln, which speaks up to version {}",
+                        h.protocol,
+                        kiln_proto::PROTOCOL_VERSION
+                    ));
+                }
+                if h.protocol < 3 {
                     return Err(format!("Hello {} (build mode needs version 3)", h.protocol));
                 }
                 self.hello = true;
@@ -390,6 +436,28 @@ impl BuildProtocol {
             GuestMessage::StepSealed(s)
                 if self.step == Some(s.id) && self.exited.is_some_and(|e| e.code == Some(0)) =>
             {
+                let refused = |why: &str| {
+                    format!(
+                        "StepSealed for step {}: range {}+{} is refused: {why} (output disk {} bytes, next diff at {})",
+                        s.id, s.offset, s.len, self.output_size, self.next_offset
+                    )
+                };
+                if s.len == 0 {
+                    return Err(refused("the range is empty"));
+                }
+                if !s.offset.is_multiple_of(DIFF_ALIGN) || !s.len.is_multiple_of(DIFF_ALIGN) {
+                    return Err(refused("the range is not aligned"));
+                }
+                if s.offset != self.next_offset {
+                    return Err(refused("it does not start where the previous diff ended"));
+                }
+                let Some(end) = s.offset.checked_add(s.len) else {
+                    return Err(refused("offset + len overflows"));
+                };
+                if end > self.output_size {
+                    return Err(refused("it ends past the output disk"));
+                }
+                self.next_offset = end;
                 let sealed = s.clone();
                 self.step = None;
                 return Ok(BuildEvent::Sealed(sealed));
@@ -549,6 +617,108 @@ mod tests {
         let mut s = spec();
         s.cache_disks = vec![("/c0".into(), "/x".into()), ("/c1".into(), "/x/".into())];
         assert!(s.check(32).is_err(), "same target with a trailing slash");
+        s.cache_disks = vec![("/c0".into(), "/x".into()), ("/c1".into(), "/x".into())];
+        assert!(s.check(32).is_err(), "the same target twice");
+        s.cache_disks = vec![("/c0".into(), "/x/".into()), ("/c1".into(), "/x".into())];
+        assert!(s.check(32).is_err(), "a trailing slash on the first");
+        s.cache_disks = vec![("/c0".into(), "/x".into()), ("/c1".into(), "/y".into())];
+        s.check(32).unwrap();
+        s.cache_disks = vec![("/c0".into(), "x/y".into())];
+        assert!(s.check(32).is_err(), "relative");
+    }
+
+    #[test]
+    fn env_names_cannot_smuggle_a_value() {
+        for bad in ["A=B", "=", "", "A\0B", "=A"] {
+            let s = RunStep {
+                env: BTreeMap::from([(bad.to_string(), "c".to_string())]),
+                ..step()
+            };
+            let err = spec().proto_step(&s, &BTreeSet::new(), 0).unwrap_err().to_string();
+            assert!(err.contains("environment name"), "{bad:?}: {err}");
+        }
+        let ok = RunStep {
+            env: BTreeMap::from([("A_B".into(), "x=y".into()), ("PATH".into(), String::new())]),
+            ..step()
+        };
+        let m = spec().proto_step(&ok, &BTreeSet::new(), 0).unwrap();
+        assert_eq!(m.env, ["A_B=x=y", "PATH="]);
+    }
+
+    #[test]
+    fn a_trailing_slash_is_ignored_when_matching_cache_targets() {
+        let slash = |t: &str| RunStep {
+            mounts: vec![t.into()],
+            ..step()
+        };
+        let mut s = spec();
+        s.cache_disks = vec![("/c0".into(), "/x/".into())];
+        let m = s.proto_step(&slash("/x"), &BTreeSet::new(), 0).unwrap();
+        assert_eq!((m.mounts[0].disk, m.mounts[0].target.as_str()), (6, "/x"));
+        s.proto_step(&slash("/x/"), &BTreeSet::new(), 0).unwrap();
+        s.cache_disks = vec![("/c0".into(), "/x".into())];
+        s.proto_step(&slash("/x/"), &BTreeSet::new(), 0).unwrap();
+        assert!(s.proto_step(&slash("/y"), &BTreeSet::new(), 0).is_err());
+        assert!(s.proto_step(&slash("/xx"), &BTreeSet::new(), 0).is_err());
+    }
+
+    #[test]
+    fn lowers_added_must_name_layers_left_to_stack() {
+        let s = spec();
+        let with = |l: Vec<usize>| RunStep {
+            lowers_added: l,
+            ..step()
+        };
+        assert!(
+            s.proto_step(&with(vec![3]), &BTreeSet::new(), 0).is_err(),
+            "index == layers.len()"
+        );
+        assert!(
+            s.proto_step(&with(vec![99]), &BTreeSet::new(), 0).is_err(),
+            "past the layers"
+        );
+        assert!(s.proto_step(&with(vec![usize::MAX]), &BTreeSet::new(), 0).is_err());
+        let two = BuildSpec {
+            layers: vec!["/l0".into(), "/l1".into(), "/l2".into(), "/l3".into()],
+            ..spec()
+        };
+        assert!(
+            two.proto_step(&with(vec![2, 2]), &BTreeSet::new(), 0).is_err(),
+            "a duplicate within one step"
+        );
+        assert_eq!(
+            two.proto_step(&with(vec![2, 3]), &BTreeSet::new(), 0)
+                .unwrap()
+                .lowers_added,
+            [5, 6]
+        );
+        assert!(
+            two.proto_step(&with(vec![3, 2]), &BTreeSet::from([2]), 0).is_err(),
+            "2 is stacked"
+        );
+    }
+
+    #[test]
+    fn egress_needs_the_step_and_the_vm_to_have_a_network() {
+        for (vm, step_net, want) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let s = BuildSpec { network: vm, ..spec() };
+            let m = s
+                .proto_step(
+                    &RunStep {
+                        network: step_net,
+                        ..step()
+                    },
+                    &BTreeSet::new(),
+                    0,
+                )
+                .unwrap();
+            assert_eq!(m.egress, want, "vm {vm}, step {step_net}");
+        }
     }
 
     #[test]
@@ -597,7 +767,7 @@ mod tests {
 
     #[test]
     fn steps_exit_then_seal_with_their_own_id() {
-        let mut p = BuildProtocol::default();
+        let mut p = BuildProtocol::new(1 << 30);
         assert!(p.start_step(1).is_err(), "not running yet");
         boot(&mut p);
         p.start_step(1).unwrap();
@@ -622,11 +792,116 @@ mod tests {
         assert!(q.accept(&exited(1, 0)).is_err());
     }
 
+    fn seal_at(id: u32, offset: u64, len: u64) -> GuestMessage {
+        GuestMessage::StepSealed(StepSealed {
+            id,
+            offset,
+            len,
+            sha256: "0".repeat(64),
+            entries: 1,
+        })
+    }
+
+    #[test]
+    fn a_hostile_seal_fails_closed() {
+        const DISK: u64 = 1 << 20;
+        // One step that exits 0, on a protocol whose output disk is DISK bytes.
+        let start = |p: &mut BuildProtocol, id: u32| {
+            p.start_step(id).unwrap();
+            assert!(matches!(p.accept(&exited(id, 0)), Ok(BuildEvent::Exited(_))));
+        };
+        // Each row is refused by the check that names it, not by an earlier one.
+        let bad = [
+            ("unaligned offset", 100, 4096, "not aligned"),
+            ("unaligned length", 0, 100, "not aligned"),
+            ("empty", 0, 0, "empty"),
+            ("not at the previous end (a gap)", 4096, 4096, "does not start where"),
+            ("past the disk", 0, DISK + 4096, "past the output disk"),
+            ("far outside", u64::MAX - 4095, 1 << 40, "does not start where"),
+        ];
+        for (what, offset, len, check) in bad {
+            let mut p = BuildProtocol::new(DISK);
+            boot(&mut p);
+            start(&mut p, 1);
+            let why = p.accept(&seal_at(1, offset, len)).unwrap_err();
+            assert!(
+                why.contains("StepSealed for step 1") && why.contains(check),
+                "{what}: {why}"
+            );
+        }
+        // The overflow check is reached only by a seal that starts where the previous one ended.
+        let mut p = BuildProtocol::new(DISK);
+        boot(&mut p);
+        start(&mut p, 1);
+        assert!(matches!(p.accept(&seal_at(1, 0, 8192)), Ok(BuildEvent::Sealed(_))));
+        start(&mut p, 2);
+        let why = p.accept(&seal_at(2, 8192, u64::MAX - 4095)).unwrap_err();
+        assert!(why.contains("overflows"), "{why}");
+        // Contiguous seals fill the disk exactly; one byte-aligned block past it is refused.
+        let mut p = BuildProtocol::new(DISK);
+        boot(&mut p);
+        start(&mut p, 1);
+        assert!(matches!(p.accept(&seal_at(1, 0, 8192)), Ok(BuildEvent::Sealed(_))));
+        start(&mut p, 2);
+        assert!(p.accept(&seal_at(2, 0, 4096)).is_err(), "overlaps the previous diff");
+        assert!(p.accept(&seal_at(2, 4096, 4096)).is_err(), "inside the previous diff");
+        assert!(p.accept(&seal_at(2, 12288, 4096)).is_err(), "a gap after it");
+        assert!(matches!(
+            p.accept(&seal_at(2, 8192, DISK - 8192)),
+            Ok(BuildEvent::Sealed(_))
+        ));
+        start(&mut p, 3);
+        assert!(p.accept(&seal_at(3, DISK, 4096)).is_err(), "the disk is full");
+    }
+
+    #[test]
+    fn a_guest_newer_than_the_host_gets_its_own_refusal() {
+        let newer = kiln_proto::PROTOCOL_VERSION + 1;
+        let why = BuildProtocol::new(1)
+            .accept(&GuestMessage::Hello(Hello { protocol: newer }))
+            .unwrap_err();
+        assert!(
+            why.contains("newer than this kiln") && !why.contains("needs version 3"),
+            "{why}"
+        );
+        let why = BuildProtocol::new(1)
+            .accept(&GuestMessage::Hello(Hello { protocol: 2 }))
+            .unwrap_err();
+        assert!(why.contains("needs version 3"), "{why}");
+        let mut p = BuildProtocol::new(1);
+        p.accept(&GuestMessage::Hello(Hello { protocol: 3 })).unwrap();
+        let why = p.accept(&GuestMessage::Hello(Hello { protocol: 3 })).unwrap_err();
+        assert!(why.contains("second Hello"), "{why}");
+    }
+
+    #[test]
+    fn stages_go_up_within_3_to_6_before_running() {
+        let hello = || GuestMessage::Hello(Hello { protocol: 3 });
+        let stage = |n| GuestMessage::Stage(Stage { n });
+        for bad in [0, 1, 2, 7, 8, 255] {
+            let mut p = BuildProtocol::new(1);
+            p.accept(&hello()).unwrap();
+            assert!(p.accept(&stage(bad)).is_err(), "stage {bad}");
+        }
+        for (first, then) in [(5, 4), (5, 5), (6, 3), (6, 6)] {
+            let mut p = BuildProtocol::new(1);
+            p.accept(&hello()).unwrap();
+            p.accept(&stage(first)).unwrap();
+            assert!(p.accept(&stage(then)).is_err(), "stage {then} after {first}");
+        }
+        let mut p = BuildProtocol::new(1);
+        p.accept(&hello()).unwrap();
+        p.accept(&stage(4)).unwrap();
+        p.accept(&stage(6)).unwrap();
+        p.accept(&GuestMessage::Running).unwrap();
+        assert!(p.accept(&stage(6)).is_err(), "no stage after Running");
+    }
+
     #[test]
     fn boot_messages_come_in_order_and_once() {
-        let mut p = BuildProtocol::default();
+        let mut p = BuildProtocol::new(1 << 30);
         assert!(p.accept(&GuestMessage::Hello(Hello { protocol: 2 })).is_err());
-        let mut p = BuildProtocol::default();
+        let mut p = BuildProtocol::new(1 << 30);
         boot(&mut p);
         assert!(p.accept(&GuestMessage::Running).is_err());
         assert!(p.accept(&GuestMessage::Stage(Stage { n: 6 })).is_err());

@@ -392,4 +392,77 @@ mod tests {
         assert_eq!(s.running(pid), None);
         assert_eq!(s.running(other), Some(1));
     }
+
+    /// A run-mode config with no volumes, so `Volumes::prepare` mounts nothing.
+    fn run_config() -> Config {
+        Config {
+            process: kiln_proto::Process::default(),
+            stop_signal: 15,
+            tty: None,
+            interactive: false,
+            hostname: "run".into(),
+            network: None,
+            layers: 0,
+            scratch: kiln_proto::Scratch { size_bytes: 1 << 30 },
+            exit_method: kiln_proto::ExitMethod::Poweroff,
+            shutdown_grace_secs: 1,
+            volumes: Vec::new(),
+            pod_disk: None,
+            services: Vec::new(),
+            ready_timeout_ms: None,
+            mode: kiln_proto::Mode::Run,
+            disks: Vec::new(),
+            source_date_epoch: None,
+        }
+    }
+
+    /// `RunStep` and `Finish` are build-mode messages: in run mode the supervisor
+    /// fails (ending the VM) instead of ignoring them.
+    ///
+    /// Safe to run only because `run` returns the error before it reaches
+    /// `sys::kill_all()` (`kill(-1, SIGKILL)`); `kill_all` panics under
+    /// `cfg(test)`, so a change that made the refusal fall through to it fails
+    /// this test instead of killing the developer's processes.
+    #[test]
+    fn build_messages_in_run_mode_are_protocol_violations() {
+        let step = kiln_proto::RunStep {
+            id: 1,
+            command: kiln_proto::Command::Shell("true".into()),
+            env: Vec::new(),
+            workdir: "/".into(),
+            uid: 0,
+            gid: 0,
+            lowers_added: Vec::new(),
+            mounts: Vec::new(),
+            secrets: Vec::new(),
+            egress: false,
+            timeout_ms: 1000,
+        };
+        for msg in [HostMessage::RunStep(Box::new(step)), HostMessage::Finish] {
+            // A real child for the supervisor to own; killed and reaped below.
+            let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+            let main = Proc {
+                name: None,
+                pid: Pid::from_raw(child.id() as i32).unwrap(),
+                stop_signal: 15,
+            };
+            let started = Started {
+                procs: vec![main],
+                outputs: Vec::new(),
+                tty: None,
+            };
+            let config = run_config();
+            let mut volumes = Volumes::prepare(&config, &[]).unwrap();
+            let (events, rx) = std::sync::mpsc::channel();
+            events.send(Event::Host(msg)).unwrap();
+            let e = run(&config, started, &rx, &mut volumes).unwrap_err();
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                e.to_string()
+                    .contains("protocol violation: a build message outside build mode"),
+                "{e}"
+            );
+        }
+    }
 }

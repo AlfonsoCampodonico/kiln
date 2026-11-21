@@ -179,14 +179,17 @@ fn fixtures_dir() -> PathBuf {
 
 const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000:App:/home/app:/bin/sh\n";
 const GROUP: &str = "root:x:0:\ntty:x:5:\napp:x:1000:\nextra:x:2000:app\nmore:x:3000:app\n";
-const APPLETS: [&str; 34] = [
+const APPLETS: [&str; 35] = [
     "[", "cat", "date", "dd", "df", "echo", "env", "false", "grep", "head", "hostname", "id", "ip", "kill", "ls",
     "mknod", "mount", "nc", "nslookup", "printf", "pwd", "readlink", "rm", "seq", "sh", "sleep", "stat", "stty",
-    "test", "timeout", "tr", "true", "tty", "wc",
+    "test", "timeout", "tr", "true", "tty", "unshare", "wc",
 ];
 
 /// Each entry's path and mtime in a ustar/PAX archive (PAX `path` and `mtime`
-/// records apply to the next entry; PAX headers are not entries).
+/// records apply to the next entry; PAX headers are not entries). It does not
+/// read GNU `L` long-name entries: the only writer of these archives is
+/// kiln-init's `TarWriter`, which puts a long name in a PAX `path` record and
+/// never writes a GNU one.
 pub fn tar_mtimes(tar: &[u8]) -> Vec<(String, u64)> {
     let field = |h: &[u8], a: usize, b: usize| {
         let s: String = h[a..b].iter().take_while(|&&c| c != 0).map(|&c| c as char).collect();

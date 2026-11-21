@@ -373,6 +373,29 @@ mod tests {
     }
 
     #[test]
+    fn build_messages_are_refused_in_run_mode() {
+        let step_exited = GuestMessage::StepExited(kiln_proto::StepExited {
+            id: 1,
+            code: Some(0),
+            signal: None,
+        });
+        let step_sealed = GuestMessage::StepSealed(kiln_proto::StepSealed {
+            id: 1,
+            offset: 0,
+            len: 4096,
+            sha256: "0".repeat(64),
+            entries: 1,
+        });
+        for (msg, name) in [(step_exited, "StepExited"), (step_sealed, "StepSealed")] {
+            for prefix in [&[hello()][..], &[hello(), stage(6), GuestMessage::Running]] {
+                let mut p = run(prefix).unwrap();
+                let why = p.accept(&msg).unwrap_err();
+                assert!(why.0.contains(name) && why.0.ends_with("outside build mode"), "{why}");
+            }
+        }
+    }
+
+    #[test]
     fn the_normal_sequence() {
         let all = [
             hello(),

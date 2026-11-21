@@ -17,10 +17,11 @@
 //! `finish` gives the guest [`END_TIMEOUT`] to end the VM. A protocol violation
 //! kills the VM, and the `BuildVm` refuses further steps.
 //!
-//! kiln never reads the output disk, and passes `StepSealed` through after
-//! checking only its shape and id: the caller checks the range (within the
-//! disk, aligned, after the previous diff, zeros after the tar's end) and hashes
-//! what it reads.
+//! kiln never reads the output disk. [`BuildProtocol`] checks a `StepSealed`'s
+//! shape, its id and that its range is a possible diff (aligned, starting where
+//! the previous one ended, within the disk); a guest whose seal is not is a
+//! protocol violation. The caller still checks the zeros after the tar's end
+//! and hashes what it reads.
 
 use std::collections::BTreeSet;
 use std::io::{ErrorKind, Read};
@@ -34,7 +35,7 @@ use std::time::{Duration, Instant};
 use kiln_proto::{Config, GuestMessage, HostMessage, Signal, port, read_message, write_message};
 use kiln_store::Store;
 use rustix::event::{PollFd, PollFlags, poll};
-use vmkit::{Disk, EgressGate, NetSpec, Vm, VmSpec, VsockSpec};
+use vmkit::{Disk, EgressGate, EndReason, NetSpec, Vm, VmSpec, VsockSpec};
 
 use super::console::ConsoleRelay;
 use super::run::{CMDLINE, backend, exit_method, vmm_identity};
@@ -85,13 +86,29 @@ pub struct BuildVm {
     gate: EgressGate,
     /// Why the VM is unusable, once it is.
     dead: Option<String>,
+    /// The VMM is known to have exited (a `wait_timeout` returned its end).
+    /// `dead` alone does not say: a killed VMM can outlive [`KILL_WAIT`].
+    vm_ended: bool,
     wake: OwnedFd,
     listener: Option<JoinHandle<()>>,
     console: Option<ConsoleRelay>,
     readers: Vec<JoinHandle<()>>,
-    /// Dropped after the VM, in this order.
+    /// Removed by `Drop` once the VMM is known gone, in this order; left for a
+    /// later run's orphan reaper when it is not.
     scratch_dir: Option<ScratchDir>,
     run_dir: Option<RunDir>,
+}
+
+/// Whether the VMM ended the way a guest ending its own VM looks: the VMM
+/// exited with code 0 and no signal, or the guest reset and vmkit stopped it
+/// there. vmkit's `Exited` also covers a VMM that failed, hence the code check.
+fn ended_by_the_guest(end: &vmkit::VmEnd) -> bool {
+    match end.reason {
+        EndReason::Exited => end.code == Some(0) && end.signal.is_none(),
+        EndReason::ResetStopped => true,
+        // Killed, BackstopFailed, and any reason added later: not the guest's doing.
+        _ => false,
+    }
 }
 
 /// `t + d`, never panicking: a duration too large for `Instant` (a caller's
@@ -198,6 +215,7 @@ impl BuildVm {
         let mut vm = vmm.create(&vm_spec)?;
         // Boot closed: no step has asked for the network yet.
         let spec_network = spec.network;
+        let output_size = spec.output_size;
         if spec_network {
             vm.set_egress(EgressGate::Closed)?;
         }
@@ -233,7 +251,7 @@ impl BuildVm {
             events,
             tx,
             out,
-            proto: BuildProtocol::default(),
+            proto: BuildProtocol::new(output_size),
             stacked: BTreeSet::new(),
             sealed: 0,
             gate: if spec_network {
@@ -242,6 +260,7 @@ impl BuildVm {
                 EgressGate::Policy
             },
             dead: None,
+            vm_ended: false,
             wake,
             listener: Some(listener),
             console: Some(console),
@@ -281,6 +300,9 @@ impl BuildVm {
     /// Runs `step`, streaming its output to `sink`. Returns within
     /// `step.timeout + STEP_GRACE + KILL_WAIT`. An error means the VM is gone (a
     /// protocol violation, the guest failed, the VMM ended): no more steps.
+    /// A [`Exit::TimedOut`] outcome is `Ok` but also ends the VM (kiln kills
+    /// it, as the guest's state after a killed step is not known): the next
+    /// `run_step` and `finish` return `Err`.
     pub fn run_step(&mut self, step: RunStep, sink: &mut dyn FnMut(Stream, &[u8])) -> Result<StepOutcome> {
         if let Some(why) = &self.dead {
             return Err(Error::refused(format!("the build VM has ended: {why}")));
@@ -352,29 +374,81 @@ impl BuildVm {
     }
 
     /// `Finish`: the guest syncs and ends the VM; killed after [`END_TIMEOUT`].
+    /// `Ok` only when the guest ended the VM cleanly (the VMM exited with code 0
+    /// and no signal, or the guest reset it). After a [`Exit::TimedOut`] step
+    /// the VM is already dead, so this is `Err`. An error means the VM was
+    /// already gone, `Finish` never reached it, the VMM ended some other way
+    /// than the guest ending it (killed, or its reset backstop failed), the
+    /// guest reported `InitFailed` after `Finish`, or it did not end in time.
     pub fn finish(mut self) -> Result<()> {
-        if self.dead.is_some() {
-            return Ok(());
+        if let Some(why) = &self.dead {
+            return Err(Error::refused(format!("the build VM had ended before Finish: {why}")));
         }
         self.send(HostMessage::Finish);
+        if let Some(why) = &self.dead {
+            return Err(Error::refused(format!(
+                "Finish was not delivered, and the build VM was killed: {why}"
+            )));
+        }
         let deadline = after(Instant::now(), END_TIMEOUT);
+        let mut failed = None;
         loop {
             match self.vm.wait_timeout(TICK) {
-                Ok(Some(_)) => {
+                Ok(Some(end)) => {
+                    self.vm_ended = true;
                     self.dead = Some("finished".into());
-                    return Ok(());
+                    // What the guest sent just before the end.
+                    self.drain_after_finish(&mut failed);
+                    if let Some(f) = failed {
+                        return Err(Error::refused(format!(
+                            "the guest failed after Finish: {}",
+                            f.describe()
+                        )));
+                    }
+                    return if ended_by_the_guest(&end) {
+                        Ok(())
+                    } else {
+                        Err(Error::refused(format!(
+                            "the build VM ended after Finish, but not by the guest ending it ({:?}, code {:?}, signal {:?})",
+                            end.reason, end.code, end.signal
+                        )))
+                    };
                 }
                 Ok(None) if Instant::now() < deadline => {}
-                _ => {
+                Ok(None) => {
                     self.kill("the guest did not end the VM after Finish".into());
                     return Err(Error::refused(format!(
                         "the build VM did not end within {}s of Finish; it was killed",
                         END_TIMEOUT.as_secs()
                     )));
                 }
+                Err(e) => {
+                    self.kill(format!("waiting for the VMM after Finish: {e}"));
+                    return Err(Error::refused(format!(
+                        "waiting for the build VMM after Finish failed ({e}); it was killed"
+                    )));
+                }
             }
-            // Messages after Finish are of no interest; keep the channel moving.
-            while self.events.try_recv().is_ok() {}
+            self.drain_after_finish(&mut failed);
+            if let Some(f) = failed {
+                self.kill("the guest reported InitFailed after Finish".into());
+                return Err(Error::refused(format!(
+                    "the guest failed after Finish: {}",
+                    f.describe()
+                )));
+            }
+        }
+    }
+
+    /// Messages after `Finish` matter only for an `InitFailed`; the rest are
+    /// dropped to keep the channel moving.
+    fn drain_after_finish(&mut self, failed: &mut Option<kiln_proto::InitFailed>) {
+        while let Ok(e) = self.events.try_recv() {
+            if let Event::Guest(msg) = e
+                && let Ok(BuildEvent::Failed(f)) = self.proto.accept(&msg)
+            {
+                failed.get_or_insert(f);
+            }
         }
     }
 
@@ -393,7 +467,7 @@ impl BuildVm {
         }
         self.dead = Some(why);
         let _ = self.vm.kill();
-        let _ = self.vm.wait_timeout(KILL_WAIT);
+        self.vm_ended = matches!(self.vm.wait_timeout(KILL_WAIT), Ok(Some(_)));
     }
 
     fn console_tail(&self) -> String {
@@ -422,6 +496,7 @@ impl BuildVm {
         if self.dead.is_none() {
             match self.vm.wait_timeout(Duration::ZERO) {
                 Ok(Some(end)) => {
+                    self.vm_ended = true;
                     self.dead = Some(format!("the VM ended ({:?})", end.reason));
                     return;
                 }
@@ -540,9 +615,11 @@ impl StepState {
 
 impl Drop for BuildVm {
     fn drop(&mut self) {
-        if self.dead.is_none() {
+        // The directories go only once the VMM is known gone: `dead` is set
+        // before a kill that can outlive KILL_WAIT.
+        if !self.vm_ended {
             let _ = self.vm.kill();
-            let _ = self.vm.wait_timeout(KILL_WAIT);
+            self.vm_ended = matches!(self.vm.wait_timeout(KILL_WAIT), Ok(Some(_)));
         }
         let _ = rustix::io::write(&self.wake, b"x");
         if let Some(l) = self.listener.take() {
@@ -553,8 +630,22 @@ impl Drop for BuildVm {
         if let Some(c) = self.console.take() {
             c.finish(Duration::from_secs(2));
         }
-        drop(self.scratch_dir.take());
-        drop(self.run_dir.take());
+        // A VMM that may still run keeps using the disks: leave both directories
+        // to a later run's orphan reaper, which finds it by its run.json.
+        match (self.vm_ended, self.scratch_dir.take(), self.run_dir.take()) {
+            (true, scratch, run) => {
+                drop(scratch);
+                drop(run);
+            }
+            (false, scratch, run) => {
+                if let Some(d) = scratch {
+                    d.leave();
+                }
+                if let Some(d) = run {
+                    d.leave();
+                }
+            }
+        }
     }
 }
 
@@ -662,6 +753,7 @@ fn read_control(stream: UnixStream, config: &Config, tx: &SyncSender<Event>, out
             Err(e) => return violation(format!("guest protocol error: {e}")),
         };
         let hello = matches!(msg, GuestMessage::Hello(_));
+        let failed = matches!(msg, GuestMessage::InitFailed(_));
         let version = if let GuestMessage::Hello(h) = &msg {
             h.protocol
         } else {
@@ -669,6 +761,11 @@ fn read_control(stream: UnixStream, config: &Config, tx: &SyncSender<Event>, out
         };
         if tx.send(Event::Guest(msg)).is_err() {
             return;
+        }
+        if failed {
+            // The guest waits for this before it ends the VM, so its InitFailed is not
+            // lost with it; reading goes on to EOF.
+            let _ = reader.shutdown(std::net::Shutdown::Write);
         }
         if hello && let Some((mut w, out)) = writer.take() {
             if let Some(why) = crate::protocol::version_refusal(version, config) {
@@ -720,13 +817,108 @@ fn read_stream(mut from: UnixStream, which: Stream, tx: &SyncSender<Event>) {
 
 #[cfg(test)]
 mod tests {
+    use vmkit::VmEnd;
+
     use super::*;
+
+    #[test]
+    fn only_a_clean_end_counts_as_the_guest_ending_the_vm() {
+        let end = |reason, code, signal| VmEnd { reason, code, signal };
+        assert!(ended_by_the_guest(&end(EndReason::Exited, Some(0), None)));
+        assert!(ended_by_the_guest(&end(EndReason::ResetStopped, None, None)));
+        // vmkit's `Exited` also covers a VMM that failed on its own.
+        assert!(!ended_by_the_guest(&end(EndReason::Exited, Some(1), None)));
+        assert!(!ended_by_the_guest(&end(EndReason::Exited, None, None)));
+        assert!(!ended_by_the_guest(&end(EndReason::Exited, None, Some(11))));
+        assert!(!ended_by_the_guest(&end(EndReason::Exited, Some(0), Some(9))));
+        assert!(!ended_by_the_guest(&end(EndReason::Killed, None, Some(9))));
+        assert!(!ended_by_the_guest(&end(EndReason::BackstopFailed, None, Some(9))));
+    }
 
     #[test]
     fn huge_durations_do_not_overflow_an_instant() {
         let t = Instant::now();
         assert!(after(t, Duration::MAX) > t + Duration::from_secs(3600));
         assert_eq!(after(t, Duration::from_secs(5)), t + Duration::from_secs(5));
+    }
+
+    fn exited(code: Option<i32>, signal: Option<i32>) -> kiln_proto::StepExited {
+        kiln_proto::StepExited { id: 1, code, signal }
+    }
+
+    fn seal() -> kiln_proto::StepSealed {
+        kiln_proto::StepSealed {
+            id: 1,
+            offset: 0,
+            len: 4096,
+            sha256: "0".repeat(64),
+            entries: 1,
+        }
+    }
+
+    fn state(e: Option<kiln_proto::StepExited>, sealed: bool) -> StepState {
+        StepState {
+            active: true,
+            stdout: StreamState::Done,
+            stderr: StreamState::Done,
+            exited: e,
+            sealed: sealed.then(seal),
+        }
+    }
+
+    #[test]
+    fn a_step_is_done_by_its_exit_streams_and_seal() {
+        let out = |exit, sealed: bool| {
+            Some(StepOutcome {
+                exit,
+                sealed: sealed.then(seal),
+            })
+        };
+        // Not timed out.
+        assert_eq!(state(None, false).done(false), None, "no exit yet");
+        assert_eq!(
+            state(Some(exited(Some(0), None)), false).done(false),
+            None,
+            "exit 0 waits for its seal"
+        );
+        assert_eq!(
+            state(Some(exited(Some(0), None)), true).done(false),
+            out(Exit::Code(0), true)
+        );
+        assert_eq!(
+            state(Some(exited(Some(3), None)), false).done(false),
+            out(Exit::Code(3), false)
+        );
+        assert_eq!(
+            state(Some(exited(None, Some(9))), false).done(false),
+            out(Exit::Signal(9), false)
+        );
+        // A stream still open holds the outcome back, whatever the exit.
+        let mut open = state(Some(exited(Some(1), None)), false);
+        open.stderr = StreamState::Open;
+        assert_eq!(open.done(false), None);
+        open.stderr = StreamState::Done;
+        open.stdout = StreamState::Waiting;
+        assert_eq!(open.done(false), None);
+        // Timed out: the outcome is TimedOut and a seal is dropped.
+        assert_eq!(state(None, false).done(true), None);
+        assert_eq!(
+            state(Some(exited(Some(0), None)), false).done(true),
+            None,
+            "exit 0 without its seal still waits (the kill deadline ends it)"
+        );
+        assert_eq!(
+            state(Some(exited(Some(0), None)), true).done(true),
+            out(Exit::TimedOut, false)
+        );
+        assert_eq!(
+            state(Some(exited(Some(1), None)), false).done(true),
+            out(Exit::TimedOut, false)
+        );
+        assert_eq!(
+            state(Some(exited(None, Some(9))), false).done(true),
+            out(Exit::TimedOut, false)
+        );
     }
 
     #[test]
