@@ -753,6 +753,7 @@ fn read_control(stream: UnixStream, config: &Config, tx: &SyncSender<Event>, out
             Err(e) => return violation(format!("guest protocol error: {e}")),
         };
         let hello = matches!(msg, GuestMessage::Hello(_));
+        let failed = matches!(msg, GuestMessage::InitFailed(_));
         let version = if let GuestMessage::Hello(h) = &msg {
             h.protocol
         } else {
@@ -760,6 +761,11 @@ fn read_control(stream: UnixStream, config: &Config, tx: &SyncSender<Event>, out
         };
         if tx.send(Event::Guest(msg)).is_err() {
             return;
+        }
+        if failed {
+            // The guest waits for this before it ends the VM, so its InitFailed is not
+            // lost with it; reading goes on to EOF.
+            let _ = reader.shutdown(std::net::Shutdown::Write);
         }
         if hello && let Some((mut w, out)) = writer.take() {
             if let Some(why) = crate::protocol::version_refusal(version, config) {

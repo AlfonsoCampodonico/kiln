@@ -1344,3 +1344,42 @@ fn an_interrupt_after_the_end_stops_waiting_for_a_stuck_sink() {
         ["the guest's stdout was cut off: kiln was asked to stop while its own output was not taking it"]
     );
 }
+
+/// D1: the guest waits for the host to close its side of the control connection before
+/// it ends the VM, or its final message can be lost with the VM. The host closes it once
+/// it has read the final message (`Exited` or `InitFailed`), and not before.
+#[test]
+fn the_host_closes_control_after_the_final_message() {
+    let finals = [
+        GuestMessage::Exited(Exited::main(false, 3)),
+        GuestMessage::InitFailed(InitFailed::new(7, Some(2), "boom")),
+    ];
+    for last in finals {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let vm = fake(move |sock, _| {
+            let mut c = connect(&sock, port::CONTROL);
+            handshake(&mut c);
+            boot(&mut c);
+            c.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            let mut b = [0u8; 1];
+            // Not before the final message: the host is still listening.
+            let before = c.read(&mut b).map_err(|e| e.kind());
+            send(&mut c, last);
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let after = c.read(&mut b).map_err(|e| e.kind());
+            tx.send((before, after)).unwrap();
+        });
+        let (st, _io) = streams(None);
+        let o = Session::start(vm, config(), st, opts()).unwrap().finish_within(LIMIT);
+        assert_eq!(o.violation, None, "{o:?}");
+        let (before, after) = rx.recv().unwrap();
+        assert!(
+            matches!(
+                before,
+                Err(std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+            ),
+            "{before:?}"
+        );
+        assert_eq!(after, Ok(0), "the host did not close its side after the final message");
+    }
+}

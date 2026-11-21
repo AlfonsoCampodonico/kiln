@@ -8,7 +8,10 @@
 //!   ([`Protocol`], D-1) and stops at the first violation, so at most nine guest
 //!   messages are ever queued for the main loop. It answers the first `Hello`
 //!   with `Config`, once. Like the output streams, it is drained to EOF after
-//!   the VM ends: the guest's last messages may still be in flight then.
+//!   the VM ends: the guest's last messages may still be in flight then. Once it
+//!   has the guest's final message (`Exited` or `InitFailed`) it shuts down the
+//!   connection's writing side: the guest waits for that, bounded, before it ends
+//!   the VM, so the message cannot be lost with the VM.
 //! - **control writer**: the only thread that writes host messages, from a
 //!   bounded queue, with a send timeout. A full queue or a stalled send is a
 //!   violation, and no other thread ever waits on the control socket (D-2).
@@ -1234,8 +1237,14 @@ fn read_control(
                 }
             }
             Ok(Accepted::Recorded) => {
+                let last = matches!(msg, GuestMessage::Exited(_) | GuestMessage::InitFailed(_));
                 if events.send(Event::Guest(msg)).is_err() {
                     return;
+                }
+                if last {
+                    // The guest waits for this before it ends the VM, so its final message
+                    // is not lost with it; reading goes on to EOF.
+                    let _ = w.shutdown(std::net::Shutdown::Write);
                 }
             }
             Ok(Accepted::Exec) => {
