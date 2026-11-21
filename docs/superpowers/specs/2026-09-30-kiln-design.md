@@ -131,6 +131,7 @@
   - §9.8, isolation: `/proc/fs` is read-only, and `/proc/acpi`, `/proc/scsi`, `/proc/latency_stats` and `/proc/timer_stats` are masked where present, as runc's lists have them. In a build VM init writes `0` to `/proc/sys/user/max_user_namespaces` before `Running`, so a step cannot create a user namespace (and so cannot get `CAP_SYS_ADMIN` inside one); Docker's default seccomp profile blocks them too.
   - §9.8, step failures: a step whose own spec or image makes its setup impossible (a cache or secret target that cannot be resolved or created, or the child's own setup) ends with `StepExited` code 125 and the reason on its stderr, and the VM goes on, as a working directory that cannot be made does. A failure of init's own work (cloning or hardening `/proc`, creating sysfs, devpts or a tmpfs, mounting or growing a cache disk, the overlay, the output disk, a seal) and a protocol violation still end the VM.
   - §9.8, the host's checks: besides shape and id, kiln refuses a `StepSealed` that is empty, not aligned to 4096, not starting exactly where the previous seal ended, overflowing or ending past the output disk; the caller's own checks (reading the range, zeros after the tar's end, hashing) are still required. A secret's target may not end in `/`. `BuildVm::finish()` is `Ok` only for a VMM that exited with code 0 and no signal (or a guest reset), and is an error when the VM was already dead (a timed-out step ends it), was killed by the host, ended some other way, or the guest sent `InitFailed` after `Finish`.
+  - §9.6, §9.7, the final message: the host shuts down its writing side of the control connection once it has read `Exited` or `InitFailed` (run and build mode), and init waits for that close, for at most 1 s, before it ends the VM. A guest's vsock write only queues the bytes, so a VM that ended right after its final message could lose it (seen as `InitFailed` missing under parallel load on Firecracker). No version gate: an older host costs the guest the second, an older guest ignores the close.
 ---
 
 ## 1. Goals
@@ -714,7 +715,7 @@ The numbers match Docker. These codes are guest-asserted (§3).
 
 ### 9.6 `kiln-init` sequence
 
-Each stage reports `Stage { n }`. A failure reports `InitFailed` when the control channel is up, prints `kiln-init: <stage>: <error>` to the console, and exits via `exitMethod`, or `reboot()` if no config has arrived. A panic hook does the same.
+Each stage reports `Stage { n }`. A failure reports `InitFailed` when the control channel is up, prints `kiln-init: <stage>: <error>` to the console, and exits via `exitMethod`, or `reboot()` if no config has arrived. A panic hook does the same. After its final message (`Exited` or `InitFailed`) init waits, for at most 1 s, for the host to close its side of the control connection, which the host does once it has read that message, so the message is not lost with the VM (rev 2.17).
 
 1. **Early:** mount `/proc`, `/sys` and `/dev` (devtmpfs) in the init root. Call `reboot(LINUX_REBOOT_CMD_CAD_OFF)` so Ctrl-Alt-Del becomes SIGINT to init instead of an instant reset.
 2. **Control:** connect vsock port 1024, send `Hello`, receive and validate `Config`.
