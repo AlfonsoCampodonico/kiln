@@ -9,7 +9,7 @@ use rustix::io::Errno;
 use rustix::mount::{FsPickFlags, MountFlags, mount};
 
 use super::{open_dir, sys};
-use crate::disks::{SCRATCH, disk_name};
+use crate::disks::{SCRATCH, device};
 use crate::error::{Context, Failure, Result};
 use crate::overlay::{EMPTY_LOWER, UPPER, WORK, layer_dir, mount_data};
 
@@ -50,7 +50,7 @@ pub fn mount_base(config: &Config, first: usize) -> Result<OwnedFd> {
     }
     let layers = config.layers as usize;
     for n in 0..layers {
-        let (dev, dir) = (format!("/dev/{}", disk_name(first + n)), layer_dir(n));
+        let (dev, dir) = (device(first + n), layer_dir(n));
         mkdir(&dir)?;
         mount(dev.as_str(), dir.as_str(), "erofs", MountFlags::RDONLY, None).context(format!("mount layer {dev}"))?;
     }
@@ -60,17 +60,21 @@ pub fn mount_base(config: &Config, first: usize) -> Result<OwnedFd> {
     Ok(rw)
 }
 
-/// Grows the scratch filesystem online to `size` bytes (spec §9.4).
-pub(super) fn grow_to_device(rw: &OwnedFd, dev: &str) -> Result<()> {
+/// The size of block device `dev` in bytes.
+fn device_size(dev: &str) -> Result<u64> {
     let d = rustix::fs::open(dev, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).context(format!("open {dev}"))?;
-    let size = rustix::fs::seek(&d, SeekFrom::End(0)).context(format!("size of {dev}"))?;
+    rustix::fs::seek(&d, SeekFrom::End(0)).context(format!("size of {dev}"))
+}
+
+/// Grows the ext4 filesystem at `rw` online to fill its device `dev` (spec §9.4).
+pub(super) fn grow_to_device(rw: &OwnedFd, dev: &str) -> Result<()> {
+    let size = device_size(dev)?;
     sys::ext4_resize(rw, size / BLOCK).context(format!("grow {dev} to {size} bytes"))
 }
 
+/// Grows the scratch filesystem online to `size` bytes (spec §9.4).
 fn grow(rw: &OwnedFd, size: u64) -> Result<()> {
-    let dev = rustix::fs::open(SCRATCH, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-        .context(format!("open {SCRATCH}"))?;
-    let dev_size = rustix::fs::seek(&dev, SeekFrom::End(0)).context(format!("size of {SCRATCH}"))?;
+    let dev_size = device_size(SCRATCH)?;
     if dev_size < size {
         return Err(Failure::msg(format!(
             "{SCRATCH} has {dev_size} bytes, but the scratch disk should have {size}"

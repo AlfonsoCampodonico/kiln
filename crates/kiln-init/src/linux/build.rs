@@ -62,7 +62,7 @@ use super::process::{connect, give, pipe, watch_signals};
 use super::seal::Output;
 use super::storage::{self, mkdir};
 use super::{Event, enter, host_ok, identity, relay, send, sys};
-use crate::disks::disk_name;
+use crate::disks::device;
 use crate::error::{Context, Failure, Result};
 use crate::passwd::Identity;
 
@@ -72,12 +72,12 @@ const ROOT: &str = "/kiln/root";
 pub fn run(config: &Config, events: Sender<Event>, rx: &Receiver<Event>) -> Result<()> {
     enter(3)?;
     let rw = storage::mount_base(config, Config::OUTPUT_DISK as usize + 1)?;
-    for dir in ["/kiln/rw/u", "/kiln/rw/w", "/kiln/disks", ROOT] {
+    for dir in ["/kiln/rw/u", "/kiln/rw/w", "/kiln/disks"] {
         mkdir(dir)?;
     }
     enter(4)?;
     // Init's own descriptor: no step ever sees a block device.
-    let output = Output::open(&format!("/dev/{}", disk_name(Config::OUTPUT_DISK as usize)))?;
+    let output = Output::open(&device(Config::OUTPUT_DISK as usize))?;
     enter(5)?;
     identity::network(config)?;
     enter(6)?;
@@ -153,7 +153,7 @@ impl Builder<'_> {
         for &disk in &step.lowers_added {
             let dir = format!("/kiln/disks/{disk}");
             mkdir(&dir)?;
-            let dev = format!("/dev/{}", disk_name(disk as usize));
+            let dev = device(disk as usize);
             rustix::mount::mount(dev.as_str(), dir.as_str(), "erofs", MountFlags::RDONLY, None)
                 .context(format!("mount layer {dev}"))?;
             self.stacked.insert(disk);
@@ -165,7 +165,6 @@ impl Builder<'_> {
         let (upper, work) = (format!("/kiln/rw/u/{k}"), format!("/kiln/rw/w/{k}"));
         mkdir(&upper)?;
         mkdir(&work)?;
-        mkdir(crate::overlay::EMPTY_LOWER)?;
         let data = crate::overlay::step_mount_data(&self.lowers, &upper, &work)?;
         let data = CString::new(data).expect("no NUL in paths");
         // `nodev`, defence in depth: a step has no CAP_MKNOD, and a device node a
@@ -264,7 +263,7 @@ impl Builder<'_> {
         )?;
 
         for mount in &step.mounts {
-            let dev = format!("/dev/{}", disk_name(mount.disk as usize));
+            let dev = device(mount.disk as usize);
             let fs = new_fs("ext4", Some(&dev), &[], &[], mount.read_only)?;
             if !mount.read_only && self.grown.insert(mount.disk) {
                 let root = rustix::fs::openat(

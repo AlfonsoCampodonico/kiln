@@ -17,12 +17,17 @@ pub fn disk_name(index: usize) -> String {
     format!("vd{}", String::from_utf8(letters).expect("ASCII"))
 }
 
+/// The device node of virtio disk `index` (0-based).
+pub fn device(index: usize) -> String {
+    format!("/dev/{}", disk_name(index))
+}
+
 /// The scratch disk.
 pub const SCRATCH: &str = "/dev/vdb";
 
 /// App layer `n` (0 is the lowest).
 pub fn layer_device(n: usize) -> String {
-    format!("/dev/{}", disk_name(n + 2))
+    device(n + 2)
 }
 
 #[cfg(test)]
@@ -40,6 +45,8 @@ mod tests {
         assert_eq!(disk_name(701), "vdzz");
         assert_eq!(disk_name(702), "vdaaa");
         assert_eq!(layer_device(0), "/dev/vdc");
-        assert_eq!(SCRATCH, format!("/dev/{}", disk_name(1)));
+        assert_eq!(SCRATCH, device(1));
+        assert_eq!(device(0), "/dev/vda");
+        assert_eq!(device(26), "/dev/vdaa");
     }
 }
