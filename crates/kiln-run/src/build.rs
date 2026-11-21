@@ -107,7 +107,8 @@ pub struct RunStep {
     pub secrets: Vec<(String, Secret)>,
     /// Whether the step may reach the network (a VM without one has none).
     pub network: bool,
-    /// For the command and its seal together.
+    /// For the command and its seal together. A value too large for the clock
+    /// (`Duration::MAX`) is clamped to a year.
     pub timeout: Duration,
 }
 

@@ -94,6 +94,14 @@ pub struct BuildVm {
     run_dir: Option<RunDir>,
 }
 
+/// `t + d`, never panicking: a duration too large for `Instant` (a caller's
+/// `Duration::MAX` timeout) is clamped to a year from `t`, which is effectively
+/// never for a step or a boot. Every `Instant + Duration` in this file goes through it.
+fn after(t: Instant, d: Duration) -> Instant {
+    const NEVER: Duration = Duration::from_secs(365 * 24 * 3600);
+    t.checked_add(d).or_else(|| t.checked_add(NEVER)).unwrap_or(t)
+}
+
 impl BuildVm {
     /// Creates the run's directories, the init layer and the scratch disk,
     /// boots the VM and waits for the guest to be ready (`Running`).
@@ -241,7 +249,7 @@ impl BuildVm {
             scratch_dir: Some(scratch_dir),
             run_dir: Some(run_dir),
         };
-        let deadline = Instant::now() + b.spec.boot_timeout;
+        let deadline = after(Instant::now(), b.spec.boot_timeout);
         while !b.proto.running() {
             if Instant::now() >= deadline {
                 b.kill(format!(
@@ -299,8 +307,8 @@ impl BuildVm {
         self.proto.start_step(step.id).map_err(Error::refused)?;
         self.stacked.extend(step.lowers_added.iter().copied());
         self.send(HostMessage::RunStep(Box::new(msg)));
-        let deadline = start + step.timeout;
-        let kill_at = deadline + STEP_GRACE;
+        let deadline = after(start, step.timeout);
+        let kill_at = after(deadline, STEP_GRACE);
         let mut timed_out = false;
         let mut s = StepState::default();
         loop {
@@ -349,7 +357,7 @@ impl BuildVm {
             return Ok(());
         }
         self.send(HostMessage::Finish);
-        let deadline = Instant::now() + END_TIMEOUT;
+        let deadline = after(Instant::now(), END_TIMEOUT);
         loop {
             match self.vm.wait_timeout(TICK) {
                 Ok(Some(_)) => {
@@ -713,6 +721,13 @@ fn read_stream(mut from: UnixStream, which: Stream, tx: &SyncSender<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn huge_durations_do_not_overflow_an_instant() {
+        let t = Instant::now();
+        assert!(after(t, Duration::MAX) > t + Duration::from_secs(3600));
+        assert_eq!(after(t, Duration::from_secs(5)), t + Duration::from_secs(5));
+    }
 
     #[test]
     fn join_draining_frees_a_thread_blocked_on_a_full_channel() {
